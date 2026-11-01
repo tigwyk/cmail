@@ -155,6 +155,39 @@ impl Cli {
     }
 }
 
+fn map_allow(cmd: &AllowCommand) -> commands::admin::AllowCmd {
+    match cmd {
+        AllowCommand::Add { name } => commands::admin::AllowCmd::Add { name: name.clone() },
+        AllowCommand::Remove { name } => commands::admin::AllowCmd::Remove { name: name.clone() },
+        AllowCommand::List => commands::admin::AllowCmd::List,
+    }
+}
+
+fn map_keyring(cmd: &KeyringCommand) -> commands::admin::KeyringCmd {
+    match cmd {
+        KeyringCommand::Add {
+            name,
+            key_file,
+            from_message,
+        } => commands::admin::KeyringCmd::Add {
+            name: name.clone(),
+            key_file: key_file.clone(),
+            from_message: from_message.clone(),
+        },
+        KeyringCommand::List => commands::admin::KeyringCmd::List,
+    }
+}
+
+fn map_quarantine(cmd: &QuarantineCommand) -> commands::admin::QuarantineCmd {
+    match cmd {
+        QuarantineCommand::List => commands::admin::QuarantineCmd::List,
+        QuarantineCommand::Show { id } => commands::admin::QuarantineCmd::Show { id: id.clone() },
+        QuarantineCommand::Release { id } => {
+            commands::admin::QuarantineCmd::Release { id: id.clone() }
+        }
+    }
+}
+
 fn main() {
     let cli = Cli::parse();
     let result = match &cli.command {
@@ -189,7 +222,14 @@ fn main() {
         }
         Commands::Wait { timeout_secs } => commands::mail::wait(&cli, *timeout_secs),
         Commands::List { all } => commands::mail::list(&cli, *all),
-        _ => {
+        Commands::Allow { cmd } => commands::admin::allow(&cli, map_allow(cmd)),
+        Commands::Approvals => commands::admin::approvals(&cli),
+        Commands::Approve { id, remember } => commands::admin::approve(&cli, id, *remember),
+        Commands::Reject { id } => commands::admin::reject(&cli, id),
+        Commands::Keyring { cmd } => commands::admin::keyring(&cli, map_keyring(cmd)),
+        Commands::Quarantine { cmd } => commands::admin::quarantine(&cli, map_quarantine(cmd)),
+        Commands::Audit { tail } => commands::admin::audit(&cli, *tail),
+        Commands::Mcp => {
             println!("not yet implemented");
             std::process::exit(1);
         }
