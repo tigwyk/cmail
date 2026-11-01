@@ -168,13 +168,27 @@ When identity B reads a message from A, trust is computed from `from`, `from_key
   --- END UNTRUSTED MAIL BODY ---
   ```
 
-  plus `trust: "untrusted"` and the sender's key fingerprint, so a human can
-  recognize a repeat correspondent (TOFU continuity). No implicit keyring update
-  ever happens; the human promotes the sender via `cmail keyring add` (CLI-only).
+plus `trust: "untrusted"` and the sender's key fingerprint, so a human can
+recognize a repeat correspondent (TOFU continuity). No implicit keyring update
+ever happens; the human promotes the sender via `cmail keyring add` (CLI-only).
+
+**Wrapping rule: any trust level other than `verified` is presented with the
+untrusted-body delimiters.** A `spoof_suspect` or `invalid` message that a human
+has released from quarantine is at least as dangerous as untrusted mail, so it is
+never shown unfenced either.
+
 - **spoof suspect** — `from` IS in the keyring but `from_key` differs from the
   stored key. Message is moved to `quarantine/` at scan time, never appears in
   `inbox`, audit event `spoof_suspected`. Quarantine is human-only territory:
   `cmail quarantine list|show|release`.
+- **Release semantics:** `quarantine release` moves the message to the mailbox's
+  `archive/` (not `inbox/`), meaning "reviewed by human, retained for the record,
+  never re-shown to the agent as new mail." This is durable for every message
+  class — release-to-inbox would be undone by the next scan for spoof/corrupt
+  mail. To make quarantined mail *visible* to an agent, use the principled knobs
+  instead: `keyring add` (trust the sender) or `inbound = "permissive"` (loosen
+  strict mode). Released mail remains readable by id via `cmail read` (archive is
+  in the read path) and always wrapped unless verified.
 - **invalid** — `sig` fails against the envelope's own `from_key` (not even
   self-consistent). Quarantined at scan time, audit event `corrupt`. Never shown.
 - Strict mode: `inbound = "known-only"` routes unknown senders to quarantine too
@@ -232,7 +246,7 @@ read/observe commands), `--root <path>` (debug/testing).
 | `cmail approve <id> [--remember]` | Deliver held mail; optionally allowlist recipient. |
 | `cmail reject <id>` | Delete held mail. |
 | `cmail keyring add <n> [--key-file f \| --from-message <id>] \| list` | Trust management (human-only). Default: promotes a local identity's public key from `identities/<n>/`; `--key-file` imports an external public key; `--from-message` promotes the `from_key` of a message you're reading (the TOFU first-contact flow). `list` shows names, fingerprints, first-seen. |
-| `cmail quarantine list\|show\|release` | Quarantine management (human-only). |
+| `cmail quarantine list\|show\|release` | Quarantine management (human-only). `release` moves to archive (reviewed, retained, not re-shown); see §4.2 release semantics. |
 | `cmail audit [--tail N]` | Tail audit log. |
 | `cmail mcp` | Run stdio MCP server (section 6). |
 | `cmail config` | Print effective config + paths. |
