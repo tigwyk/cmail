@@ -225,7 +225,7 @@ read/observe commands), `--root <path>` (debug/testing).
 | `cmail inbox` | Unread list: id, from, kind, subject, trust, age. |
 | `cmail read <id>` | Full message (trust-annotated), moves inbox → archive. |
 | `cmail reply <id> [--body ...]` | Send with `in_reply_to` set (still gated). |
-| `cmail wait [--timeout 30s]` | Block until new inbox mail for active identity, then print inbox. Filesystem watch, poll fallback. |
+| `cmail wait [--timeout 30s]` | Block until new inbox mail for active identity, then print inbox. Polls at 250 ms. |
 | `cmail list [--all]` | Inbox (+ archive with `--all`). |
 | `cmail allow add\|remove\|list` | Allowlist management. |
 | `cmail approvals` | Held outbound mail (all identities by default, `--as` to scope). |
@@ -242,7 +242,11 @@ it is not a failure.
 
 ## 6. MCP server
 
-`cmail mcp [--as <name>]` — stdio transport, implemented with the `rmcp` crate.
+`cmail mcp [--as <name>]` — stdio transport, implemented as a hand-rolled minimal
+MCP server (newline-delimited JSON-RPC 2.0: `initialize`, `tools/list`,
+`tools/call`, `ping`). No MCP SDK dependency: the protocol subset is small,
+stable, and fully under our control — which also keeps the untrusted-content
+presentation exact and the dependency tree minimal.
 Tools mirror the agent-safe subset of the CLI:
 
 - `cmail_send` (args: to, kind, subject, body, attachments?, reply_to?)
@@ -294,9 +298,9 @@ Cargo workspace, single `cmail` binary:
 - `crates/cmail-cli` — clap definitions, human/JSON output formatting, `main`.
 - `crates/cmail-mcp` — rmcp server, thin wrapper over `cmail-core`.
 
-Dependencies: `ed25519-dalek`, `serde`/`serde_json`, `clap`, `rmcp`, `toml`,
-`sha2`, `rand`, `thiserror`/`anyhow`, `notify` (wait), `hex`/`base64`, `time`.
-Canonical JSON is hand-rolled (3.3).
+Dependencies: `ed25519-dalek`, `serde`/`serde_json`, `clap`, `toml`,
+`sha2`, `rand`, `thiserror`/`anyhow`, `hex`/`base64`, `time`. `wait` polls the
+inbox (250 ms interval) — no filesystem-watching dependency.
 
 ## 9. Testing strategy
 
