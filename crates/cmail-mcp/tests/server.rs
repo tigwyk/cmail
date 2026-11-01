@@ -139,3 +139,72 @@ fn unknown_method_is_minus_32601() {
     );
     assert_eq!(out[0]["error"]["code"], -32601);
 }
+
+#[test]
+fn missing_method_is_minus_32600() {
+    let root = setup();
+    let out = drive(root.path(), &[r#"{"jsonrpc":"2.0","id":9,"params":{}}"#]);
+    assert_eq!(out[0]["error"]["code"], -32600);
+}
+
+#[test]
+fn wait_seconds_clamped_to_600() {
+    assert_eq!(cmail_mcp::tools::clamp_wait_secs(0), 0);
+    assert_eq!(cmail_mcp::tools::clamp_wait_secs(30), 30);
+    assert_eq!(cmail_mcp::tools::clamp_wait_secs(600), 600);
+    assert_eq!(cmail_mcp::tools::clamp_wait_secs(u64::MAX), 600);
+}
+
+#[test]
+fn inbox_read_reply_wait_covered_via_mcp() {
+    let root = setup();
+    // Deliver real untrusted mail to zoe using core (bypassing the gate
+    // directly): zoe must be allowlisted as a recipient so the send is Sent.
+    // A plain local variable carries the id into the request lines below.
+    let id = {
+        let svc = cmail_core::Cmail::open(root.path()).unwrap();
+        svc.allow_add("zoe").unwrap();
+        let sent = svc
+            .send(
+                Some("alice"),
+                "zoe",
+                "note",
+                "s",
+                "hello via core",
+                &[],
+                None,
+            )
+            .unwrap();
+        let cmail_core::service::SendOutcome::Sent { id } = sent else {
+            panic!("expected Sent, got {sent:?}")
+        };
+        id
+    };
+    let lines: Vec<String> = vec![
+        r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05"}}"#.into(),
+        r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#.into(),
+        r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cmail_inbox","arguments":{}}}"#.into(),
+        format!(r#"{{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{{"name":"cmail_read","arguments":{{"id":"{id}"}}}}}}"#),
+        format!(r#"{{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{{"name":"cmail_reply","arguments":{{"id":"{id}","body":"roger"}}}}}}"#),
+        r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cmail_wait","arguments":{"timeout_seconds":1}}}"#.into(),
+    ];
+    let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
+    let out = drive(root.path(), &refs);
+    // Responses (notification silent): [initialize, inbox, read, reply, wait].
+    let inbox: serde_json::Value =
+        serde_json::from_str(out[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(inbox[0]["trust"], "untrusted");
+    let read: serde_json::Value =
+        serde_json::from_str(out[2]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(read["body"]
+        .as_str()
+        .unwrap()
+        .contains("UNTRUSTED MAIL BODY"));
+    assert_eq!(read["fingerprint"].as_str().unwrap().len(), 16);
+    let reply: serde_json::Value =
+        serde_json::from_str(out[3]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert_eq!(reply["status"], "held"); // zoe->alice not allowlisted
+    let wait: serde_json::Value =
+        serde_json::from_str(out[4]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();
+    assert!(wait.as_array().unwrap().is_empty()); // read moved it to archive; wait sees nothing new
+}
