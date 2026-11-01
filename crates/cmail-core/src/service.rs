@@ -271,6 +271,33 @@ impl Cmail {
         Ok(())
     }
 
+    pub fn allow_remove(&self, name: &str) -> Result<()> {
+        // Load fresh: allow_add/approve may have updated the allowlist after
+        // this handle was opened (long-lived MCP process), mirroring allow_add.
+        let mut cfg = Config::load_or_init(&self.root)?;
+        cfg.allow.send.retain(|n| n != name);
+        cfg.save(&self.root)?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::AllowRemove, "human").counterpart(name),
+        )?;
+        Ok(())
+    }
+
+    pub fn allow_list(&self) -> Result<Vec<String>> {
+        let mut v = Config::load_or_init(&self.root)?.allow.send;
+        v.sort();
+        Ok(v)
+    }
+
+    pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRecord>> {
+        crate::audit::tail(&self.root, n)
+    }
+
+    pub fn list_identities(&self) -> Vec<String> {
+        crate::identity::list_identities(&self.root)
+    }
+
     /// Scan the inbox (spec 4.2 inbound): quarantine unparseable, badly
     /// self-signed, spoof-suspect and (in known-only mode) unknown-sender mail;
     /// list everything else with its trust level.
@@ -924,5 +951,19 @@ mod tests {
                 .public_key,
             alice_pub
         );
+    }
+
+    // --- Task 12 test: admin passthroughs ---
+
+    #[test]
+    fn allow_remove_and_list() {
+        let (_root, c) = svc();
+        c.allow_add("zoe").unwrap();
+        c.allow_add("mallory").unwrap();
+        assert_eq!(c.allow_list().unwrap(), vec!["mallory", "zoe"]);
+        c.allow_remove("mallory").unwrap();
+        assert_eq!(c.allow_list().unwrap(), vec!["zoe"]);
+        let recs = c.audit_tail(5).unwrap();
+        assert!(recs.iter().any(|r| r.event == AuditEvent::AllowRemove));
     }
 }
