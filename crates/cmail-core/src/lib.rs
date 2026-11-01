@@ -6,5 +6,6 @@ pub mod error;
 pub mod identity;
 pub mod keyring;
 pub mod store;
+pub mod trust;
 
 pub use error::{CoreError, Result};
