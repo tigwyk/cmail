@@ -9,4 +9,6 @@ pub mod service;
 pub mod store;
 pub mod trust;
 
+pub use config::Config;
 pub use error::{CoreError, Result};
+pub use service::Cmail;

@@ -182,6 +182,7 @@ dependencies = [
  "cmail-core",
  "cmail-mcp",
  "predicates",
+ "serde",
  "serde_json",
  "tempfile",
  "time",

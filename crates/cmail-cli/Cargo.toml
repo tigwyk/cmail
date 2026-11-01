@@ -12,6 +12,7 @@ cmail-core.workspace = true
 cmail-mcp.workspace = true
 clap.workspace = true
 anyhow.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 time.workspace = true
 
