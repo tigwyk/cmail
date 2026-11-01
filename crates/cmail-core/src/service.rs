@@ -354,23 +354,34 @@ impl Cmail {
         self.store.ensure_mailbox(&me)?;
         let inbox = self.store.inbox_dir(&me);
         let archive = self.store.archive_dir(&me);
-        // Only unread (inbox) copies are readable; a copy already in the archive
-        // reads back as MessageNotFound ("already read or not found").
-        let was_unread = inbox.join(format!("{id}.mail")).exists();
-        if !was_unread {
+        let in_inbox = inbox.join(format!("{id}.mail")).exists();
+        // Unread (inbox) copies read normally. A copy already in the archive is
+        // readable only when it has never been read — i.e. it landed there via
+        // `quarantine release` (spec 4.2: archive is in the read path for
+        // released mail). Anything else reads back as MessageNotFound
+        // ("already read or not found").
+        let released =
+            !in_inbox && archive.join(format!("{id}.mail")).exists() && !self.was_read_by(&me, id);
+        if !in_inbox && !released {
             return Err(CoreError::MessageNotFound(format!(
                 "{id} (already read or not found)"
             )));
         }
-        let env = self.load_envelope_from(std::slice::from_ref(&inbox), id)?;
+        let src = if in_inbox { &inbox } else { &archive };
+        let env = self.load_envelope_from(std::slice::from_ref(src), id)?;
         let keyring = KeyRing::load(&self.root)?;
         let tr = crate::trust::evaluate(&env, &keyring);
-        let body = if tr.level == TrustLevel::Untrusted {
-            wrap_untrusted(&env.body)
-        } else {
+        // Spec 4.2 wrapping rule: every trust level other than `verified` is
+        // presented behind the untrusted fence — a spoof-suspect or invalid
+        // message a human released from quarantine is never shown unfenced.
+        let body = if tr.level == TrustLevel::Verified {
             env.body.clone()
+        } else {
+            wrap_untrusted(&env.body)
         };
-        self.store.move_message(&inbox, &archive, id)?;
+        if in_inbox {
+            self.store.move_message(&inbox, &archive, id)?;
+        }
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::Read, &me)
@@ -390,6 +401,21 @@ impl Cmail {
             trust: tr.level.as_str().to_string(),
             fingerprint: tr.fingerprint,
         })
+    }
+
+    /// Whether `actor` already read `id` (a prior `read` audit event). With no
+    /// sidecar state, the audit log is the record that distinguishes an
+    /// archived copy that was read from one placed there by `quarantine_release`.
+    fn was_read_by(&self, actor: &str, id: &str) -> bool {
+        crate::audit::tail(&self.root, usize::MAX)
+            .map(|records| {
+                records.iter().any(|r| {
+                    r.event == AuditEvent::Read
+                        && r.actor == actor
+                        && r.msg_id.as_deref() == Some(id)
+                })
+            })
+            .unwrap_or(false)
     }
 
     pub fn reply(
@@ -500,14 +526,19 @@ impl Cmail {
         })
     }
 
-    /// Move a quarantined message back to its owner's inbox. Never re-verifies:
-    /// release is an explicit human decision overriding the automatic routing.
+    /// Move a quarantined message to its owner's archive: "reviewed by human,
+    /// retained for the record, never re-shown to the agent as new mail"
+    /// (spec 4.2 release semantics). Archive is durable for every message
+    /// class — release-to-inbox would be undone by the next scan for
+    /// spoof/corrupt mail. Never re-verifies: release is an explicit human
+    /// decision overriding the automatic routing; the released copy stays
+    /// readable by id via `read_message`, wrapped unless verified.
     pub fn quarantine_release(&self, id: &str) -> Result<()> {
         for owner in crate::identity::list_identities(&self.root) {
             let q = self.store.quarantine_dir(&owner);
             if q.join(format!("{id}.mail")).exists() {
                 self.store
-                    .move_message(&q, &self.store.inbox_dir(&owner), id)?;
+                    .move_message(&q, &self.store.archive_dir(&owner), id)?;
                 append(
                     &self.root,
                     &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(id),
@@ -736,7 +767,7 @@ mod tests {
     }
 
     #[test]
-    fn spoofed_name_goes_to_quarantine() {
+    fn spoofed_name_goes_to_quarantine_never_inbox() {
         let (_root, c) = svc();
         c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
         // mallory creates her own identity, then hand-crafts an envelope claiming from=alice
@@ -769,9 +800,28 @@ mod tests {
         );
         let q = c.quarantine_list(Some("zoe")).unwrap();
         assert_eq!(q.len(), 1);
-        // release puts it back in inbox (still untrusted-by-key: name mismatch resolved by human)
+        // release moves to archive: "reviewed by human, retained, never re-shown".
+        // Release-to-inbox would be undone by the next scan (release loop).
         c.quarantine_release(&env.id).unwrap();
-        assert_eq!(c.store.list_ids(&c.store.inbox_dir("zoe")), vec![env.id]);
+        assert_eq!(
+            c.store.list_ids(&c.store.archive_dir("zoe")),
+            vec![env.id.clone()]
+        );
+        assert!(c.store.list_ids(&c.store.inbox_dir("zoe")).is_empty());
+        assert!(c.store.list_ids(&c.store.quarantine_dir("zoe")).is_empty());
+        // the next inbox scan neither re-shows nor re-quarantines it
+        assert!(c.inbox(Some("zoe")).unwrap().is_empty());
+        assert_eq!(
+            c.store.list_ids(&c.store.archive_dir("zoe")),
+            vec![env.id.clone()]
+        );
+        // released mail stays readable by id (archive is in the read path) and,
+        // not being verified, reads behind the untrusted fence
+        let msg = c.read_message(Some("zoe"), &env.id).unwrap();
+        assert_eq!(msg.trust, "spoof_suspect");
+        assert!(msg.body.starts_with(UNTRUSTED_OPEN));
+        assert!(msg.body.ends_with(UNTRUSTED_CLOSE));
+        assert!(msg.body.contains("imposter"));
     }
 
     #[test]
