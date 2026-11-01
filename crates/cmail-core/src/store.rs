@@ -53,13 +53,23 @@ impl MailStore {
         Ok(())
     }
 
-    fn mail_path(dir: &Path, id: &str) -> PathBuf {
-        dir.join(format!("{id}.mail"))
+    /// Message ids are 32 lowercase hex chars. Validating here makes every
+    /// id-taking entry point safe against path traversal (`../` in an id can
+    /// never reach the filesystem join), per final whole-branch review.
+    fn valid_id(id: &str) -> bool {
+        id.len() == 32 && id.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    fn mail_path(dir: &Path, id: &str) -> Result<PathBuf> {
+        if !Self::valid_id(id) {
+            return Err(CoreError::MessageNotFound(id.to_string()));
+        }
+        Ok(dir.join(format!("{id}.mail")))
     }
 
     pub fn write_envelope(&self, dir: &Path, env: &Envelope) -> Result<()> {
         fs::create_dir_all(dir)?;
-        let path = Self::mail_path(dir, &env.id);
+        let path = Self::mail_path(dir, &env.id)?;
         let tmp = dir.join(format!("{}.tmp", env.id));
         fs::write(&tmp, serde_json::to_string_pretty(env)?)?;
         fs::rename(&tmp, &path)?;
@@ -67,7 +77,7 @@ impl MailStore {
     }
 
     pub fn read_raw(&self, dir: &Path, id: &str) -> Result<String> {
-        fs::read_to_string(Self::mail_path(dir, id))
+        fs::read_to_string(Self::mail_path(dir, id)?)
             .map_err(|_| CoreError::MessageNotFound(id.to_string()))
     }
 
@@ -90,13 +100,13 @@ impl MailStore {
 
     pub fn move_message(&self, from_dir: &Path, to_dir: &Path, id: &str) -> Result<()> {
         fs::create_dir_all(to_dir)?;
-        fs::rename(Self::mail_path(from_dir, id), Self::mail_path(to_dir, id))
+        fs::rename(Self::mail_path(from_dir, id)?, Self::mail_path(to_dir, id)?)
             .map_err(|_| CoreError::MessageNotFound(id.to_string()))?;
         Ok(())
     }
 
     pub fn delete_message(&self, dir: &Path, id: &str) -> Result<()> {
-        fs::remove_file(Self::mail_path(dir, id))
+        fs::remove_file(Self::mail_path(dir, id)?)
             .map_err(|_| CoreError::MessageNotFound(id.to_string()))?;
         Ok(())
     }
@@ -148,7 +158,10 @@ impl MailStore {
             for e in entries.flatten() {
                 let owner = e.file_name().to_string_lossy().to_string();
                 let pending = self.pending_dir(&owner);
-                if Self::mail_path(&pending, id).exists() {
+                if Self::mail_path(&pending, id)
+                    .map(|p| p.exists())
+                    .unwrap_or(false)
+                {
                     let raw = self.read_raw(&pending, id)?;
                     let env = Envelope::parse(&raw)?;
                     return Ok((owner, env));
@@ -250,6 +263,31 @@ mod tests {
         assert!(store
             .find_pending("ffffffffffffffffffffffffffffffff")
             .is_err());
+    }
+
+    #[test]
+    fn traversal_ids_never_reach_the_filesystem() {
+        let root = TempDir::new().unwrap();
+        let store = MailStore::new(root.path());
+        let target = root.path().join("secret.mail");
+        fs::write(&target, "TOPSECRET").unwrap();
+        for evil in [
+            "../../secret",
+            "../../../secret",
+            "..\\..\\secret",
+            "not-an-id",
+            "",
+        ] {
+            let err = store
+                .read_raw(&store.inbox_dir("zoe"), evil)
+                .expect_err("non-hex id must be rejected before any path join");
+            assert!(
+                matches!(err, crate::error::CoreError::MessageNotFound(_)),
+                "{evil}: {err}"
+            );
+        }
+        // and the planted file is still there, unread
+        assert_eq!(fs::read_to_string(&target).unwrap(), "TOPSECRET");
     }
 
     #[test]

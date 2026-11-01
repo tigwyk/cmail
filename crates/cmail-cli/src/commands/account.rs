@@ -31,24 +31,16 @@ pub fn run(cmd: AccountCommand, cli: &Cli) -> Result<()> {
         }
         AccountCommand::Whoami => {
             let c = cmail_core::Cmail::open(&root)?;
-            let me = c.resolve_identity(cli.as_name.as_deref());
+            let me = c.resolve_identity(cli.as_name.as_deref())?;
+            // No identity is an error (exit 1) per spec §7 — never a success
+            // with an "error" key.
             if cli.json {
-                let value = match me {
-                    Ok(n) => serde_json::json!({
-                        "identity": n,
-                        "root": root.display().to_string(),
-                    }),
-                    Err(e) => serde_json::json!({
-                        "error": e.to_string(),
-                        "root": root.display().to_string(),
-                    }),
-                };
-                output::print_json(&value);
+                output::print_json(&serde_json::json!({
+                    "identity": me,
+                    "root": root.display().to_string(),
+                }));
             } else {
-                match me {
-                    Ok(n) => println!("identity: {n}"),
-                    Err(_) => println!("no identity configured (root: {})", root.display()),
-                }
+                println!("identity: {me}");
             }
             Ok(())
         }

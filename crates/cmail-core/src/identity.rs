@@ -83,11 +83,18 @@ pub fn create_identity(root: &Path, name: &str) -> Result<Identity> {
 pub fn load_identity(root: &Path, name: &str) -> Result<Identity> {
     let key_path = identity_dir(root, name).join("key.ed25519");
     let bytes = fs::read(&key_path).map_err(|_| CoreError::IdentityNotFound(name.to_string()))?;
-    let signing = SigningKey::from_bytes(&{
-        let mut b = [0u8; 32];
-        b.copy_from_slice(&bytes);
-        b
-    });
+    if bytes.len() != 32 {
+        // Never crash on bad input (spec §7): a truncated key file is realistic
+        // under root-sync. Recover by deleting the broken identity and letting
+        // init regenerate it.
+        return Err(CoreError::Config(format!(
+            "corrupt identity key for '{name}' ({} bytes, expected 32); delete ~/.cmail/identities/{name} and re-run cmail init",
+            bytes.len()
+        )));
+    }
+    let mut b = [0u8; 32];
+    b.copy_from_slice(&bytes);
+    let signing = SigningKey::from_bytes(&b);
     Ok(Identity {
         name: name.to_string(),
         signing,
@@ -165,6 +172,16 @@ mod tests {
     fn load_missing_fails_with_hint() {
         let root = root();
         let err = load_identity(root.path(), "ghost").unwrap_err();
+        assert!(err.to_string().contains("cmail init"));
+    }
+
+    #[test]
+    fn truncated_key_file_errors_cleanly() {
+        let root = TempDir::new().unwrap();
+        create_identity(root.path(), "zoe").unwrap();
+        fs::write(root.path().join("identities/zoe/key.ed25519"), b"short").unwrap();
+        let err = load_identity(root.path(), "zoe").unwrap_err();
+        assert!(err.to_string().contains("corrupt identity key"));
         assert!(err.to_string().contains("cmail init"));
     }
 }

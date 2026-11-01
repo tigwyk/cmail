@@ -206,9 +206,12 @@ owner.
 
 JSONL at `<root>/audit.log`, append-only. Events: `init`, `send`, `held`,
 `approve`, `reject`, `read`, `allow_add`, `allow_remove`, `key_add`,
-`spoof_suspected`, `corrupt`, `quarantine_release`. Each line: `{ts, event, actor (identity
-or "human"), msg_id, counterpart, outcome, detail}`. `cmail audit [--tail N]`
-reads it. No tooling beyond tail in v1.
+`spoof_suspected`, `corrupt`, `quarantine_release`. Each line: `{ts, event, actor
+(identity, "human", or "system" for automated routing decisions such as
+spoof/corrupt quarantine), msg_id, counterpart, outcome, detail}`. `cmail audit
+[--tail N]` reads it. No tooling beyond tail in v1. The strict-mode unknown-sender
+route is audited as `corrupt` with detail "strict mode: unknown sender" — a
+policy routing, not corruption; a distinct event name is a future refinement.
 
 ### 4.5 config.toml
 
@@ -263,7 +266,9 @@ stable, and fully under our control — which also keeps the untrusted-content
 presentation exact and the dependency tree minimal.
 Tools mirror the agent-safe subset of the CLI:
 
-- `cmail_send` (args: to, kind, subject, body, attachments?, reply_to?)
+- `cmail_send` (args: to, kind, subject, body, reply_to? — deliberately NO
+  attachments argument over MCP: honoring server-side attachment paths would
+  let an agent copy arbitrary local files into outbound mail)
 - `cmail_inbox`
 - `cmail_read` (id)
 - `cmail_reply` (id, body, subject?)
@@ -310,7 +315,7 @@ Cargo workspace, single `cmail` binary:
   keyring, mailbox store, trust computation, audit, config, limits. No CLI/MCP
   concerns. All crypto and filesystem policy lives here, unit-tested.
 - `crates/cmail-cli` — clap definitions, human/JSON output formatting, `main`.
-- `crates/cmail-mcp` — rmcp server, thin wrapper over `cmail-core`.
+- `crates/cmail-mcp` — hand-rolled MCP stdio server (see §6), thin wrapper over `cmail-core`.
 
 Dependencies: `ed25519-dalek`, `serde`/`serde_json`, `clap`, `toml`,
 `sha2`, `rand`, `thiserror`/`anyhow`, `hex`/`base64`, `time`. `wait` polls the

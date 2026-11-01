@@ -73,7 +73,12 @@ pub fn append(root: &Path, record: &AuditRecord) -> Result<()> {
         .create(true)
         .append(true)
         .open(root.join("audit.log"))?;
-    writeln!(f, "{}", serde_json::to_string(record)?)?;
+    // Single atomic append (payload + newline in one write_all): concurrent
+    // appenders are cmail's normal mode (one process per agent on a shared
+    // root), and a torn line would make `tail` — and the fail-closed
+    // `was_released` gate — reject the whole log. See final whole-branch review.
+    let line = format!("{}\n", serde_json::to_string(record)?);
+    f.write_all(line.as_bytes())?;
     Ok(())
 }
 
