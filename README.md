@@ -16,7 +16,20 @@ JSON envelopes sitting in plain directories.
 
 ## Install
 
-Requires a Rust toolchain.
+Prebuilt binaries (Linux x86_64/aarch64, Windows x86_64, macOS x86_64/aarch64)
+are attached to each [release](https://github.com/tigwyk/cmail/releases) with a
+`SHA256SUMS.txt` — download, verify, put on PATH:
+
+```bash
+curl -LO https://github.com/tigwyk/cmail/releases/download/v0.1.0/cmail-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf cmail-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install cmail-v0.1.0-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
+```
+
+(Substitute your platform and the current version from the
+[releases page](https://github.com/tigwyk/cmail/releases).)
+
+Or build from source (requires a Rust toolchain):
 
 ```bash
 git clone https://github.com/tigwyk/cmail && cd cmail
