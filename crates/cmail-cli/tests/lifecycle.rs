@@ -13,7 +13,10 @@ const UNTRUSTED_CLOSE: &str = "--- END UNTRUSTED MAIL BODY ---";
 
 fn cmail(root: &TempDir) -> Command {
     let mut c = Command::cargo_bin("cmail").unwrap();
-    c.arg("--root").arg(root.path());
+    c.arg("--root")
+        .arg(root.path())
+        .env_remove("CMAIL_IDENTITY")
+        .env_remove("CMAIL_HOME");
     c
 }
 
@@ -144,7 +147,12 @@ fn full_lifecycle_with_json_shapes() {
         read["body"].as_str().unwrap().lines().next(),
         Some(UNTRUSTED_OPEN)
     );
-    assert_eq!(read["fingerprint"].as_str().unwrap().len(), 16);
+    let fp = read["fingerprint"].as_str().unwrap();
+    assert_eq!(fp.len(), 16);
+    assert!(
+        fp.chars().all(|c| c.is_ascii_hexdigit()),
+        "fingerprint not hex: {fp}"
+    );
 
     // human trusts alice; a second send now arrives verified
     let trusted = json_out(
@@ -396,6 +404,16 @@ fn quarantine_release_success_moves_to_archive_and_reads() {
             .arg("read")
             .arg(&id),
     );
+    // pin directly that the re-scan did not re-quarantine the released mail
+    let q_final = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("zoe")
+            .arg("--json")
+            .arg("quarantine")
+            .arg("list"),
+    );
+    assert_eq!(q_final.as_array().map(Vec::len), Some(0));
 }
 
 #[test]
