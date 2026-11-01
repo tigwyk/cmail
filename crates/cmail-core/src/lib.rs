@@ -1,9 +1,4 @@
-pub mod placeholder;
+pub mod canonical;
+pub mod error;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn workspace_smoke() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+pub use error::{CoreError, Result};
