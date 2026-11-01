@@ -115,7 +115,10 @@ impl Cmail {
                 return Ok(n);
             }
         }
-        if let Some(n) = &self.config.default_identity {
+        // Read fresh from disk: default_identity may have been set after this
+        // handle was opened (long-lived MCP process), mirroring send()'s gate.
+        let cfg = Config::load_or_init(&self.root)?;
+        if let Some(n) = &cfg.default_identity {
             if !n.is_empty() {
                 if !identity_exists(&self.root, n) {
                     return Err(CoreError::IdentityNotFound(n.clone()));
@@ -153,10 +156,41 @@ impl Cmail {
         let id = new_id();
         let identity = load_identity(&self.root, &from)?;
         let attachment_meta = self.store.copy_attachments(&id, attachments)?;
-        let env = build_and_sign(
+        let outcome = self.send_gated(
             &id,
+            &identity,
+            &from,
+            to,
+            kind,
+            subject,
+            body,
+            attachment_meta,
+            reply_to,
+        );
+        if outcome.is_err() {
+            // no orphaned attachments/<id>/ on any failure (review hardening)
+            let _ = std::fs::remove_dir_all(self.store.attachments_dir(&id));
+        }
+        outcome
+    }
+
+    #[expect(clippy::too_many_arguments)]
+    fn send_gated(
+        &self,
+        id: &str,
+        identity: &crate::identity::Identity,
+        from: &str,
+        to: &str,
+        kind: &str,
+        subject: &str,
+        body: &str,
+        attachment_meta: Vec<crate::envelope::Attachment>,
+        reply_to: Option<&str>,
+    ) -> Result<SendOutcome> {
+        let env = build_and_sign(
+            id,
             &NewEnvelope {
-                from: from.clone(),
+                from: from.to_string(),
                 from_key: identity.public_key_b64(),
                 to: to.to_string(),
                 kind: kind.to_string(),
@@ -168,7 +202,7 @@ impl Cmail {
             },
             &identity.signing,
         )?;
-        self.store.ensure_mailbox(&from)?;
+        self.store.ensure_mailbox(from)?;
         self.store.ensure_mailbox(to)?;
         // Gate on the current on-disk config: allow_add/approve may have updated the
         // allowlist after this Cmail handle was opened (long-lived MCP process).
@@ -177,23 +211,23 @@ impl Cmail {
             self.store.write_envelope(&self.store.inbox_dir(to), &env)?;
             append(
                 &self.root,
-                &AuditRecord::now(AuditEvent::Send, &from)
-                    .msg(&id)
+                &AuditRecord::now(AuditEvent::Send, from)
+                    .msg(id)
                     .counterpart(to),
             )?;
-            Ok(SendOutcome::Sent { id })
+            Ok(SendOutcome::Sent { id: id.to_string() })
         } else {
             self.store
-                .write_envelope(&self.store.pending_dir(&from), &env)?;
+                .write_envelope(&self.store.pending_dir(from), &env)?;
             append(
                 &self.root,
-                &AuditRecord::now(AuditEvent::Held, &from)
-                    .msg(&id)
+                &AuditRecord::now(AuditEvent::Held, from)
+                    .msg(id)
                     .counterpart(to)
                     .outcome("held for approval"),
             )?;
             Ok(SendOutcome::Held {
-                id,
+                id: id.to_string(),
                 to: to.to_string(),
             })
         }
@@ -208,14 +242,24 @@ impl Cmail {
         for o in owners {
             for id in self.store.list_ids(&self.store.pending_dir(&o)) {
                 let raw = self.store.read_raw(&self.store.pending_dir(&o), &id)?;
-                if let Ok(env) = Envelope::parse(&raw) {
-                    out.push(HeldMessage {
+                match Envelope::parse(&raw) {
+                    Ok(env) => out.push(HeldMessage {
                         id: env.id,
                         from: env.from,
                         to: env.to,
                         subject: env.subject,
                         created: env.created,
-                    });
+                    }),
+                    // A pending file that no longer parses must stay visible to
+                    // the human, not silently disappear from the approval list
+                    // (review hardening).
+                    Err(_) => out.push(HeldMessage {
+                        id,
+                        from: o.clone(),
+                        to: String::new(),
+                        subject: "<unparseable pending message>".into(),
+                        created: String::new(),
+                    }),
                 }
             }
         }
@@ -225,6 +269,11 @@ impl Cmail {
 
     pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
         let (owner, env) = self.store.find_pending(id)?;
+        // Re-verify the recipient still has an identity: it may have been
+        // removed after the mail was held (review hardening).
+        if !identity_exists(&self.root, &env.to) {
+            return Err(CoreError::UnknownRecipient(env.to));
+        }
         self.store.ensure_mailbox(&env.to)?;
         self.store.move_message(
             &self.store.pending_dir(&owner),
@@ -247,13 +296,20 @@ impl Cmail {
         let (owner, env) = self.store.find_pending(id)?;
         self.store
             .delete_message(&self.store.pending_dir(&owner), id)?;
-        let _ = std::fs::remove_dir_all(self.store.attachments_dir(id));
+        let removed = std::fs::remove_dir_all(self.store.attachments_dir(id));
+        // Honest audit: report attachment-removal failure instead of a bare
+        // "deleted" (review hardening).
+        let outcome = if removed.is_ok() {
+            "deleted"
+        } else {
+            "deleted (attachments removal failed)"
+        };
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::Reject, "human")
                 .msg(id)
                 .counterpart(&env.to)
-                .outcome("deleted"),
+                .outcome(outcome),
         )?;
         Ok(())
     }
@@ -508,11 +564,13 @@ impl Cmail {
         let before: Vec<String> = self.inbox(as_name)?.into_iter().map(|i| i.id).collect();
         let start = std::time::Instant::now();
         loop {
-            std::thread::sleep(std::time::Duration::from_millis(250));
+            // Check before sleeping: a zero timeout (or mail that arrived while
+            // the caller was setting up) must return without a 250 ms delay.
             let current = self.inbox(as_name)?;
             if current.iter().any(|i| !before.contains(&i.id)) || start.elapsed() >= timeout {
                 return Ok(current);
             }
+            std::thread::sleep(std::time::Duration::from_millis(250));
         }
     }
 
@@ -968,5 +1026,142 @@ mod tests {
         assert_eq!(c.allow_list().unwrap(), vec!["zoe"]);
         let recs = c.audit_tail(5).unwrap();
         assert!(recs.iter().any(|r| r.event == AuditEvent::AllowRemove));
+    }
+
+    // --- Task H5 tests: service consistency and failure cleanup ---
+
+    #[test]
+    fn send_failure_cleans_up_attachments() {
+        let (_root, c) = svc();
+        let att = _root.path().join("note.txt");
+        std::fs::write(&att, "x").unwrap();
+        let before = std::fs::read_dir(_root.path().join("attachments"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        // invalid kind trips build_and_sign AFTER copy_attachments ran
+        assert!(c
+            .send(Some("alice"), "zoe", "shout", "s", "b", &[att], None)
+            .is_err());
+        let after = std::fs::read_dir(_root.path().join("attachments"))
+            .map(|d| d.count())
+            .unwrap_or(0);
+        assert_eq!(before, after, "failed send must not orphan attachments");
+    }
+
+    #[test]
+    fn approve_rejects_missing_recipient_identity() {
+        let (_root, c) = svc();
+        let SendOutcome::Held { id, .. } = c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        std::fs::remove_dir_all(_root.path().join("identities").join("zoe")).unwrap();
+        let err = c.approve(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::UnknownRecipient(_)), "{err}");
+    }
+
+    #[test]
+    fn approvals_list_unparseable_pending() {
+        let (_root, c) = svc();
+        c.store.ensure_mailbox("alice").unwrap();
+        std::fs::write(
+            c.store
+                .pending_dir("alice")
+                .join(format!("{}.mail", "ab".repeat(16))),
+            "garbage",
+        )
+        .unwrap();
+        let apps = c.approvals(None).unwrap();
+        assert!(apps
+            .iter()
+            .any(|h| h.id == "ab".repeat(16) && h.subject.contains("unparseable")));
+    }
+
+    #[test]
+    fn default_identity_read_fresh_from_disk() {
+        let (root, c) = svc();
+        assert!(c.resolve_identity(None).is_err());
+        let mut cfg = c.config.clone();
+        cfg.default_identity = Some("zoe".into());
+        cfg.save(root.path()).unwrap();
+        // same handle, no reopen:
+        assert_eq!(c.resolve_identity(None).unwrap(), "zoe");
+    }
+
+    #[test]
+    fn wait_with_zero_timeout_returns_immediately() {
+        let (_root, c) = svc();
+        let start = std::time::Instant::now();
+        let _ = c
+            .wait(Some("zoe"), std::time::Duration::from_secs(0))
+            .unwrap();
+        assert!(
+            start.elapsed() < std::time::Duration::from_millis(200),
+            "zero timeout must not sleep"
+        );
+    }
+
+    #[test]
+    fn strict_mode_quarantines_unknown_senders() {
+        let (root, c) = svc();
+        // deliver one untrusted message (alice -> zoe, allowlisted for the test)
+        c.allow_add("zoe").unwrap();
+        let id = match c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        {
+            SendOutcome::Sent { id } => id,
+            _ => panic!(),
+        };
+        // flip to strict mode on disk; inbox() must quarantine the untrusted mail
+        let mut cfg = c.config.clone();
+        cfg.inbound = crate::config::InboundMode::KnownOnly;
+        cfg.save(root.path()).unwrap();
+        assert!(c.inbox(Some("zoe")).unwrap().is_empty());
+        assert_eq!(
+            c.store.list_ids(&c.store.quarantine_dir("zoe")),
+            vec![id.clone()]
+        );
+        // back to permissive on a fresh handle: released-by-config, but still untrusted
+        let mut cfg = c.config.clone();
+        cfg.inbound = crate::config::InboundMode::Permissive;
+        cfg.save(root.path()).unwrap();
+        let c2 = Cmail::open(root.path()).unwrap();
+        assert_eq!(c2.inbox(Some("zoe")).unwrap().len(), 0); // still in quarantine, not re-listed
+        c2.quarantine_release(&id).unwrap();
+        let msg = c2.read_message(Some("zoe"), &id).unwrap();
+        assert_eq!(msg.trust, "untrusted");
+        assert!(msg.body.contains("UNTRUSTED MAIL BODY"));
+    }
+
+    #[test]
+    fn reject_audit_outcome_is_honest_about_attachment_removal() {
+        let (_root, c) = svc();
+        // happy path: attachments dir present and removable -> plain "deleted"
+        let SendOutcome::Held { id, .. } = c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        c.reject(&id).unwrap();
+        let recs = c.audit_tail(1).unwrap();
+        assert_eq!(recs[0].event, AuditEvent::Reject);
+        assert_eq!(recs[0].outcome, "deleted");
+        // attachments dir vanished from under the held mail -> the audit must
+        // say so instead of a bare "deleted"
+        let SendOutcome::Held { id, .. } = c
+            .send(Some("alice"), "zoe", "note", "s2", "b2", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        std::fs::remove_dir_all(c.store.attachments_dir(&id)).unwrap();
+        c.reject(&id).unwrap();
+        let recs = c.audit_tail(1).unwrap();
+        assert_eq!(recs[0].event, AuditEvent::Reject);
+        assert_eq!(recs[0].outcome, "deleted (attachments removal failed)");
     }
 }
