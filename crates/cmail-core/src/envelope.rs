@@ -70,7 +70,7 @@ fn validate(p: &NewEnvelope, id: &str) -> Result<()> {
     if p.subject.chars().count() > MAX_SUBJECT_LEN {
         return bad("subject exceeds 200 chars");
     }
-    if p.subject.contains('\n') {
+    if p.subject.contains('\n') || p.subject.contains('\r') {
         return bad("subject must be a single line");
     }
     if p.body.len() > MAX_BODY_BYTES {
@@ -86,9 +86,14 @@ fn validate(p: &NewEnvelope, id: &str) -> Result<()> {
         return bad("attachments exceed 25 MiB total");
     }
     if let Some(parent) = &p.in_reply_to {
-        if parent.len() != 32 {
+        if parent.len() != 32 || !parent.chars().all(|c| c.is_ascii_hexdigit()) {
             return bad("in_reply_to must be a message id");
         }
+    }
+    if time::OffsetDateTime::parse(&p.created, &time::format_description::well_known::Rfc3339)
+        .is_err()
+    {
+        return bad("created must be an RFC 3339 timestamp");
     }
     Ok(())
 }
@@ -277,5 +282,51 @@ mod tests {
         let parsed = Envelope::parse(&serde_json::to_string(&env).unwrap()).unwrap();
         assert_eq!(parsed.id, env.id);
         assert!(Envelope::parse("not json").is_err());
+    }
+
+    #[test]
+    fn parse_rejects_bad_created_in_reply_to_and_cr() {
+        let (alice, _) = fixtures();
+        let from_key = B64.encode(alice.verifying_key().as_bytes());
+        let mut p = parts("alice", &from_key, "zoe");
+        p.created = "not a date".into();
+        assert!(build_and_sign("66".repeat(16).as_str(), &p, &alice).is_err());
+
+        // parse-time rejection of a hand-edited envelope
+        let env = build_and_sign(
+            "77".repeat(16).as_str(),
+            &parts("alice", &from_key, "zoe"),
+            &alice,
+        )
+        .unwrap();
+        let tamper = |env: &Envelope, field: &str, value: String| {
+            let mut e = env.clone();
+            match field {
+                "created" => e.created = value,
+                "in_reply_to" => e.in_reply_to = Some(value),
+                "subject" => e.subject = value,
+                _ => unreachable!(),
+            }
+            // re-sign so ONLY the semantic rule is under test, not the signature
+            build_and_sign(
+                &e.id,
+                &NewEnvelope {
+                    from: e.from.clone(),
+                    from_key: e.from_key.clone(),
+                    to: e.to.clone(),
+                    kind: e.kind.clone(),
+                    subject: e.subject.clone(),
+                    body: e.body.clone(),
+                    attachments: e.attachments.clone(),
+                    in_reply_to: e.in_reply_to.clone(),
+                    created: e.created.clone(),
+                },
+                &alice,
+            )
+        };
+        assert!(tamper(&env, "created", "yesterday".into()).is_err());
+        assert!(tamper(&env, "in_reply_to", "zz".repeat(16)).is_err()); // right length, not hex
+        assert!(tamper(&env, "in_reply_to", "ab".repeat(16)).is_ok()); // valid hex is fine
+        assert!(tamper(&env, "subject", "has\rreturn".into()).is_err());
     }
 }
