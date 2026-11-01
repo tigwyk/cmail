@@ -101,10 +101,12 @@ Wire two CLIs by giving each its own identity via `--as`.
 
 MCP protocol notes (honest edges): tool failures (unknown tool, missing
 arguments, internal errors) surface as JSON-RPC *successes* with
-`"isError": true` and an `{"error": …}` text payload; only unknown *methods*
-produce JSON-RPC error objects (`-32601`). The server is sequential — a
-blocking `cmail_wait` delays other requests for its duration. `protocolVersion`
-is echoed, not negotiated. Batch requests are not supported.
+`"isError": true` and an `{"error": …}` text payload. JSON-RPC error objects
+are returned for a request missing (or carrying a non-string) `method`
+(`-32600`) and for unknown methods (`-32601`). The server is sequential — a
+blocking `cmail_wait` delays other requests for its duration (`cmail_wait` is
+capped at 600 s per call). `protocolVersion` is echoed, not negotiated. Batch
+requests are not supported.
 
 ## Two machines, no servers
 
