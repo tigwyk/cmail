@@ -216,7 +216,7 @@ read/observe commands), `--root <path>` (debug/testing).
 | `cmail approvals` | Held outbound mail (all identities by default, `--as` to scope). |
 | `cmail approve <id> [--remember]` | Deliver held mail; optionally allowlist recipient. |
 | `cmail reject <id>` | Delete held mail. |
-| `cmail keyring add <n> [--key-file f] \| list` | Trust management (human-only). |
+| `cmail keyring add <n> [--key-file f] \| list` | Trust management (human-only). Default: promotes a local identity's public key from `identities/<n>/`; `--key-file` imports an external public key (the cross-machine case). |
 | `cmail quarantine list\|show\|release` | Quarantine management (human-only). |
 | `cmail audit [--tail N]` | Tail audit log. |
 | `cmail mcp` | Run stdio MCP server (section 6). |
@@ -254,9 +254,11 @@ verbs so non-MCP harnesses adopt it with zero glue.
 ## 7. Error handling
 
 - Unknown/typo recipient (no identity) → immediate error, no mail written.
-- Corrupt envelope (invalid JSON, unknown fields version-tolerated) → quarantine +
-  audit `spoof_suspected` only if signature fails against a known name; corrupt
-  unknown-sender mail is simply untrusted. Never crash on bad input.
+- Unparseable file (invalid JSON) in any mail dir → quarantine + audit
+  (`corrupt`), regardless of sender. It is not readable mail.
+- Parseable envelope whose `sig` fails against a *known* `from` name →
+  quarantine + audit `spoof_suspected` (section 4.2). Parseable envelope from an
+  unknown name → ordinary untrusted mail. Never crash on bad input.
 - Missing identity for a command that needs one → error with "run cmail init".
 - Concurrent access: atomic temp+rename writes, one file per message, append-only
   audit. No locking in v1 (collision odds are negligible; worst case is a duplicate
