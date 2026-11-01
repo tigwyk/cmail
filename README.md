@@ -19,7 +19,7 @@ JSON envelopes sitting in plain directories.
 Requires a Rust toolchain.
 
 ```bash
-git clone <this-repo> && cd cmail
+git clone https://github.com/tigwyk/cmail && cd cmail
 cargo install --path .
 ```
 
@@ -123,3 +123,9 @@ Spec (envelope format, trust/permissioning model, CLI reference, audit events):
 [`docs/superpowers/specs/2026-11-01-cmail-design.md`](docs/superpowers/specs/2026-11-01-cmail-design.md)
 
 Agent-facing cheat sheet: [`AGENTS.md`](AGENTS.md)
+
+## License
+
+Dual-licensed under [MIT](LICENSE-MIT) or [Apache-2.0](LICENSE-APACHE), at your
+option — pick whichever suits. The Rust ecosystem standard, so cmail drops into
+any project without license friction.
