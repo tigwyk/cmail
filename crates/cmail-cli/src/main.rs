@@ -190,13 +190,25 @@ fn map_quarantine(cmd: &QuarantineCommand) -> commands::admin::QuarantineCmd {
 
 fn main() {
     let cli = Cli::parse();
-    let result = match &cli.command {
+    let result = dispatch(&cli);
+    if let Err(e) = result {
+        if cli.json {
+            output::fail_json(&e.to_string());
+        } else {
+            eprintln!("error: {e}");
+        }
+        std::process::exit(1);
+    }
+}
+
+fn dispatch(cli: &Cli) -> anyhow::Result<()> {
+    match &cli.command {
         Commands::Init { name } => commands::account::run(
             commands::account::AccountCommand::Init { name: name.clone() },
-            &cli,
+            cli,
         ),
-        Commands::Whoami => commands::account::run(commands::account::AccountCommand::Whoami, &cli),
-        Commands::Config => commands::account::run(commands::account::AccountCommand::Config, &cli),
+        Commands::Whoami => commands::account::run(commands::account::AccountCommand::Whoami, cli),
+        Commands::Config => commands::account::run(commands::account::AccountCommand::Config, cli),
         Commands::Send {
             to,
             kind,
@@ -206,7 +218,7 @@ fn main() {
             attachments,
             reply_to,
         } => commands::mail::send(
-            &cli,
+            cli,
             to,
             kind,
             subject,
@@ -215,31 +227,25 @@ fn main() {
             attachments.clone(),
             reply_to.clone(),
         ),
-        Commands::Inbox => commands::mail::inbox(&cli),
-        Commands::Read { id } => commands::mail::read(&cli, id),
+        Commands::Inbox => commands::mail::inbox(cli),
+        Commands::Read { id } => commands::mail::read(cli, id),
         Commands::Reply { id, body, subject } => {
-            commands::mail::reply(&cli, id, body.clone(), subject.clone())
+            commands::mail::reply(cli, id, body.clone(), subject.clone())
         }
-        Commands::Wait { timeout_secs } => commands::mail::wait(&cli, *timeout_secs),
-        Commands::List { all } => commands::mail::list(&cli, *all),
-        Commands::Allow { cmd } => commands::admin::allow(&cli, map_allow(cmd)),
-        Commands::Approvals => commands::admin::approvals(&cli),
-        Commands::Approve { id, remember } => commands::admin::approve(&cli, id, *remember),
-        Commands::Reject { id } => commands::admin::reject(&cli, id),
-        Commands::Keyring { cmd } => commands::admin::keyring(&cli, map_keyring(cmd)),
-        Commands::Quarantine { cmd } => commands::admin::quarantine(&cli, map_quarantine(cmd)),
-        Commands::Audit { tail } => commands::admin::audit(&cli, *tail),
-        Commands::Mcp => {
-            println!("not yet implemented");
-            std::process::exit(1);
-        }
-    };
-    if let Err(e) = result {
-        if cli.json {
-            output::fail_json(&e.to_string());
-        } else {
-            eprintln!("error: {e}");
-        }
-        std::process::exit(1);
+        Commands::Wait { timeout_secs } => commands::mail::wait(cli, *timeout_secs),
+        Commands::List { all } => commands::mail::list(cli, *all),
+        Commands::Allow { cmd } => commands::admin::allow(cli, map_allow(cmd)),
+        Commands::Approvals => commands::admin::approvals(cli),
+        Commands::Approve { id, remember } => commands::admin::approve(cli, id, *remember),
+        Commands::Reject { id } => commands::admin::reject(cli, id),
+        Commands::Keyring { cmd } => commands::admin::keyring(cli, map_keyring(cmd)),
+        Commands::Quarantine { cmd } => commands::admin::quarantine(cli, map_quarantine(cmd)),
+        Commands::Audit { tail } => commands::admin::audit(cli, *tail),
+        Commands::Mcp => cmail_mcp::run_server(
+            cli.root_path()?,
+            cli.as_name.clone(),
+            std::io::BufReader::new(std::io::stdin()),
+            &mut std::io::stdout(),
+        ),
     }
 }

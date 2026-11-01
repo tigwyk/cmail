@@ -258,7 +258,9 @@ mod tests {
         let store = MailStore::new(root.path());
         let src = root.path().join("hello.txt");
         fs::write(&src, b"hello world").unwrap();
-        let atts = store.copy_attachments("id1", &[src.clone()]).unwrap();
+        let atts = store
+            .copy_attachments("id1", std::slice::from_ref(&src))
+            .unwrap();
         assert_eq!(atts[0].filename, "hello.txt");
         assert_eq!(atts[0].size, 11);
         assert_eq!(atts[0].sha256.len(), 64);
