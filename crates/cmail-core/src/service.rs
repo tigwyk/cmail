@@ -356,12 +356,13 @@ impl Cmail {
         let archive = self.store.archive_dir(&me);
         let in_inbox = inbox.join(format!("{id}.mail")).exists();
         // Unread (inbox) copies read normally. A copy already in the archive is
-        // readable only when it has never been read — i.e. it landed there via
-        // `quarantine release` (spec 4.2: archive is in the read path for
-        // released mail). Anything else reads back as MessageNotFound
+        // readable only when it was human-released from quarantine (spec 4.2:
+        // archive is in the read path for released mail); release means
+        // "human-approved for reading", so released mail is re-readable any
+        // number of times. Anything else reads back as MessageNotFound
         // ("already read or not found").
         let released =
-            !in_inbox && archive.join(format!("{id}.mail")).exists() && !self.was_read_by(&me, id);
+            !in_inbox && archive.join(format!("{id}.mail")).exists() && self.was_released(id);
         if !in_inbox && !released {
             return Err(CoreError::MessageNotFound(format!(
                 "{id} (already read or not found)"
@@ -403,19 +404,19 @@ impl Cmail {
         })
     }
 
-    /// Whether `actor` already read `id` (a prior `read` audit event). With no
-    /// sidecar state, the audit log is the record that distinguishes an
-    /// archived copy that was read from one placed there by `quarantine_release`.
-    fn was_read_by(&self, actor: &str, id: &str) -> bool {
+    /// Whether `id` was released from quarantine by a human (a
+    /// `quarantine_release` audit event). Release = "human-approved for
+    /// reading", so released mail stays re-readable; every read is still
+    /// audited.
+    fn was_released(&self, id: &str) -> bool {
         crate::audit::tail(&self.root, usize::MAX)
             .map(|records| {
                 records.iter().any(|r| {
-                    r.event == AuditEvent::Read
-                        && r.actor == actor
+                    r.event == crate::audit::AuditEvent::QuarantineRelease
                         && r.msg_id.as_deref() == Some(id)
                 })
             })
-            .unwrap_or(false)
+            .unwrap_or(false) // log absent/corrupt -> not released -> archived mail stays locked (fail-closed)
     }
 
     pub fn reply(
@@ -822,6 +823,29 @@ mod tests {
         assert!(msg.body.starts_with(UNTRUSTED_OPEN));
         assert!(msg.body.ends_with(UNTRUSTED_CLOSE));
         assert!(msg.body.contains("imposter"));
+    }
+
+    #[test]
+    fn archived_mail_stays_locked_when_audit_log_missing() {
+        let (root, c) = svc();
+        let SendOutcome::Held { id, .. } = c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        c.approve(&id, false).unwrap();
+        c.read_message(Some("zoe"), &id).unwrap(); // inbox -> archive
+        assert!(c
+            .store
+            .archive_dir("zoe")
+            .join(format!("{id}.mail"))
+            .exists());
+        // Audit-log loss must fail closed: an archived copy with no
+        // quarantine-release on record stays locked ("already read").
+        std::fs::remove_file(root.path().join("audit.log")).unwrap();
+        let err = c.read_message(Some("zoe"), &id).unwrap_err().to_string();
+        assert!(err.contains("already read") || err.contains("not found"));
     }
 
     #[test]
