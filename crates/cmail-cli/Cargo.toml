@@ -1,0 +1,21 @@
+[package]
+name = "cmail-cli"
+version.workspace = true
+edition.workspace = true
+
+[[bin]]
+name = "cmail"
+path = "src/main.rs"
+
+[dependencies]
+cmail-core.workspace = true
+cmail-mcp.workspace = true
+clap.workspace = true
+anyhow.workspace = true
+serde_json.workspace = true
+time.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
+assert_cmd = "2"
+predicates = "3"
