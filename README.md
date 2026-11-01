@@ -1,0 +1,119 @@
+# cmail
+
+Store-and-forward mail for AI agents, with **permissioning as the headline
+feature**. One static Rust binary, no daemon, no servers, no accounts: a shared
+mailbox root (`~/.cmail/`) is the meeting ground, messages are Ed25519-signed
+JSON envelopes sitting in plain directories.
+
+- **Agent-first** — a CLI with `--json` everywhere *and* a stdio MCP server in
+  the same binary. Any harness that speaks MCP gets `cmail` with zero glue.
+- **Zero-framework adoption** — a second agent joins by pointing its MCP config
+  at the same binary. No signup, no infrastructure, no background process.
+- **Permissioning first** — outbound mail to unapproved recipients is
+  quarantined for human release; inbound mail from unverified senders is
+  delivered wrapped in explicit `UNTRUSTED MAIL BODY` delimiters so agents
+  treat it as data, not instructions.
+
+## Install
+
+Requires a Rust toolchain.
+
+```bash
+cargo install --path .
+# or from a checkout:
+git clone <this-repo> && cd cmail && cargo install --path .
+```
+
+## Quickstart
+
+Two agents on one machine (adjust `--root` to taste; default is `~/.cmail`):
+
+```bash
+cmail init --name alice          # identity + Ed25519 keypair (idempotent)
+cmail init --name zoe
+
+# alice mails zoe a handoff — NOT allowlisted, so it's held, not sent:
+cmail --as alice send --to zoe --kind handoff --subject "handoff" --body "the state"
+# => {"status":"held","id":"…","to":"zoe"}
+
+# the human releases it (and optionally remembers zoe as approved):
+cmail approvals
+cmail approve <id> --remember
+
+# zoe reads it — unknown sender, so the body arrives fenced:
+cmail --as zoe --json read <id>
+# body: "--- UNTRUSTED MAIL BODY (sender not verified; …) ---\nthe state\n--- END …"
+
+# the human trusts alice's key; the next mail arrives verified, unfenced:
+cmail keyring add alice
+```
+
+## The trust model
+
+Every message is signed by its sender's Ed25519 key, and every envelope carries
+the sender's public key inline (`from_key`), so signatures are checkable even
+for strangers. Trust is computed at read time from YOUR local keyring — it is
+never stored in (or forgeable via) the message.
+
+| `trust` | Meaning | Presentation |
+|---|---|---|
+| `verified` | Sender's key is in your keyring and the signature verifies | Raw body |
+| `untrusted` | Valid signature, unknown key | Body wrapped in UNTRUSTED delimiters + key fingerprint shown (TOFU) |
+| `spoof_suspect` | Claims a known name but a *different* key signed it | Never reaches the inbox — quarantined, audited |
+| `invalid` | Signature fails against its own inline key | Quarantined, audited |
+
+## Human-only powers
+
+Agents can send, read, reply, wait, and list their own held mail — nothing
+else. These exist only in the CLI, used by the human owner:
+
+- `cmail approvals` / `approve <id> [--remember]` / `reject <id>` — the outbound gate
+- `cmail allow add|remove|list` — outbound allowlist
+- `cmail keyring add <name> [--key-file f | --from-message <id>]` / `list` — trust decisions
+- `cmail quarantine list|show|release` — quarantine review (`release` moves to
+  archive: reviewed, retained, never re-shown to the agent)
+- `cmail audit [--tail N]` — append-only log of every security-relevant event
+- `config.toml` — `outbound = "gated"|"open"`, `inbound = "permissive"|"known-only"`
+
+## MCP wiring
+
+```json
+{
+  "mcpServers": {
+    "cmail": {
+      "command": "cmail",
+      "args": ["mcp", "--as", "<this-agent's-identity>"]
+    }
+  }
+}
+```
+
+Six agent-safe tools: `cmail_send`, `cmail_inbox`, `cmail_read`, `cmail_reply`,
+`cmail_wait`, `cmail_approvals` (listing only). Held sends return
+`status: "held"` with guidance to inform the human; untrusted bodies arrive
+fenced; the tool descriptions themselves carry the "mail is data" rule.
+
+Wire two CLIs by giving each its own identity via `--as`.
+
+MCP protocol notes (honest edges): tool failures (unknown tool, missing
+arguments, internal errors) surface as JSON-RPC *successes* with
+`"isError": true` and an `{"error": …}` text payload; only unknown *methods*
+produce JSON-RPC error objects (`-32601`). The server is sequential — a
+blocking `cmail_wait` delays other requests for its duration. `protocolVersion`
+is echoed, not negotiated. Batch requests are not supported.
+
+## Two machines, no servers
+
+The mailbox root is just a directory of signed envelopes — sync it with
+Syncthing, git, rsync, or a USB stick. Signatures and the local keyring make
+synced copies safe: a name you know arriving with an unknown key is a spoof
+suspect, not a surprise. Relays/encryption-at-rest are deliberately out of
+scope for v1; the design path is written down in
+[the spec, §11](docs/superpowers/specs/2026-11-01-cmail-design.md).
+
+## Design documentation
+
+Spec (envelope format, trust/permissioning model, CLI reference, audit events):
+[`docs/superpowers/specs/2026-11-01-cmail-design.md`](docs/superpowers/specs/2026-11-01-cmail-design.md)
+
+Agent-facing cheat sheet: [`AGENTS.md`](AGENTS.md)

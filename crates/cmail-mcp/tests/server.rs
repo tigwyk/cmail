@@ -97,9 +97,37 @@ fn send_held_then_read_via_mcp() {
     let text = send_result["content"][0]["text"].as_str().unwrap();
     let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
     assert_eq!(parsed["status"], "held");
+    // Spec §6: held outcomes carry guidance pointing the agent at its human.
+    assert!(parsed["guidance"]
+        .as_str()
+        .expect("held outcome must carry guidance")
+        .contains("cmail approvals"));
     let apps = out[2]["result"]["content"][0]["text"].as_str().unwrap();
     let apps: serde_json::Value = serde_json::from_str(apps).unwrap();
     assert_eq!(apps.as_array().map(Vec::len), Some(1));
+}
+
+#[test]
+fn human_only_tool_call_is_unknown_tool() {
+    // Pins the human-only boundary from the call side, not just tools/list:
+    // `cmail_approve` must fail like any unknown tool, never execute.
+    let root = setup();
+    let out = drive(
+        root.path(),
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cmail_approve","arguments":{"id":"whatever"}}}"#,
+        ],
+    );
+    let resp = &out[1];
+    assert!(
+        resp.get("error").is_none(),
+        "tool failure must be JSON-RPC success"
+    );
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("unknown tool"), "got: {text}");
 }
 
 #[test]
