@@ -60,7 +60,8 @@ fn identity_dir(root: &Path, name: &str) -> PathBuf {
 }
 
 pub fn identity_exists(root: &Path, name: &str) -> bool {
-    identity_dir(root, name).join("key.ed25519").exists()
+    // Path safety (final-review hardening): never join an unvalidated name.
+    validate_name(name).is_ok() && identity_dir(root, name).join("key.ed25519").exists()
 }
 
 pub fn create_identity(root: &Path, name: &str) -> Result<Identity> {
@@ -81,6 +82,7 @@ pub fn create_identity(root: &Path, name: &str) -> Result<Identity> {
 }
 
 pub fn load_identity(root: &Path, name: &str) -> Result<Identity> {
+    validate_name(name)?;
     let key_path = identity_dir(root, name).join("key.ed25519");
     let bytes = fs::read(&key_path).map_err(|_| CoreError::IdentityNotFound(name.to_string()))?;
     if bytes.len() != 32 {
@@ -183,5 +185,20 @@ mod tests {
         let err = load_identity(root.path(), "zoe").unwrap_err();
         assert!(err.to_string().contains("corrupt identity key"));
         assert!(err.to_string().contains("cmail init"));
+    }
+
+    #[test]
+    fn identity_names_are_path_safe() {
+        let root = TempDir::new().unwrap();
+        create_identity(root.path(), "real").unwrap();
+        // Plant a key file at a traversal-relative location: root/identities/../evil/identities/real/key.ed25519
+        let planted = root.path().join("evil").join("identities").join("real");
+        fs::create_dir_all(&planted).unwrap();
+        fs::write(planted.join("key.ed25519"), [0u8; 32]).unwrap();
+        // Without validation, identity_exists(root, "../evil/identities/real") would find it.
+        assert!(!identity_exists(root.path(), "../evil/identities/real"));
+        assert!(identity_exists(root.path(), "real"));
+        let err = load_identity(root.path(), "../evil/identities/real").unwrap_err();
+        assert!(matches!(err, crate::error::CoreError::InvalidName(_)));
     }
 }
