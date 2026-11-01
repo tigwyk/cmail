@@ -12,7 +12,7 @@ pub enum CoreError {
     MessageNotFound(String),
     #[error("limit exceeded: {0}")]
     LimitExceeded(String),
-    #[error("config error: {0}")]
+    #[error("{0}")]
     Config(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),

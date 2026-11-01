@@ -5,6 +5,7 @@ pub mod envelope;
 pub mod error;
 pub mod identity;
 pub mod keyring;
+pub mod service;
 pub mod store;
 pub mod trust;
 
