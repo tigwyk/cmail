@@ -96,6 +96,19 @@ mod tests {
     }
 
     #[test]
+    fn conflict_error_names_the_existing_fingerprint() {
+        let mut kr = KeyRing::default();
+        kr.add("alice", "YWxpY2VrZXk=").unwrap();
+        let err = kr.add("alice", "bWFsbG9yeWtleQ==").unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("different key"), "{msg}");
+        assert!(
+            msg.contains(&fingerprint_of("YWxpY2VrZXk=")),
+            "must name the EXISTING key: {msg}"
+        );
+    }
+
+    #[test]
     fn remove_reports_existence() {
         let mut kr = KeyRing::default();
         kr.add("alice", "a2V5").unwrap();

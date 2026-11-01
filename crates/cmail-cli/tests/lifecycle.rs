@@ -211,6 +211,36 @@ fn full_lifecycle_with_json_shapes() {
     assert_eq!(rep["status"], "held");
     assert_eq!(rep["to"], "alice");
 
+    // allow add is no longer silent: it reports a status object under --json
+    // (placed after the reply check: allowlisting alice here must not change
+    // the reply-gate outcome asserted above)
+    let allowed = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("allow")
+            .arg("add")
+            .arg("alice"),
+    );
+    assert_eq!(allowed["status"], "allowed");
+    assert_eq!(allowed["name"], "alice");
+
+    // strict XOR: --body together with --body-file is an error, not a silent
+    // --body win (exits 1 with {"error": ...} on stdout under --json)
+    cmail(&root)
+        .arg("--as")
+        .arg("alice")
+        .arg("--json")
+        .arg("send")
+        .arg("--to")
+        .arg("zoe")
+        .arg("--body")
+        .arg("x")
+        .arg("--body-file")
+        .arg("y")
+        .assert()
+        .code(1)
+        .stdout(contains("\"error\""));
+
     // audit saw everything
     let audit = json_out(
         cmail(&root)
@@ -234,7 +264,7 @@ fn full_lifecycle_with_json_shapes() {
 }
 
 #[test]
-fn spoof_lands_in_quarantine_never_inbox() {
+fn corrupt_lands_in_quarantine_never_inbox() {
     let root = TempDir::new().unwrap();
     cmail(&root)
         .arg("--json")
@@ -293,6 +323,95 @@ fn spoof_lands_in_quarantine_never_inbox() {
             .arg("list"),
     );
     assert_eq!(q.as_array().map(Vec::len), Some(1));
+}
+
+/// A TRUE spoof: mallory's identity signs a self-consistent envelope claiming
+/// `from: alice` (the signature is valid against mallory's key, so only the
+/// keyring comparison can catch it). Zoe's human already trusts the real
+/// alice, so the scan must quarantine the impostor — never show it in inbox.
+#[test]
+fn true_spoof_lands_in_quarantine_never_inbox() {
+    let root = TempDir::new().unwrap();
+    cmail(&root)
+        .arg("init")
+        .arg("--name")
+        .arg("alice")
+        .assert()
+        .success();
+    cmail(&root)
+        .arg("init")
+        .arg("--name")
+        .arg("zoe")
+        .assert()
+        .success();
+    cmail(&root)
+        .arg("init")
+        .arg("--name")
+        .arg("mallory")
+        .assert()
+        .success();
+    cmail(&root)
+        .arg("keyring")
+        .arg("add")
+        .arg("alice")
+        .assert()
+        .success(); // zoe's human trusts alice
+
+    // Mallory signs an envelope claiming from: alice — self-consistent
+    // signature, only the keyring comparison can catch it. (base64 is not a
+    // cmail-cli dependency, so the b64 key comes from the identity itself.)
+    let (owner, env) = {
+        use cmail_core::envelope::{build_and_sign, NewEnvelope};
+        use cmail_core::identity::load_identity;
+        let mallory = load_identity(root.path(), "mallory").unwrap();
+        let env = build_and_sign(
+            &"ab".repeat(16),
+            &NewEnvelope {
+                from: "alice".into(),
+                from_key: mallory.public_key_b64(),
+                to: "zoe".into(),
+                kind: "note".into(),
+                subject: "fake".into(),
+                body: "imposter".into(),
+                attachments: vec![],
+                in_reply_to: None,
+                created: "2026-11-01T12:00:00Z".into(),
+            },
+            &mallory.signing,
+        )
+        .unwrap();
+        ("zoe", env)
+    };
+    std::fs::create_dir_all(root.path().join("mailboxes").join(owner).join("inbox")).unwrap();
+    std::fs::write(
+        root.path()
+            .join("mailboxes")
+            .join(owner)
+            .join("inbox")
+            .join(format!("{}.mail", env.id)),
+        serde_json::to_string_pretty(&env).unwrap(),
+    )
+    .unwrap();
+
+    let inbox = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("zoe")
+            .arg("--json")
+            .arg("inbox"),
+    );
+    assert_eq!(inbox.as_array().map(Vec::len), Some(0));
+    let q = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("zoe")
+            .arg("--json")
+            .arg("quarantine")
+            .arg("list"),
+    );
+    assert_eq!(q.as_array().map(Vec::len), Some(1));
+    // the quarantined mail still CLAIMS to be from alice — that's the tell
+    assert_eq!(q[0]["from"], "alice");
 }
 
 #[test]

@@ -6,8 +6,22 @@ use cmail_core::service::KeySource;
 pub fn allow(cli: &Cli, cmd: AllowCmd) -> Result<()> {
     let c = cmail_core::Cmail::open(&cli.root_path()?)?;
     match cmd {
-        AllowCmd::Add { name } => c.allow_add(&name)?,
-        AllowCmd::Remove { name } => c.allow_remove(&name)?,
+        AllowCmd::Add { name } => {
+            c.allow_add(&name)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({"status": "allowed", "name": name}));
+            } else {
+                println!("allowed {name}");
+            }
+        }
+        AllowCmd::Remove { name } => {
+            c.allow_remove(&name)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({"status": "removed", "name": name}));
+            } else {
+                println!("removed {name}");
+            }
+        }
         AllowCmd::List => {
             let v = c.allow_list()?;
             if cli.json {

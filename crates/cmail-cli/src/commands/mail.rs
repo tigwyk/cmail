@@ -24,6 +24,21 @@ pub fn print_read(m: &ReadMessage) {
     println!("{}", m.body);
 }
 
+/// Single home for the send/reply outcome rendering (send and reply share it;
+/// `SendOutcome` is `#[serde(tag = "status")]`, so the JSON shape is unchanged).
+pub fn print_outcome(json: bool, out: &SendOutcome) {
+    if json {
+        output::print_json(out);
+        return;
+    }
+    match out {
+        SendOutcome::Sent { id } => println!("sent ({id})"),
+        SendOutcome::Held { id, to } => {
+            println!("held for approval by {to} ({id}) — ask your human to run: cmail approvals")
+        }
+    }
+}
+
 // Mirrors the clap Send variant 1:1 (brief-pinned signature).
 #[expect(clippy::too_many_arguments)]
 pub fn send(
@@ -37,7 +52,8 @@ pub fn send(
     reply_to: Option<String>,
 ) -> Result<()> {
     let body = match (body, body_file) {
-        (Some(b), _) => b,
+        (Some(_), Some(_)) => bail!("provide --body or --body-file, not both"),
+        (Some(b), None) => b,
         (None, Some(f)) => {
             std::fs::read_to_string(&f).with_context(|| format!("reading {}", f.display()))?
         }
@@ -53,16 +69,7 @@ pub fn send(
         &attachments,
         reply_to.as_deref(),
     )?;
-    if cli.json {
-        output::print_json(&out);
-    } else {
-        match &out {
-            SendOutcome::Sent { id } => println!("sent ({id})"),
-            SendOutcome::Held { id, to } => println!(
-                "held for approval by {to} ({id}) — ask your human to run: cmail approvals"
-            ),
-        }
-    }
+    print_outcome(cli.json, &out);
     Ok(())
 }
 
@@ -98,16 +105,7 @@ pub fn reply(cli: &Cli, id: &str, body: Option<String>, subject: Option<String>)
         &body.unwrap_or_default(),
         subject.as_deref(),
     )?;
-    if cli.json {
-        output::print_json(&out);
-    } else {
-        match &out {
-            SendOutcome::Sent { id } => println!("sent ({id})"),
-            SendOutcome::Held { id, to } => println!(
-                "held for approval by {to} ({id}) — ask your human to run: cmail approvals"
-            ),
-        }
-    }
+    print_outcome(cli.json, &out);
     Ok(())
 }
 

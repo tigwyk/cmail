@@ -104,6 +104,13 @@ mod tests {
         let mut env = signed("alice", &alice, "zoe");
         env.body = "tampered".into();
         assert_eq!(evaluate(&env, &kr).level, TrustLevel::Invalid);
+
+        // tampered envelope CLAIMING a keyring-known name, signed by an impostor:
+        // signature check must win -> Invalid, not SpoofSuspect
+        let (kr, _) = keyring_with("alice", &alice);
+        let mut env = signed("alice", &mallory, "zoe");
+        env.body = "tampered".into();
+        assert_eq!(evaluate(&env, &kr).level, TrustLevel::Invalid);
     }
 
     #[test]

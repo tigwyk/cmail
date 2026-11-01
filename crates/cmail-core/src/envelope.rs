@@ -274,6 +274,31 @@ mod tests {
     }
 
     #[test]
+    fn attachment_size_limits_enforced() {
+        let (alice, _) = fixtures();
+        let from_key = B64.encode(alice.verifying_key().as_bytes());
+        // per-file: one attachment over 10 MiB
+        let big = Attachment {
+            filename: "big".into(),
+            sha256: "0".repeat(64),
+            size: MAX_ATTACHMENT_BYTES + 1,
+        };
+        let mut p = parts("alice", &from_key, "zoe");
+        p.attachments = vec![big];
+        assert!(build_and_sign("88".repeat(16).as_str(), &p, &alice).is_err());
+        // total: 3 files of 9 MiB = 27 MiB > 25 MiB, count 3 <= 8, so the
+        // TOTAL limit is what trips (9 files would hit the count limit first)
+        let mid = Attachment {
+            filename: "m".into(),
+            sha256: "0".repeat(64),
+            size: 9 * 1024 * 1024,
+        };
+        let mut p = parts("alice", &from_key, "zoe");
+        p.attachments = vec![mid; 3];
+        assert!(build_and_sign("99".repeat(16).as_str(), &p, &alice).is_err());
+    }
+
+    #[test]
     fn parse_round_trip_and_reject_garbage() {
         let (alice, _) = fixtures();
         let from_key = B64.encode(alice.verifying_key().as_bytes());
