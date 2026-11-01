@@ -192,6 +192,31 @@ impl MailStore {
         }
         Err(CoreError::MessageNotFound(id.to_string()))
     }
+
+    /// Locate a pending message WITHOUT parsing it. A corrupt pending file
+    /// (visible in approvals since H5) can't survive `find_pending`'s parse,
+    /// but the human must still be able to clear it via reject.
+    pub fn find_pending_file(&self, id: &str) -> Option<(String, std::path::PathBuf)> {
+        let mailboxes = self.root.join("mailboxes");
+        if let Ok(entries) = fs::read_dir(&mailboxes) {
+            for e in entries.flatten() {
+                let owner = e.file_name().to_string_lossy().to_string();
+                let pending = self.pending_dir(&owner);
+                if let Ok(path) = Self::mail_path(&pending, id) {
+                    if path.exists() {
+                        return Some((owner, path));
+                    }
+                }
+            }
+        }
+        None
+    }
+
+    /// Validated `<dir>/<id>.mail` path (32-hex id gate) for existence
+    /// probes, so no probe can act as a filesystem oracle for invalid ids.
+    pub fn mail_file_path(&self, dir: &Path, id: &str) -> Result<PathBuf> {
+        Self::mail_path(dir, id)
+    }
 }
 
 fn safe_filename(p: &Path) -> String {

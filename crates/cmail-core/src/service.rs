@@ -293,22 +293,37 @@ impl Cmail {
     }
 
     pub fn reject(&self, id: &str) -> Result<()> {
-        let (owner, env) = self.store.find_pending(id)?;
+        // Locate WITHOUT parsing: a corrupt pending file (visible in approvals
+        // since H5) must be clearable by the human, not just well-formed held
+        // mail (review hardening).
+        let Some((owner, path)) = self.store.find_pending_file(id) else {
+            return Err(CoreError::MessageNotFound(id.to_string()));
+        };
+        let env = std::fs::read_to_string(&path)
+            .ok()
+            .and_then(|raw| Envelope::parse(&raw).ok());
         self.store
             .delete_message(&self.store.pending_dir(&owner), id)?;
         let removed = std::fs::remove_dir_all(self.store.attachments_dir(id));
         // Honest audit: report attachment-removal failure instead of a bare
-        // "deleted" (review hardening).
-        let outcome = if removed.is_ok() {
-            "deleted"
-        } else {
-            "deleted (attachments removal failed)"
+        // "deleted", and say when the pending file could not be parsed at all
+        // (its counterpart is unknowable) (review hardening).
+        let (counterpart, outcome) = match env {
+            Some(env) => {
+                let outcome = if removed.is_ok() {
+                    "deleted"
+                } else {
+                    "deleted (attachments removal failed)"
+                };
+                (env.to, outcome)
+            }
+            None => (String::new(), "deleted (unparseable pending message)"),
         };
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::Reject, "human")
                 .msg(id)
-                .counterpart(&env.to)
+                .counterpart(&counterpart)
                 .outcome(outcome),
         )?;
         Ok(())
@@ -425,7 +440,12 @@ impl Cmail {
 
     fn load_envelope_from(&self, dirs: &[PathBuf], id: &str) -> Result<Envelope> {
         for d in dirs {
-            if d.join(format!("{id}.mail")).exists() {
+            if self
+                .store
+                .mail_file_path(d, id)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+            {
                 let raw = self.store.read_raw(d, id)?;
                 return Envelope::parse(&raw);
             }
@@ -440,15 +460,24 @@ impl Cmail {
         self.store.ensure_mailbox(&me)?;
         let inbox = self.store.inbox_dir(&me);
         let archive = self.store.archive_dir(&me);
-        let in_inbox = inbox.join(format!("{id}.mail")).exists();
+        let in_inbox = self
+            .store
+            .mail_file_path(&inbox, id)
+            .map(|p| p.exists())
+            .unwrap_or(false);
         // Unread (inbox) copies read normally. A copy already in the archive is
         // readable only when it was human-released from quarantine (spec 4.2:
         // archive is in the read path for released mail); release means
         // "human-approved for reading", so released mail is re-readable any
         // number of times. Anything else reads back as MessageNotFound
         // ("already read or not found").
-        let released =
-            !in_inbox && archive.join(format!("{id}.mail")).exists() && self.was_released(id);
+        let released = !in_inbox
+            && self
+                .store
+                .mail_file_path(&archive, id)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+            && self.was_released(id);
         if !in_inbox && !released {
             return Err(CoreError::MessageNotFound(format!(
                 "{id} (already read or not found)"
@@ -625,7 +654,12 @@ impl Cmail {
     pub fn quarantine_release(&self, id: &str) -> Result<()> {
         for owner in crate::identity::list_identities(&self.root) {
             let q = self.store.quarantine_dir(&owner);
-            if q.join(format!("{id}.mail")).exists() {
+            if self
+                .store
+                .mail_file_path(&q, id)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+            {
                 self.store
                     .move_message(&q, &self.store.archive_dir(&owner), id)?;
                 append(
@@ -672,7 +706,12 @@ impl Cmail {
                 self.store.quarantine_dir(&owner),
                 self.store.pending_dir(&owner),
             ] {
-                if d.join(format!("{id}.mail")).exists() {
+                if self
+                    .store
+                    .mail_file_path(&d, id)
+                    .map(|p| p.exists())
+                    .unwrap_or(false)
+                {
                     return Envelope::parse(&self.store.read_raw(&d, id)?);
                 }
             }
@@ -692,6 +731,11 @@ mod tests {
     use crate::config::OutboundMode;
     use crate::error::CoreError;
     use tempfile::TempDir;
+
+    /// `CMAIL_IDENTITY` is process-global: tests that set it (or assert on
+    /// its absence) must serialize against each other to avoid a parallel
+    /// `resolve_identity(None)` race (review hardening).
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn svc() -> (TempDir, Cmail) {
         let root = TempDir::new().unwrap();
@@ -793,6 +837,7 @@ mod tests {
 
     #[test]
     fn identity_resolution_order() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (root, c) = svc();
         assert_eq!(
             c.resolve_identity(None).unwrap_err().to_string(),
@@ -1081,6 +1126,7 @@ mod tests {
 
     #[test]
     fn default_identity_read_fresh_from_disk() {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
         let (root, c) = svc();
         assert!(c.resolve_identity(None).is_err());
         let mut cfg = c.config.clone();
@@ -1163,5 +1209,24 @@ mod tests {
         let recs = c.audit_tail(1).unwrap();
         assert_eq!(recs[0].event, AuditEvent::Reject);
         assert_eq!(recs[0].outcome, "deleted (attachments removal failed)");
+    }
+
+    #[test]
+    fn reject_clears_unparseable_pending() {
+        let (_root, c) = svc();
+        c.store.ensure_mailbox("alice").unwrap();
+        let id = "cd".repeat(16);
+        let path = c.store.pending_dir("alice").join(format!("{id}.mail"));
+        std::fs::write(&path, "garbage").unwrap();
+        // a corrupt pending file is visible in approvals; reject must clear it
+        c.reject(&id).unwrap();
+        assert!(!path.exists());
+        assert!(c.approvals(None).unwrap().is_empty());
+        assert!(c.store.find_pending_file(&id).is_none());
+        let recs = c.audit_tail(1).unwrap();
+        assert_eq!(recs[0].event, AuditEvent::Reject);
+        assert_eq!(recs[0].msg_id.as_deref(), Some(id.as_str()));
+        assert_eq!(recs[0].counterpart.as_deref(), Some(""));
+        assert_eq!(recs[0].outcome, "deleted (unparseable pending message)");
     }
 }
