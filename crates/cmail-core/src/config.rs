@@ -21,7 +21,7 @@ pub enum InboundMode {
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq)]
 pub struct Config {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub default_identity: Option<String>,
     #[serde(default)]
     pub outbound: OutboundMode,
@@ -120,6 +120,18 @@ mod tests {
         assert_eq!(cfg, again);
         let text = fs::read_to_string(Config::path(root.path())).unwrap();
         assert_eq!(text, default_config_toml());
+    }
+
+    #[test]
+    fn save_preserves_absent_default_identity() {
+        let mut cfg = Config::default();
+        assert_eq!(cfg.default_identity, None);
+        cfg.allow.send = vec!["zoe".into()];
+        let root = TempDir::new().unwrap();
+        cfg.save(root.path()).unwrap();
+        let back = Config::load_or_init(root.path()).unwrap();
+        assert_eq!(back.default_identity, None);
+        assert!(back.is_send_allowed("zoe"));
     }
 
     #[test]
