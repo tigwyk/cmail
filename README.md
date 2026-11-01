@@ -19,9 +19,8 @@ JSON envelopes sitting in plain directories.
 Requires a Rust toolchain.
 
 ```bash
+git clone <this-repo> && cd cmail
 cargo install --path .
-# or from a checkout:
-git clone <this-repo> && cd cmail && cargo install --path .
 ```
 
 ## Quickstart
@@ -46,6 +45,11 @@ cmail --as zoe --json read <id>
 
 # the human trusts alice's key; the next mail arrives verified, unfenced:
 cmail keyring add alice
+cmail --as alice send --to zoe --body "again"     # zoe is remembered from --remember
+cmail --as zoe --json inbox
+# => [{"id":"…","from":"alice",…,"trust":"verified",…}]
+cmail --as zoe --json read <new-id>
+# => …"body":"again"…   (no fence — verified sender)
 ```
 
 ## The trust model
