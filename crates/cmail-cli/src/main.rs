@@ -70,7 +70,7 @@ pub enum Commands {
     },
     /// Block until new mail arrives
     Wait {
-        #[arg(long, default_value = "30")]
+        #[arg(long = "timeout", default_value = "30")]
         timeout_secs: u64,
     },
     /// List inbox (and archive with --all)
@@ -164,6 +164,31 @@ fn main() {
         ),
         Commands::Whoami => commands::account::run(commands::account::AccountCommand::Whoami, &cli),
         Commands::Config => commands::account::run(commands::account::AccountCommand::Config, &cli),
+        Commands::Send {
+            to,
+            kind,
+            subject,
+            body,
+            body_file,
+            attachments,
+            reply_to,
+        } => commands::mail::send(
+            &cli,
+            to,
+            kind,
+            subject,
+            body.clone(),
+            body_file.clone(),
+            attachments.clone(),
+            reply_to.clone(),
+        ),
+        Commands::Inbox => commands::mail::inbox(&cli),
+        Commands::Read { id } => commands::mail::read(&cli, id),
+        Commands::Reply { id, body, subject } => {
+            commands::mail::reply(&cli, id, body.clone(), subject.clone())
+        }
+        Commands::Wait { timeout_secs } => commands::mail::wait(&cli, *timeout_secs),
+        Commands::List { all } => commands::mail::list(&cli, *all),
         _ => {
             println!("not yet implemented");
             std::process::exit(1);
