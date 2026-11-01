@@ -290,8 +290,11 @@ impl Cmail {
         Ok(v)
     }
 
+    /// Display-oriented audit tail: skips malformed lines so a damaged log
+    /// still renders. The fail-closed `was_released` gate keeps using strict
+    /// `audit::tail` directly.
     pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRecord>> {
-        crate::audit::tail(&self.root, n)
+        crate::audit::tail_lossy(&self.root, n)
     }
 
     pub fn list_identities(&self) -> Vec<String> {

@@ -75,13 +75,8 @@ impl Config {
 
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = Self::path(root);
-        let tmp = path.with_extension("toml.tmp");
-        fs::write(
-            &tmp,
-            toml::to_string_pretty(self).map_err(|e| CoreError::Config(e.to_string()))?,
-        )?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
+        let text = toml::to_string_pretty(self).map_err(|e| CoreError::Config(e.to_string()))?;
+        crate::fsutil::write_durable(&path, text.as_bytes())
     }
 
     pub fn is_send_allowed(&self, name: &str) -> bool {

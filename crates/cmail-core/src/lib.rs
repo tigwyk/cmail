@@ -3,6 +3,7 @@ pub mod canonical;
 pub mod config;
 pub mod envelope;
 pub mod error;
+pub mod fsutil;
 pub mod identity;
 pub mod keyring;
 pub mod service;

@@ -28,10 +28,7 @@ impl KeyRing {
 
     pub fn save(&self, root: &Path) -> Result<()> {
         let path = root.join("keyring.json");
-        let tmp = path.with_extension("json.tmp");
-        fs::write(&tmp, serde_json::to_string_pretty(self)?)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
+        crate::fsutil::write_durable(&path, serde_json::to_string_pretty(self)?.as_bytes())
     }
 
     pub fn get(&self, name: &str) -> Option<&KeyEntry> {

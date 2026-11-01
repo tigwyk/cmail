@@ -1,8 +1,8 @@
 use crate::error::Result;
+use crate::fsutil;
 use crate::identity::now_rfc3339;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, OpenOptions};
-use std::io::Write;
+use std::fs;
 use std::path::Path;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -69,17 +69,14 @@ impl AuditRecord {
 
 pub fn append(root: &Path, record: &AuditRecord) -> Result<()> {
     fs::create_dir_all(root)?;
-    let mut f = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(root.join("audit.log"))?;
-    // Single atomic append (payload + newline in one write_all): concurrent
-    // appenders are cmail's normal mode (one process per agent on a shared
-    // root), and a torn line would make `tail` — and the fail-closed
+    // Single atomic append (payload + newline in one write_all) + fsync:
+    // concurrent appenders are cmail's normal mode (one process per agent on
+    // a shared root), and a torn line would make `tail` — and the fail-closed
     // `was_released` gate — reject the whole log. See final whole-branch review.
-    let line = format!("{}\n", serde_json::to_string(record)?);
-    f.write_all(line.as_bytes())?;
-    Ok(())
+    fsutil::append_line(
+        &root.join("audit.log"),
+        &format!("{}\n", serde_json::to_string(record)?),
+    )
 }
 
 pub fn tail(root: &Path, n: usize) -> Result<Vec<AuditRecord>> {
@@ -93,6 +90,25 @@ pub fn tail(root: &Path, n: usize) -> Result<Vec<AuditRecord>> {
         .filter(|l| !l.trim().is_empty())
         .map(serde_json::from_str)
         .collect::<std::result::Result<_, _>>()?;
+    if records.len() > n {
+        records.drain(..records.len() - n);
+    }
+    Ok(records)
+}
+
+/// Display-oriented tail: skips malformed lines instead of failing. The
+/// fail-closed `was_released` gate keeps using strict `tail`.
+pub fn tail_lossy(root: &Path, n: usize) -> Result<Vec<AuditRecord>> {
+    let path = root.join("audit.log");
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = fs::read_to_string(&path)?;
+    let mut records: Vec<AuditRecord> = text
+        .lines()
+        .filter(|l| !l.trim().is_empty())
+        .filter_map(|l| serde_json::from_str(l).ok())
+        .collect();
     if records.len() > n {
         records.drain(..records.len() - n);
     }
@@ -133,5 +149,49 @@ mod tests {
         let r = AuditRecord::now(AuditEvent::SpoofSuspected, "system");
         let s = serde_json::to_string(&r).unwrap();
         assert!(s.contains("\"spoof_suspected\""));
+    }
+
+    #[test]
+    fn all_twelve_event_names_pinned() {
+        for (evt, name) in [
+            (AuditEvent::Init, "init"),
+            (AuditEvent::Send, "send"),
+            (AuditEvent::Held, "held"),
+            (AuditEvent::Approve, "approve"),
+            (AuditEvent::Reject, "reject"),
+            (AuditEvent::Read, "read"),
+            (AuditEvent::AllowAdd, "allow_add"),
+            (AuditEvent::AllowRemove, "allow_remove"),
+            (AuditEvent::KeyAdd, "key_add"),
+            (AuditEvent::SpoofSuspected, "spoof_suspected"),
+            (AuditEvent::Corrupt, "corrupt"),
+            (AuditEvent::QuarantineRelease, "quarantine_release"),
+        ] {
+            let r = AuditRecord::now(evt, "t");
+            let s = serde_json::to_string(&r).unwrap();
+            assert!(s.contains(&format!("\"event\":\"{name}\"")), "{s}");
+        }
+    }
+
+    #[test]
+    fn tail_lossy_skips_garbage_but_tail_stays_strict() {
+        let root = TempDir::new().unwrap();
+        append(root.path(), &AuditRecord::now(AuditEvent::Send, "a")).unwrap();
+        // Clean 2-good-1-bad construction: good record, one garbage line
+        // appended directly, then another good record.
+        let mut f = std::fs::OpenOptions::new()
+            .append(true)
+            .open(root.path().join("audit.log"))
+            .unwrap();
+        use std::io::Write;
+        writeln!(f, "{{garbage").unwrap();
+        append(root.path(), &AuditRecord::now(AuditEvent::Read, "a")).unwrap();
+        assert!(
+            tail(root.path(), 10).is_err(),
+            "strict tail must reject the whole file"
+        );
+        let lossy = tail_lossy(root.path(), 10).unwrap();
+        assert_eq!(lossy.len(), 2);
+        assert_eq!(lossy[1].event, AuditEvent::Read);
     }
 }

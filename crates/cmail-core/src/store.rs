@@ -80,10 +80,7 @@ impl MailStore {
     pub fn write_envelope(&self, dir: &Path, env: &Envelope) -> Result<()> {
         fs::create_dir_all(dir)?;
         let path = Self::mail_path(dir, &env.id)?;
-        let tmp = dir.join(format!("{}.tmp", env.id));
-        fs::write(&tmp, serde_json::to_string_pretty(env)?)?;
-        fs::rename(&tmp, &path)?;
-        Ok(())
+        crate::fsutil::write_durable(&path, serde_json::to_string_pretty(env)?.as_bytes())
     }
 
     pub fn read_raw(&self, dir: &Path, id: &str) -> Result<String> {
