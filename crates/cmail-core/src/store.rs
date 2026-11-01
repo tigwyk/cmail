@@ -67,6 +67,16 @@ impl MailStore {
         Ok(dir.join(format!("{id}.mail")))
     }
 
+    /// Only a genuine `NotFound` means "message absent"; every other io error
+    /// (permissions, not-a-directory, ...) is reported honestly as `Io`
+    /// instead of being collapsed into `MessageNotFound`.
+    fn classify_io_err(id: &str, e: std::io::Error) -> CoreError {
+        match e.kind() {
+            std::io::ErrorKind::NotFound => CoreError::MessageNotFound(id.to_string()),
+            _ => CoreError::Io(e),
+        }
+    }
+
     pub fn write_envelope(&self, dir: &Path, env: &Envelope) -> Result<()> {
         fs::create_dir_all(dir)?;
         let path = Self::mail_path(dir, &env.id)?;
@@ -77,14 +87,17 @@ impl MailStore {
     }
 
     pub fn read_raw(&self, dir: &Path, id: &str) -> Result<String> {
-        fs::read_to_string(Self::mail_path(dir, id)?)
-            .map_err(|_| CoreError::MessageNotFound(id.to_string()))
+        let path = Self::mail_path(dir, id)?;
+        fs::read_to_string(&path).map_err(|e| Self::classify_io_err(id, e))
     }
 
     pub fn list_ids(&self, dir: &Path) -> Vec<String> {
         let mut ids = Vec::new();
         if let Ok(entries) = fs::read_dir(dir) {
             for e in entries.flatten() {
+                if !e.file_type().map(|t| t.is_file()).unwrap_or(false) {
+                    continue;
+                }
                 if let Some(ext) = e.path().extension() {
                     if ext == "mail" {
                         if let Some(stem) = e.path().file_stem().and_then(|s| s.to_str()) {
@@ -100,14 +113,14 @@ impl MailStore {
 
     pub fn move_message(&self, from_dir: &Path, to_dir: &Path, id: &str) -> Result<()> {
         fs::create_dir_all(to_dir)?;
-        fs::rename(Self::mail_path(from_dir, id)?, Self::mail_path(to_dir, id)?)
-            .map_err(|_| CoreError::MessageNotFound(id.to_string()))?;
+        let from = Self::mail_path(from_dir, id)?;
+        let to = Self::mail_path(to_dir, id)?;
+        fs::rename(&from, &to).map_err(|e| Self::classify_io_err(id, e))?;
         Ok(())
     }
 
     pub fn delete_message(&self, dir: &Path, id: &str) -> Result<()> {
-        fs::remove_file(Self::mail_path(dir, id)?)
-            .map_err(|_| CoreError::MessageNotFound(id.to_string()))?;
+        fs::remove_file(Self::mail_path(dir, id)?).map_err(|e| Self::classify_io_err(id, e))?;
         Ok(())
     }
 
@@ -123,6 +136,18 @@ impl MailStore {
         }
         let dir = self.attachments_dir(id);
         fs::create_dir_all(&dir)?;
+        match self.copy_attachments_inner(&dir, paths) {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // Roll back so a failed copy never leaves a half-populated
+                // attachments dir behind.
+                let _ = fs::remove_dir_all(&dir);
+                Err(e)
+            }
+        }
+    }
+
+    fn copy_attachments_inner(&self, dir: &Path, paths: &[PathBuf]) -> Result<Vec<Attachment>> {
         let mut out = Vec::new();
         let mut total: u64 = 0;
         for p in paths {
@@ -306,5 +331,64 @@ mod tests {
         // count limit
         let many: Vec<PathBuf> = (0..9).map(|_| src.clone()).collect();
         assert!(store.copy_attachments("id2", &many).is_err());
+    }
+
+    #[test]
+    fn io_errors_are_not_disguised_as_not_found() {
+        let root = TempDir::new().unwrap();
+        let store = MailStore::new(root.path());
+        // Platform note: a FILE where a directory component is expected
+        // (`read_to_string("<file>/sub/<id>.mail")`) cannot be used as the io
+        // fixture here — Windows reports ERROR_PATH_NOT_FOUND, which Rust maps
+        // to ErrorKind::NotFound, i.e. indistinguishable from a genuinely
+        // absent message. The cross-platform fixture is a DIRECTORY sitting at
+        // the *.mail path itself: reading it fails with PermissionDenied
+        // (windows) / IsADirectory (unix) — an honest io error, not NotFound.
+        let id = "ab".repeat(16);
+        let inbox = store.inbox_dir("zoe");
+        fs::create_dir_all(inbox.join(format!("{id}.mail"))).unwrap();
+        let err = store.read_raw(&inbox, &id).unwrap_err();
+        assert!(matches!(err, crate::error::CoreError::Io(_)), "{err}");
+        // genuinely absent -> MessageNotFound
+        let err = store
+            .read_raw(&inbox, "cd".repeat(16).as_str())
+            .unwrap_err();
+        assert!(matches!(err, crate::error::CoreError::MessageNotFound(_)));
+    }
+
+    #[test]
+    fn list_ids_ignores_directories_named_mail() {
+        let root = TempDir::new().unwrap();
+        let store = MailStore::new(root.path());
+        fs::create_dir_all(store.inbox_dir("zoe").join("trap.mail")).unwrap();
+        assert!(store.list_ids(&store.inbox_dir("zoe")).is_empty());
+    }
+
+    #[test]
+    fn copy_attachments_rolls_back_on_limit_trip() {
+        let root = TempDir::new().unwrap();
+        let store = MailStore::new(root.path());
+        let big = root.path().join("big.bin");
+        let mut bytes = vec![0u8; 1024];
+        bytes[0..8].copy_from_slice(b"payload!"); // compresses poorly; keeps size honest
+        fs::write(&big, bytes.repeat(1024)).unwrap(); // 1 MiB
+
+        // 9 files -> COUNT limit (8) trips at the top, before the dir is created
+        let many: Vec<PathBuf> = (0..9).map(|_| big.clone()).collect();
+        assert!(store.copy_attachments("rollback1", &many).is_err());
+        assert!(
+            !store.attachments_dir("rollback1").exists(),
+            "count overflow must not create the dir at all"
+        );
+        // 3 x 10 MiB (each at, not over, the per-file limit) -> TOTAL limit
+        // (25 MiB) trips mid-copy, after the dir exists and files are written;
+        // the half-populated dir must be rolled back.
+        fs::write(&big, bytes.repeat(10240)).unwrap(); // exactly MAX_ATTACHMENT_BYTES
+        let heavy: Vec<PathBuf> = (0..3).map(|_| big.clone()).collect();
+        assert!(store.copy_attachments("rollback2", &heavy).is_err());
+        assert!(
+            !store.attachments_dir("rollback2").exists(),
+            "failed copy must not leave a dir behind"
+        );
     }
 }
