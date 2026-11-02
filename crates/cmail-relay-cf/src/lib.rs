@@ -4,6 +4,8 @@
 //! amended). This crate compiles both on the host (route/path unit tests,
 //! CI clippy) and on `wasm32-unknown-unknown` (`wrangler deploy`).
 
+pub mod calc;
+pub mod mailbox;
 pub mod parcel;
 pub mod paths;
 pub mod routes;

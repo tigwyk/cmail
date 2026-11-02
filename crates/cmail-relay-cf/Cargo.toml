@@ -16,6 +16,11 @@ sha2.workspace = true
 hex.workspace = true
 base64.workspace = true
 anyhow.workspace = true
+# Direct dep so `#[durable_object]`'s wasm-bindgen struct codegen resolves
+# `wasm_bindgen::...` paths at this crate's root: wasm-bindgen 0.2.130
+# parses but does not propagate the macro's path-override option for structs
+# (parser.rs `let _ = attrs.wasm_bindgen();`). Version unifies with worker's.
+wasm-bindgen = "0.2"
 
 [dev-dependencies]
 # Host-only parity tests (parcel/fingerprint vs core). Production wasm code
