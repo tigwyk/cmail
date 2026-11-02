@@ -3,8 +3,11 @@ use crate::config::{Config, InboundMode, OutboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
 use crate::error::{CoreError, Result};
-use crate::identity::{create_identity, identity_exists, load_identity, now_rfc3339};
+use crate::identity::{
+    create_identity, fingerprint_of, identity_exists, load_identity, now_rfc3339,
+};
 use crate::keyring::KeyRing;
+use crate::relay::{build_parcel, deposit};
 use crate::store::MailStore;
 use crate::trust::TrustLevel;
 use serde::{Deserialize, Serialize};
@@ -164,18 +167,43 @@ impl Cmail {
         // the body and every attachment.
         let session = SealSession::new(&self.recipient_x25519(to)?);
         let attachment_meta = self.store.seal_attachments(&session, &id, attachments)?;
-        let outcome = self.send_gated(
-            &id,
-            &identity,
-            &from,
-            to,
-            kind,
-            subject,
-            body,
-            attachment_meta,
-            reply_to,
-            &session,
-        );
+        // Spec §3.2 resolution: a local identity always wins (today's local
+        // path, verbatim — even when a route is also known); a keyring-known
+        // recipient WITH a route and NO local identity is remote (gate, then
+        // relay POST); anything else — keyring-only, no route — is the
+        // synced-root case and stays on the local path.
+        let remote_route = if identity_exists(&self.root, to) {
+            None
+        } else {
+            KeyRing::load(&self.root)?.get_route(to)
+        };
+        let outcome = match remote_route {
+            Some(route) => self.send_remote(
+                &id,
+                &identity,
+                &from,
+                to,
+                kind,
+                subject,
+                body,
+                attachment_meta,
+                reply_to,
+                &session,
+                &route,
+            ),
+            None => self.send_gated(
+                &id,
+                &identity,
+                &from,
+                to,
+                kind,
+                subject,
+                body,
+                attachment_meta,
+                reply_to,
+                &session,
+            ),
+        };
         if outcome.is_err() {
             // no orphaned attachments/<id>/ on any failure (review hardening)
             let _ = std::fs::remove_dir_all(self.store.attachments_dir(&id));
@@ -262,6 +290,124 @@ impl Cmail {
         }
     }
 
+    /// Routed branch of spec §3.2: the recipient is keyring-known, has a
+    /// route, and has no local identity. The outbound gate applies exactly as
+    /// on the local path — held mail lands in the SENDER's pending BEFORE any
+    /// network I/O; `approve` later performs the POST. On the allowed path
+    /// the sealed envelope plus its attachment frames travel as one Parcel
+    /// (`POST /mailbox/{fp}`); nothing is written locally, and a deposit
+    /// failure surfaces as a clean `CoreError::Relay` with no local trace.
+    #[expect(clippy::too_many_arguments)]
+    fn send_remote(
+        &self,
+        id: &str,
+        identity: &crate::identity::Identity,
+        from: &str,
+        to: &str,
+        kind: &str,
+        subject: &str,
+        body: &str,
+        attachment_meta: Vec<crate::envelope::Attachment>,
+        reply_to: Option<&str>,
+        session: &SealSession,
+        route: &str,
+    ) -> Result<SendOutcome> {
+        // Same sealed envelope as the local path (spec 4.1): the shared
+        // SealSession was keyed by recipient_x25519, i.e. the keyring key.
+        let env = seal_and_sign(
+            id,
+            &NewSealedMessage {
+                from: from.to_string(),
+                from_key: identity.public_key_b64(),
+                to: to.to_string(),
+                kind: kind.to_string(),
+                subject: subject.to_string(),
+                body: body.to_string(),
+                attachments: attachment_meta,
+                in_reply_to: reply_to.map(str::to_string),
+            },
+            session,
+            &now_rfc3339(),
+            &identity.signing,
+        )?;
+        // Gate on the current on-disk config (long-lived MCP process), held
+        // BEFORE network — identical gate semantics to send_gated.
+        let gate = Config::load_or_init(&self.root)?;
+        if gate.outbound != OutboundMode::Open && !gate.is_send_allowed(to) {
+            self.store
+                .write_envelope(&self.store.pending_dir(from), &env)?;
+            append(
+                &self.root,
+                &AuditRecord::now(AuditEvent::Held, from)
+                    .msg(id)
+                    .counterpart(to)
+                    .outcome("held for approval"),
+            )?;
+            return Ok(SendOutcome::Held {
+                id: id.to_string(),
+                to: to.to_string(),
+            });
+        }
+        self.deposit_remote(&env, route)?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::SendRelay, from)
+                .msg(id)
+                .counterpart(to),
+        )?;
+        // The frames travelled inside the parcel and no local copy of this
+        // message exists — the staging dir must not linger (mirrors the
+        // failure-path cleanup in send()).
+        let _ = std::fs::remove_dir_all(self.store.attachments_dir(id));
+        Ok(SendOutcome::Sent { id: id.to_string() })
+    }
+
+    /// POST `env` plus its staged attachment frames to `route` as one Parcel
+    /// for the keyring-known recipient `env.to` (spec §3.2). Pure transport +
+    /// parcel assembly: the CALLER owns the audit ordering (`send_relay` is
+    /// appended by each caller after its own bookkeeping).
+    fn deposit_remote(&self, env: &Envelope, route: &str) -> Result<()> {
+        let entry = KeyRing::load(&self.root)?
+            .get(&env.to)
+            .cloned()
+            .ok_or_else(|| CoreError::UnknownRecipient(env.to.clone()))?;
+        let frames = self.read_attachment_frames(&env.id)?;
+        let parcel = build_parcel(env, &frames, &entry.public_key)?;
+        let fp = fingerprint_of(&entry.public_key);
+        deposit(route, &fp, &parcel)?;
+        Ok(())
+    }
+
+    /// The sealed attachment frames staged for `id` — `att-*.bin` sorted by
+    /// index — for parcel assembly (spec §2.1: the parcel carries the same
+    /// raw frames the local path keeps on disk). No staged dir = no frames.
+    fn read_attachment_frames(&self, id: &str) -> Result<Vec<(usize, Vec<u8>)>> {
+        let dir = self.store.attachments_dir(id);
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(CoreError::Io(e)),
+        };
+        let mut found: Vec<(usize, std::path::PathBuf)> = entries
+            .flatten()
+            .filter_map(|e| {
+                let name = e.file_name().to_string_lossy().to_string();
+                let idx = name
+                    .strip_prefix("att-")?
+                    .strip_suffix(".bin")?
+                    .parse::<usize>()
+                    .ok()?;
+                Some((idx, e.path()))
+            })
+            .collect();
+        found.sort_by_key(|(i, _)| *i);
+        let mut frames = Vec::with_capacity(found.len());
+        for (i, path) in found {
+            frames.push((i, std::fs::read(path)?));
+        }
+        Ok(frames)
+    }
+
     pub fn approvals(&self, owner: Option<&str>) -> Result<Vec<HeldMessage>> {
         let owners: Vec<String> = match owner {
             Some(o) => vec![o.to_string()],
@@ -301,16 +447,45 @@ impl Cmail {
 
     pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
         let (owner, env) = self.store.find_pending(id)?;
+        let keyring = KeyRing::load(&self.root)?;
         // Re-verify the recipient is still releasable: the same disjunction
         // send() accepts (local identity OR keyring-known). A local identity
         // may have been removed after the mail was held — but on a synced
         // root the keyring entry alone still carries the encrypt-to key
         // (review hardening + whole-branch fix: held mail to keyring-only
         // recipients must be approvable, not just sendable).
-        if !identity_exists(&self.root, &env.to)
-            && KeyRing::load(&self.root)?.get(&env.to).is_none()
-        {
+        if !identity_exists(&self.root, &env.to) && keyring.get(&env.to).is_none() {
             return Err(CoreError::UnknownRecipient(env.to));
+        }
+        // Routed held mail (spec §3.2): the recipient has no local identity
+        // but has keyring+route at approve time — the approval performs the
+        // relay POST instead of the local move. A deposit failure propagates
+        // with the pending file left in place for a retry. A keyring-known
+        // recipient WITHOUT a route keeps the synced-root local move below
+        // (v1.1 rule).
+        if !identity_exists(&self.root, &env.to) {
+            if let Some(route) = keyring.get_route(&env.to) {
+                self.deposit_remote(&env, &route)?;
+                self.store
+                    .delete_message(&self.store.pending_dir(&owner), id)?;
+                let _ = std::fs::remove_dir_all(self.store.attachments_dir(id));
+                append(
+                    &self.root,
+                    &AuditRecord::now(AuditEvent::Approve, "human")
+                        .msg(id)
+                        .counterpart(&env.to),
+                )?;
+                append(
+                    &self.root,
+                    &AuditRecord::now(AuditEvent::SendRelay, &env.from)
+                        .msg(id)
+                        .counterpart(&env.to),
+                )?;
+                if remember {
+                    self.allow_add(&env.to)?;
+                }
+                return Ok(());
+            }
         }
         self.store.ensure_mailbox(&env.to)?;
         self.store.move_message(
@@ -1656,5 +1831,192 @@ mod tests {
         assert!(recs
             .iter()
             .any(|r| r.event == AuditEvent::RelaySet && r.actor == "human"));
+    }
+
+    // --- Task R4 tests: routed send through the outbound gate (spec §3.2) ---
+
+    /// One "machine": a cmail root with alice on it, plus a live relay on its
+    /// own root. The relay handle (and its root) must outlive the test — the
+    /// server owns worker threads. NEVER `cargo run` the relayd binary; this
+    /// in-process server is the only sanctioned fixture.
+    fn relay_fix() -> (
+        tempfile::TempDir,
+        Cmail,
+        cmail_relayd::RelayServer,
+        String, /*base*/
+    ) {
+        let root = tempfile::tempdir().unwrap();
+        let rroot = tempfile::tempdir().unwrap();
+        let server =
+            cmail_relayd::RelayServer::start("127.0.0.1:0", rroot.path().to_path_buf(), 7).unwrap();
+        let base = server.base_url();
+        let c = Cmail::open(root.path()).unwrap();
+        c.init("alice").unwrap();
+        (root, c, server, base)
+    }
+
+    /// Out-of-band key exchange: write the identity's b64 pubkey to a temp
+    /// file for `KeySource::KeyFile` (unique per fingerprint so parallel
+    /// fixtures never read a stale key).
+    fn keyfile_of(id: &crate::identity::Identity) -> PathBuf {
+        let path = std::env::temp_dir().join(format!("cmail-test-{}-pub.b64", id.fingerprint()));
+        std::fs::write(&path, id.public_key_b64()).unwrap();
+        path
+    }
+
+    #[test]
+    fn send_to_routed_recipient_deposits_parcel_and_fetches_back() {
+        let (_r, sender, _s, base) = relay_fix();
+        let (_r2, recipient, _s2, _b2) = relay_fix(); // SEPARATE root = separate machine
+        let _ = recipient; // recipient's Cmail handle is unused; her root provides zoe's key
+                           // recipient publishes: sender's human learns zoe's key + route out-of-band
+        let zoe = crate::identity::create_identity(_r2.path(), "zoe").unwrap();
+        sender
+            .keyring_add("zoe", KeySource::KeyFile(keyfile_of(&zoe)))
+            .unwrap();
+        sender.keyring_route("zoe", Some(&base)).unwrap();
+        sender.allow_add("zoe").unwrap(); // through the gate -> the POST happens
+        let att = _r.path().join("note.txt");
+        std::fs::write(&att, "machine state").unwrap();
+        let out = sender
+            .send(
+                Some("alice"),
+                "zoe",
+                "note",
+                "remote",
+                "hello machine",
+                &[att],
+                None,
+            )
+            .unwrap();
+        assert!(matches!(out, SendOutcome::Sent { .. }));
+        // nothing local on the sender's machine: no inbox copy, no staged frames
+        assert!(sender
+            .store
+            .list_ids(&sender.store.inbox_dir("zoe"))
+            .is_empty());
+        assert!(!sender
+            .store
+            .attachments_dir(match &out {
+                SendOutcome::Sent { id } => id,
+                _ => unreachable!(),
+            })
+            .exists());
+        // fetch itself lands in R5 — here verify the PARCEL is on the relay via
+        // the core relay client, sealed to zoe's key, frames intact
+        let fp = zoe.fingerprint();
+        let ids = crate::relay::list_pending(&base, &fp, &zoe.signing).unwrap();
+        assert_eq!(ids.len(), 1);
+        let parcel = crate::relay::fetch_parcel(&base, &fp, &ids[0], &zoe.signing).unwrap();
+        assert!(parcel.envelope.is_sealed());
+        let opened = open_envelope(&parcel.envelope, &x25519_secret(&zoe.signing)).unwrap();
+        assert_eq!(opened.body, "hello machine");
+        // the attachment frame round-trips: raw epk||nonce||ct decodes to the plaintext under zoe's key
+        assert_eq!(parcel.attachments.len(), 1);
+        assert_eq!(parcel.attachments[0].i, 0);
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let raw = B64.decode(&parcel.attachments[0].data).unwrap();
+        assert_eq!(raw.len(), 32 + 24 + "machine state".len() + 16);
+        let sealed = crate::crypto::SealedBox {
+            epk: B64.encode(&raw[..32]),
+            nonce: B64.encode(&raw[32..56]),
+            ct: B64.encode(&raw[56..]),
+        };
+        let plain = crate::crypto::open(
+            &x25519_secret(&zoe.signing),
+            &sealed,
+            &crate::crypto::att_label(0),
+        )
+        .unwrap();
+        assert_eq!(plain, b"machine state");
+    }
+
+    #[test]
+    fn routed_send_is_gated_before_network() {
+        let (_r, sender, _s, base) = relay_fix();
+        let (_r2, recipient, _s2, _b2) = relay_fix();
+        let _ = recipient;
+        let zoe = crate::identity::create_identity(_r2.path(), "zoe").unwrap();
+        sender
+            .keyring_add("zoe", KeySource::KeyFile(keyfile_of(&zoe)))
+            .unwrap();
+        sender.keyring_route("zoe", Some(&base)).unwrap();
+        let out = sender
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap();
+        assert!(matches!(out, SendOutcome::Held { .. })); // gate BEFORE network
+        let id = match out {
+            SendOutcome::Held { id, .. } => id,
+            _ => unreachable!(),
+        };
+        // nothing on the relay yet (a never-deposited mailbox cannot even be
+        // listed — auth needs its stored pubkey — so 404 also means "empty")
+        match crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing) {
+            Ok(ids) => assert!(ids.is_empty()),
+            Err(e) => assert!(e.to_string().contains("404"), "{e}"),
+        }
+        sender.approve(&id, true).unwrap(); // approve performs the POST
+        assert_eq!(
+            crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing)
+                .unwrap()
+                .len(),
+            1
+        );
+        // delivered remotely: the pending copy is consumed
+        assert!(sender
+            .store
+            .list_ids(&sender.store.pending_dir("alice"))
+            .is_empty());
+        assert!(sender.approvals(None).unwrap().is_empty());
+        let recs = sender.audit_tail(6).unwrap();
+        let pos = |e: AuditEvent| {
+            recs.iter()
+                .position(|r| r.event == e && r.msg_id.as_deref() == Some(id.as_str()))
+        };
+        assert!(
+            pos(AuditEvent::SendRelay).is_some(),
+            "missing send_relay: {recs:?}"
+        );
+        // approve is audited BEFORE send_relay (the human acts, then the POST)
+        assert!(
+            pos(AuditEvent::Approve) < pos(AuditEvent::SendRelay),
+            "{recs:?}"
+        );
+    }
+
+    #[test]
+    fn routed_send_failure_writes_nothing_local() {
+        // route to a dead port: send errors cleanly, no pending/inbox writes
+        let (_r, sender, _s, _b) = relay_fix();
+        let (_r2, recipient, _s2, _b2) = relay_fix();
+        let _ = recipient;
+        let zoe = crate::identity::create_identity(_r2.path(), "zoe").unwrap();
+        sender
+            .keyring_add("zoe", KeySource::KeyFile(keyfile_of(&zoe)))
+            .unwrap();
+        sender
+            .keyring_route("zoe", Some("http://127.0.0.1:9"))
+            .unwrap(); // port 9 = discard, refused
+        sender.allow_add("zoe").unwrap();
+        let err = sender
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Relay(_)), "{err}");
+        assert!(sender
+            .store
+            .list_ids(&sender.store.pending_dir("alice"))
+            .is_empty());
+        assert!(sender
+            .store
+            .list_ids(&sender.store.inbox_dir("zoe"))
+            .is_empty());
+        // staged attachment frames are rolled back too — nothing local written
+        assert_eq!(
+            std::fs::read_dir(_r.path().join("attachments"))
+                .map(|d| d.count())
+                .unwrap_or(0),
+            0
+        );
     }
 }

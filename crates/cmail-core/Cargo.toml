@@ -23,3 +23,6 @@ url.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+# Dev-only (legal Cargo cycle): in-process relay fixtures for the routed-send
+# and fetch service tests. Server code never ships with core.
+cmail-relayd = { path = "../cmail-relayd" }
