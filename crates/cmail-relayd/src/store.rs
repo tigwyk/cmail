@@ -26,7 +26,7 @@ use ed25519_dalek::{Signature, Verifier, VerifyingKey};
 use rand::RngCore;
 use serde_json::json;
 use sha2::{Digest, Sha256};
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
@@ -176,11 +176,13 @@ impl RelayStore {
             )?;
         }
         let id = self.fresh_id(fp);
-        fs::write(self.parcel_path(fp, &id), parcel_bytes)?;
-        fs::write(
-            self.sidecar_path(fp, &id),
-            json!({"received_unix": now_unix()}).to_string(),
-        )?;
+        // Atomic parcel + sidecar writes (write BOTH temps, rename BOTH): a
+        // crash can no longer serve a truncated parcel, and the tiny window
+        // between the two renames is covered by the sidecar-less-parcel GC
+        // rule below (belt-and-braces for pre-atomic-write stores too).
+        let sidecar = json!({"received_unix": now_unix()}).to_string();
+        atomic_write(&self.parcel_path(fp, &id), parcel_bytes)?;
+        atomic_write(&self.sidecar_path(fp, &id), sidecar.as_bytes())?;
         self.bump_caps(fp, 1, parcel_bytes.len() as i64);
         Ok(())
     }
@@ -345,10 +347,42 @@ impl RelayStore {
 
     /// Lazy GC on mailbox access and deposit (spec §2.2): retention sweep of
     /// old entries (pruning mailboxes left empty by the sweep) + expired
-    /// nonce sweep.
+    /// nonce sweep. This per-fp pass is the one shared GC routine — lazy
+    /// request paths and the periodic sweep ([`Self::sweep_all`]) both run it.
     pub fn gc(&self, fp: &str) {
         self.gc_mailbox(fp);
         self.gc_nonces(fp);
+    }
+
+    /// One GC pass over EVERY fingerprint on disk — the union of
+    /// `mailboxes/*` and `nonces/*` — running the shared per-fp GC
+    /// ([`Self::gc`]) for each, then pruning nonce dirs the sweep left empty
+    /// (`rmdir` only succeeds when empty, so concurrent live challenges are
+    /// untouched). Covers fps that are never revisited (deposit-and-abandon,
+    /// challenge floods across random fps) which lazy per-access GC never
+    /// touches; mandated by spec §2.2 (all mailboxes, every 10 minutes, run
+    /// by the server's sweep thread / [`Self::sweep_now`]).
+    pub fn sweep_all(&self) {
+        let mut fps = BTreeSet::new();
+        for dir in ["mailboxes", "nonces"] {
+            if let Ok(rd) = fs::read_dir(self.root.join(dir)) {
+                for entry in rd.flatten() {
+                    if let Some(name) = entry.file_name().to_str() {
+                        if valid_fp(name) {
+                            fps.insert(name.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        for fp in &fps {
+            self.gc(fp);
+        }
+        if let Ok(rd) = fs::read_dir(self.root.join("nonces")) {
+            for entry in rd.flatten() {
+                let _ = fs::remove_dir(entry.path()); // no-op unless empty
+            }
+        }
     }
 
     /// Expired-nonce sweep — run on every request touching `fp`, including
@@ -378,10 +412,13 @@ impl RelayStore {
     }
 
     /// Retention sweep: delete `.parcel` files whose sidecar `received_unix`
-    /// is older than the retention window (missing/unreadable sidecar →
-    /// treated as fresh, conservatively). A mailbox left empty BY THIS SWEEP
-    /// is pruned entirely (meta included), making it unknown again — a
-    /// mailbox emptied by acks keeps its meta so the owner can keep listing.
+    /// is older than the retention window. A sidecar-LESS parcel is treated
+    /// as expired and deleted too (belt-and-braces: a crash between the
+    /// parcel and sidecar renames — or a pre-atomic-write store — must not
+    /// leave an entry GC treats as fresh forever). A mailbox left empty BY
+    /// THIS SWEEP is pruned entirely (meta included), making it unknown
+    /// again — a mailbox emptied by acks keeps its meta so the owner can
+    /// keep listing.
     fn gc_mailbox(&self, fp: &str) {
         if !valid_fp(fp) {
             return;
@@ -401,9 +438,11 @@ impl RelayStore {
             let Some(id) = p.file_stem().and_then(|s| s.to_str()) else {
                 continue;
             };
-            let received =
-                read_json_field(&self.sidecar_path(fp, id), "received_unix").unwrap_or(i64::MAX);
-            if received <= cutoff {
+            let expired = match read_json_field(&self.sidecar_path(fp, id), "received_unix") {
+                Some(received) => received <= cutoff,
+                None => true, // missing/unreadable sidecar → expired
+            };
+            if expired {
                 let _ = fs::remove_file(&p);
                 let _ = fs::remove_file(self.sidecar_path(fp, id));
                 removed += 1;
@@ -485,6 +524,28 @@ fn verify_challenge_sig(nonce: &str, sig_b64: &str, pubkey_b64: &str) -> bool {
     verifying.verify(nonce.as_bytes(), &sig).is_ok()
 }
 
+/// Atomic file replace: write to a randomly-suffixed temp sibling, then
+/// rename over the destination. A reader (or a crash) sees either the
+/// previous file or the complete new bytes — never a truncated write. On
+/// Windows std's rename replaces an existing destination (MoveFileEx with
+/// REPLACE_EXISTING), so this is atomic on both platforms. Temp names end in
+/// `.tmp-{hex}` so mailbox scans (which match `.parcel`/`.json`) never see
+/// them; an orphaned temp (crash mid-write) is garbage on disk only.
+fn atomic_write(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let mut raw = [0u8; 4];
+    rand::rngs::OsRng.fill_bytes(&mut raw);
+    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("file");
+    let tmp = path.with_file_name(format!("{name}.tmp-{}", hex::encode(raw)));
+    fs::write(&tmp, bytes)?;
+    match fs::rename(&tmp, path) {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let _ = fs::remove_file(&tmp);
+            Err(e)
+        }
+    }
+}
+
 /// Read one integer field out of a small JSON file (`None` if unreadable).
 fn read_json_field(path: &Path, field: &str) -> Option<i64> {
     let raw = fs::read_to_string(path).ok()?;
@@ -553,6 +614,64 @@ mod tests {
         assert!(store.consume_nonce(&fp, &nonce, &sig, &pubkey));
         assert_eq!(store.nonce_count(&fp), 0);
         assert!(!store.consume_nonce(&fp, &nonce, &sig, &pubkey));
+    }
+
+    #[test]
+    fn gc_deletes_sidecarless_parcels_and_atomic_writes_leave_no_temps() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RelayStore::new(root.path().to_path_buf(), 365);
+        let (_, pubkey, fp) = key_and_fp();
+        store.deposit(&fp, &pubkey, br#"{"v":1}"#).unwrap();
+
+        // atomic deposit: only final names remain — no `.tmp-*` residue
+        let names: Vec<String> = fs::read_dir(store.mailbox_dir(&fp))
+            .unwrap()
+            .flatten()
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(!names.is_empty());
+        assert!(
+            names
+                .iter()
+                .all(|n| n == "meta.json" || n.ends_with(".parcel") || n.ends_with(".meta.json")),
+            "unexpected files left by deposit: {names:?}"
+        );
+
+        // a sidecar-less parcel (crash-between-renames / pre-atomic-write
+        // leftover) is swept as EXPIRED even with long retention...
+        let orphan = format!("{}.parcel", "b".repeat(32));
+        fs::write(store.mailbox_dir(&fp).join(&orphan), b"x").unwrap();
+        store.gc(&fp);
+        assert!(
+            !store.mailbox_dir(&fp).join(&orphan).exists(),
+            "sidecar-less parcel swept as expired"
+        );
+        // ...while the properly sidecarred deposit survives
+        assert_eq!(store.list(&fp).len(), 1);
+    }
+
+    #[test]
+    fn sweep_all_collects_never_revisited_fps() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RelayStore::new(root.path().to_path_buf(), 0);
+        let (_, pubkey, fp) = key_and_fp();
+        store.deposit(&fp, &pubkey, br#"{"v":1}"#).unwrap();
+        // challenge-flood leftover: expired nonce under an fp with NO mailbox
+        let ghost = "0123456789abcdef";
+        let ndir = store.nonce_dir(ghost);
+        fs::create_dir_all(&ndir).unwrap();
+        fs::write(
+            ndir.join("deadbeefdeadbeef.json"),
+            br#"{"nonce":"x","expires_unix":0}"#,
+        )
+        .unwrap();
+        let mbox = store.mailbox_dir(&fp);
+        assert!(mbox.exists());
+
+        store.sweep_all(); // no per-fp access before this — lazy GC never ran
+
+        assert!(!mbox.exists(), "abandoned mailbox swept and pruned");
+        assert!(!ndir.exists(), "swept nonce dir pruned");
     }
 
     #[test]

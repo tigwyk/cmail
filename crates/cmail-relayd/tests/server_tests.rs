@@ -314,6 +314,37 @@ fn retention_gc_removes_expired_and_prunes_empty_mailbox() {
 }
 
 #[test]
+fn periodic_sweep_collects_untouched_mailboxes_and_stale_nonce_dirs() {
+    // deposit-and-abandon + challenge-flood leftovers: those fps are never
+    // revisited, so lazy GC never fires for them — one pass of the periodic
+    // sweep (spec §2.2: ALL mailboxes every 10 minutes) must collect both.
+    let f = fix_retention(0);
+    assert_eq!(deposit(&f, &f.fp, &minimal_parcel(&f)), 200);
+
+    // expired nonce under a ghost fp that only ever requested challenges
+    let ghost = "0123456789abcdef";
+    let ndir = f._root.path().join("nonces").join(ghost);
+    std::fs::create_dir_all(&ndir).unwrap();
+    std::fs::write(
+        ndir.join("deadbeefdeadbeef.json"),
+        br#"{"nonce":"x","expires_unix":0}"#,
+    )
+    .unwrap();
+
+    // deliberately NO mailbox access after the deposit: lazy GC cannot fire
+    let mbox = f._root.path().join("mailboxes").join(&f.fp);
+    assert!(mbox.exists(), "deposit-and-abandon entry is on disk");
+    f.server.sweep_now(); // one synchronous periodic sweep
+    assert!(!mbox.exists(), "abandoned mailbox swept and pruned");
+    assert!(
+        !ndir.exists(),
+        "expired nonce swept, empty nonce dir pruned"
+    );
+    // the store still serves after a sweep
+    assert_eq!(deposit(&f, &f.fp, &minimal_parcel(&f)), 200);
+}
+
+#[test]
 fn challenge_outstanding_nonce_cap_is_429() {
     let f = fix();
     for _ in 0..MAX_OUTSTANDING_NONCES {

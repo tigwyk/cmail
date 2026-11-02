@@ -1,7 +1,8 @@
 //! Reference relay server (wire protocol v1, spec §2): five routes on
 //! `tiny_http`, nonce-challenge Ed25519 auth, Content-Length precheck,
-//! lazy retention/nonce GC, and caps. Plaintext HTTP only — the protocol
-//! requires TLS in production; loopback is the insecure-local test mode.
+//! lazy per-access GC plus a periodic all-mailbox sweep, and caps.
+//! Plaintext HTTP only — the protocol requires TLS in production; loopback
+//! is the insecure-local test mode.
 
 use crate::store::{
     now_unix, rfc3339, valid_fp, RelayStore, MAX_BODY_BYTES, MAX_OUTSTANDING_NONCES, NONCE_TTL_SECS,
@@ -13,20 +14,29 @@ use std::io::Read;
 use std::net::IpAddr;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::mpsc::{self, RecvTimeoutError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
+use std::time::Duration;
 use tiny_http::{Header, Method, Request, Response, Server};
 
 /// Handler threads accepting requests (tiny_http `recv` is thread-safe).
 const WORKERS: usize = 4;
 
-/// A running relay server. `start` spawns the workers detached; tests hold
-/// the struct (and the relay root) alive, and `Drop` stops the workers.
+/// Periodic all-fingerprint GC interval (spec §2.2: every 10 minutes).
+const SWEEP_INTERVAL: Duration = Duration::from_secs(10 * 60);
+
+/// A running relay server. `start` spawns the workers and the periodic
+/// sweep thread; tests hold the struct (and the relay root) alive, and
+/// `Drop` stops everything.
 pub struct RelayServer {
     server: Arc<Server>,
     base_url: String,
     workers: Mutex<Vec<JoinHandle<()>>>,
     stop: Arc<AtomicBool>,
+    store: Arc<RelayStore>,
+    /// Shutdown signal + handle for the periodic sweep thread (joined on Drop).
+    sweeper: Option<(mpsc::Sender<()>, JoinHandle<()>)>,
 }
 
 impl RelayServer {
@@ -65,17 +75,36 @@ impl RelayServer {
                     .expect("spawn relay worker thread")
             })
             .collect();
+        // Periodic GC sweep of ALL fingerprints (spec §2.2): lazy per-access
+        // GC never fires for abandoned mailboxes or challenge-flooded fps.
+        let (sweep_tx, sweep_rx) = mpsc::channel::<()>();
+        let sweeper = std::thread::Builder::new()
+            .name("cmail-relayd-sweeper".into())
+            .spawn({
+                let store = Arc::clone(&store);
+                move || sweep_loop(store, sweep_rx)
+            })
+            .expect("spawn relay sweep thread");
         Ok(RelayServer {
             server,
             base_url,
             workers: Mutex::new(workers),
             stop,
+            store,
+            sweeper: Some((sweep_tx, sweeper)),
         })
     }
 
     /// The bound base URL, e.g. `http://127.0.0.1:39219` (test/insecure mode).
     pub fn base_url(&self) -> String {
         self.base_url.clone()
+    }
+
+    /// Run one synchronous all-fingerprint GC pass — the same routine the
+    /// sweep thread runs every [`SWEEP_INTERVAL`]. Test hook for driving the
+    /// periodic sweep deterministically.
+    pub fn sweep_now(&self) {
+        self.store.sweep_all();
     }
 
     /// Block until all worker threads exit (after a stop signal).
@@ -96,6 +125,22 @@ impl Drop for RelayServer {
         for _ in 0..n {
             self.server.unblock();
         }
+        // Wake the sweep thread out of its interval wait and join it so no
+        // thread outlives the server.
+        if let Some((tx, handle)) = self.sweeper.take() {
+            let _ = tx.send(());
+            let _ = handle.join();
+        }
+    }
+}
+
+/// Periodic GC: one all-fingerprint sweep ([`RelayStore::sweep_all`]) every
+/// [`SWEEP_INTERVAL`], waking immediately on the shutdown signal (or sender
+/// drop) so shutdown is never delayed by the interval.
+fn sweep_loop(store: Arc<RelayStore>, shutdown: mpsc::Receiver<()>) {
+    // Timeout → run one sweep; shutdown signal or sender drop → exit.
+    while let Err(RecvTimeoutError::Timeout) = shutdown.recv_timeout(SWEEP_INTERVAL) {
+        store.sweep_all();
     }
 }
 
