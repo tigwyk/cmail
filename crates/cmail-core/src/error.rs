@@ -2,7 +2,7 @@
 pub enum CoreError {
     #[error("identity not found: {0} (run: cmail init --name {0})")]
     IdentityNotFound(String),
-    #[error("recipient has no identity: {0}")]
+    #[error("unknown recipient: {0} (neither a local identity nor keyring-known)")]
     UnknownRecipient(String),
     #[error("invalid name: {0} (allowed: lowercase alphanumerics and hyphens, max 64)")]
     InvalidName(String),

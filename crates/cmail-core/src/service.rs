@@ -301,9 +301,15 @@ impl Cmail {
 
     pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
         let (owner, env) = self.store.find_pending(id)?;
-        // Re-verify the recipient still has an identity: it may have been
-        // removed after the mail was held (review hardening).
-        if !identity_exists(&self.root, &env.to) {
+        // Re-verify the recipient is still releasable: the same disjunction
+        // send() accepts (local identity OR keyring-known). A local identity
+        // may have been removed after the mail was held — but on a synced
+        // root the keyring entry alone still carries the encrypt-to key
+        // (review hardening + whole-branch fix: held mail to keyring-only
+        // recipients must be approvable, not just sendable).
+        if !identity_exists(&self.root, &env.to)
+            && KeyRing::load(&self.root)?.get(&env.to).is_none()
+        {
             return Err(CoreError::UnknownRecipient(env.to));
         }
         self.store.ensure_mailbox(&env.to)?;
@@ -1460,6 +1466,69 @@ mod tests {
         let raw = c.store.read_raw(&c.store.inbox_dir("zoe"), &id).unwrap();
         assert!(raw.contains("\"enc\""));
         assert!(!raw.contains("secret body"));
+    }
+
+    #[test]
+    fn approve_releases_held_mail_to_keyring_known_recipient() {
+        let (root, c) = svc();
+        // Same cross-machine setup as the sendable test above: zoe is
+        // keyring-known locally, but identities/zoe/ lives on her machine.
+        c.keyring_add("zoe", KeySource::LocalIdentity).unwrap();
+        std::fs::remove_dir_all(root.path().join("identities").join("zoe")).unwrap();
+
+        // Held (not allowlisted), then approved: the recipient gate must
+        // accept the same disjunction send() accepts — a keyring-known name
+        // is a releasable recipient, not an UnknownRecipient.
+        let out = c
+            .send(Some("alice"), "zoe", "note", "s", "secret body", &[], None)
+            .unwrap();
+        let hid = match out {
+            SendOutcome::Held { id, .. } => id,
+            other => panic!("expected Held, got {other:?}"),
+        };
+        c.approve(&hid, false).unwrap();
+        assert!(c
+            .store
+            .inbox_dir("zoe")
+            .join(format!("{hid}.mail"))
+            .exists());
+        assert!(c.approvals(None).unwrap().is_empty());
+        let recs = c.audit_tail(5).unwrap();
+        assert!(recs.iter().any(|r| {
+            r.event == AuditEvent::Approve && r.msg_id.as_deref() == Some(hid.as_str())
+        }));
+    }
+
+    #[test]
+    fn sealed_send_pins_shared_epk_between_envelope_and_attachment() {
+        let (_root, c) = svc();
+        c.allow_add("zoe").unwrap();
+        let att = _root.path().join("note.txt");
+        std::fs::write(&att, "attachment state").unwrap();
+        let SendOutcome::Sent { id } = c
+            .send(Some("alice"), "zoe", "handoff", "s", "b", &[att], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        // Spec §2.2 contract: ONE ECDH per message — the session's epk sits on
+        // the envelope's enc object and, byte-for-byte, at the head of every
+        // sealed attachment frame (epk[32] || nonce[24] || ct).
+        let raw = c.store.read_raw(&c.store.inbox_dir("zoe"), &id).unwrap();
+        let env = Envelope::parse(&raw).unwrap();
+        let crate::envelope::EnvelopeContent::Sealed { enc } = env.content else {
+            panic!("send must seal");
+        };
+        use base64::engine::general_purpose::STANDARD as B64;
+        use base64::Engine;
+        let epk = B64.decode(&enc.epk).unwrap();
+        assert_eq!(epk.len(), 32);
+        let frame = std::fs::read(c.store.attachments_dir(&id).join("att-0.bin")).unwrap();
+        assert_eq!(
+            &epk[..],
+            &frame[..32],
+            "envelope and attachment epk must be identical"
+        );
     }
 
     #[test]
