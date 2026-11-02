@@ -538,12 +538,26 @@ mod tests {
     fn plain_wire_format_unchanged() {
         let (alice, _) = fixtures();
         let from_key = B64.encode(alice.verifying_key().as_bytes());
-        let mut p = parts("alice", &from_key, "zoe");
-        p.subject = "s".into();
-        let env = build_and_sign("ff".repeat(16).as_str(), &p, &alice).unwrap();
+        let env = build_and_sign(
+            "ff".repeat(16).as_str(),
+            &parts("alice", &from_key, "zoe"),
+            &alice,
+        )
+        .unwrap();
         let s = serde_json::to_string(&env).unwrap();
-        assert!(!s.contains("enc"));
-        assert!(s.contains("\"subject\":\"s\"")); // v1 shape intact (key order sorted, no spaces)
+        // v1 key order pinned: content fields sit between "to" and "created"
+        let to = s.find("\"to\":").expect("to present");
+        let kind = s.find("\"kind\":").expect("kind present");
+        let created = s.find("\"created\":").expect("created present");
+        let sig = s.find("\"sig\":").expect("sig present");
+        assert!(
+            to < kind && kind < created && created < sig,
+            "wire order drifted: {s}"
+        );
+        // no top-level enc KEY (not substring-matching base64 payloads)
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert!(v.get("enc").is_none());
+        assert!(v.get("subject").is_some());
         assert!(Envelope::parse(&s).unwrap().verify_self_signature());
     }
 
