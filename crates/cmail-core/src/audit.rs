@@ -20,6 +20,11 @@ pub enum AuditEvent {
     SpoofSuspected,
     Corrupt,
     QuarantineRelease,
+    // v0.3 relay events (spec §3.4): routing decisions and relay traffic
+    KeyRoute,
+    RelaySet,
+    SendRelay,
+    Fetch,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -152,7 +157,7 @@ mod tests {
     }
 
     #[test]
-    fn all_twelve_event_names_pinned() {
+    fn all_sixteen_event_names_pinned() {
         for (evt, name) in [
             (AuditEvent::Init, "init"),
             (AuditEvent::Send, "send"),
@@ -166,6 +171,10 @@ mod tests {
             (AuditEvent::SpoofSuspected, "spoof_suspected"),
             (AuditEvent::Corrupt, "corrupt"),
             (AuditEvent::QuarantineRelease, "quarantine_release"),
+            (AuditEvent::KeyRoute, "key_route"),
+            (AuditEvent::RelaySet, "relay_set"),
+            (AuditEvent::SendRelay, "send_relay"),
+            (AuditEvent::Fetch, "fetch"),
         ] {
             let r = AuditRecord::now(evt, "t");
             let s = serde_json::to_string(&r).unwrap();

@@ -566,3 +566,133 @@ fn no_identity_errors_cleanly() {
         .code(1)
         .stdout(contains("\"error\""));
 }
+
+/// Task R3: keyring routes and the pickup-relay config round-trip through the
+/// CLI — `keyring add --route` / `keyring route` set→list→clear, and
+/// `relay set`→`config` shows the url→`relay clear`, with `key_route` and
+/// `relay_set` landing in the audit log.
+#[test]
+fn keyring_route_and_relay_config_lifecycle() {
+    let root = TempDir::new().unwrap();
+    cmail(&root)
+        .arg("--json")
+        .arg("init")
+        .arg("--name")
+        .arg("alice")
+        .assert()
+        .success();
+    cmail(&root)
+        .arg("--json")
+        .arg("init")
+        .arg("--name")
+        .arg("zoe")
+        .assert()
+        .success();
+
+    // keyring add --route: route accepted at add time and listed
+    let added = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("keyring")
+            .arg("add")
+            .arg("alice")
+            .arg("--route")
+            .arg("https://relay.example.com"),
+    );
+    assert_eq!(added["status"], "trusted");
+    let list = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
+    let arr = list.as_array().unwrap();
+    assert_eq!(arr.len(), 1);
+    assert_eq!(arr[0]["name"], "alice");
+    assert_eq!(arr[0]["route"], "https://relay.example.com");
+
+    // human list appends " -> {url}" when a route is present
+    cmail(&root)
+        .arg("keyring")
+        .arg("list")
+        .assert()
+        .success()
+        .stdout(contains("-> https://relay.example.com"));
+
+    // route set -> list -> clear
+    let set = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("keyring")
+            .arg("route")
+            .arg("alice")
+            .arg("https://relay2.example.com"),
+    );
+    assert_eq!(set["status"], "set");
+    assert_eq!(set["name"], "alice");
+    assert_eq!(set["route"], "https://relay2.example.com");
+    let list2 = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
+    assert_eq!(
+        list2.as_array().unwrap()[0]["route"],
+        "https://relay2.example.com"
+    );
+    let cleared = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("keyring")
+            .arg("route")
+            .arg("alice")
+            .arg("--clear"),
+    );
+    assert_eq!(cleared["status"], "cleared");
+    let list3 = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
+    assert!(list3.as_array().unwrap()[0]["route"].is_null());
+
+    // routing an unknown name is an error, not a silent no-op
+    cmail(&root)
+        .arg("--json")
+        .arg("keyring")
+        .arg("route")
+        .arg("ghost")
+        .arg("https://relay.example.com")
+        .assert()
+        .code(1)
+        .stdout(contains("\"error\""));
+
+    // relay set -> config shows the url -> relay show -> clear
+    let rset = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("relay")
+            .arg("set")
+            .arg("https://pickup.example.com"),
+    );
+    assert_eq!(rset["status"], "set");
+    assert_eq!(rset["url"], "https://pickup.example.com");
+    let cfg = json_out(cmail(&root).arg("--json").arg("config"));
+    assert_eq!(cfg["config"]["relay"]["url"], "https://pickup.example.com");
+    let shown = json_out(cmail(&root).arg("--json").arg("relay").arg("show"));
+    assert_eq!(shown["url"], "https://pickup.example.com");
+    let rclear = json_out(cmail(&root).arg("--json").arg("relay").arg("clear"));
+    assert_eq!(rclear["status"], "cleared");
+    let cfg2 = json_out(cmail(&root).arg("--json").arg("config"));
+    assert!(cfg2["config"]["relay"]["url"].is_null());
+    let shown2 = json_out(cmail(&root).arg("--json").arg("relay").arg("show"));
+    assert!(shown2["url"].is_null());
+
+    // audit saw the routing and relay-config decisions
+    let audit = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("audit")
+            .arg("--tail")
+            .arg("100"),
+    );
+    let events: Vec<&str> = audit
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["event"].as_str().unwrap())
+        .collect();
+    for expected in ["key_route", "relay_set"] {
+        assert!(
+            events.contains(&expected),
+            "missing {expected} in {events:?}"
+        );
+    }
+}

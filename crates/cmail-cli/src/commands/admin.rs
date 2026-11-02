@@ -78,6 +78,7 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
             name,
             key_file,
             from_message,
+            route,
         } => {
             let source = if let Some(f) = key_file {
                 KeySource::KeyFile(f)
@@ -87,10 +88,44 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
                 KeySource::LocalIdentity
             };
             c.keyring_add(&name, source)?;
+            if let Some(url) = &route {
+                c.keyring_route(&name, Some(url))?;
+            }
             if cli.json {
-                output::print_json(&serde_json::json!({"status":"trusted","name":name}));
+                let mut v = serde_json::json!({"status":"trusted","name":name});
+                if let Some(url) = route {
+                    v["route"] = serde_json::json!(url);
+                }
+                output::print_json(&v);
             } else {
-                println!("trusted {name}");
+                match &route {
+                    Some(url) => println!("trusted {name} -> {url}"),
+                    None => println!("trusted {name}"),
+                }
+            }
+        }
+        KeyringCmd::Route { name, url, clear } => {
+            // --clear and a url are mutually exclusive (clap); neither is an error
+            let url = if clear {
+                None
+            } else {
+                url.as_deref().map(str::to_string)
+            };
+            if !clear && url.is_none() {
+                anyhow::bail!("keyring route needs a url or --clear");
+            }
+            c.keyring_route(&name, url.as_deref())?;
+            if cli.json {
+                let mut v = serde_json::json!({"status": if clear { "cleared" } else { "set" }, "name": name});
+                if let Some(u) = &url {
+                    v["route"] = serde_json::json!(u);
+                }
+                output::print_json(&v);
+            } else {
+                match &url {
+                    Some(u) => println!("routed {name} -> {u}"),
+                    None => println!("route cleared for {name}"),
+                }
             }
         }
         KeyringCmd::List => {
@@ -102,6 +137,7 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
                         "name": name,
                         "fingerprint": cmail_core::identity::fingerprint_of(&e.public_key),
                         "first_seen": e.first_seen,
+                        "route": e.route,
                     })
                 })
                 .collect();
@@ -109,11 +145,50 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
                 output::print_json(&v);
             } else {
                 for it in &v {
+                    let route = it["route"]
+                        .as_str()
+                        .map(|u| format!(" -> {u}"))
+                        .unwrap_or_default();
                     println!(
-                        "{}  {}",
+                        "{}  {}{}",
                         it["name"].as_str().unwrap_or("?"),
-                        it["fingerprint"].as_str().unwrap_or("?")
+                        it["fingerprint"].as_str().unwrap_or("?"),
+                        route
                     );
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn relay(cli: &Cli, cmd: RelayCmd) -> Result<()> {
+    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    match cmd {
+        RelayCmd::Set { url } => {
+            c.relay_set(Some(&url))?;
+            if cli.json {
+                output::print_json(&serde_json::json!({"status":"set","url":url}));
+            } else {
+                println!("relay set {url}");
+            }
+        }
+        RelayCmd::Clear => {
+            c.relay_set(None)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({"status":"cleared"}));
+            } else {
+                println!("relay cleared");
+            }
+        }
+        RelayCmd::Show => {
+            let url = cmail_core::Config::load_or_init(&c.root)?.relay_url();
+            if cli.json {
+                output::print_json(&serde_json::json!({"url": url}));
+            } else {
+                match url {
+                    Some(u) => println!("{u}"),
+                    None => println!("<none>"),
                 }
             }
         }
@@ -186,8 +261,20 @@ pub enum KeyringCmd {
         name: String,
         key_file: Option<std::path::PathBuf>,
         from_message: Option<String>,
+        route: Option<String>,
+    },
+    Route {
+        name: String,
+        url: Option<String>,
+        clear: bool,
     },
     List,
+}
+
+pub enum RelayCmd {
+    Set { url: String },
+    Clear,
+    Show,
 }
 
 pub enum QuarantineCmd {

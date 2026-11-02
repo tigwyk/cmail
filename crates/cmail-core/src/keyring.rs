@@ -9,6 +9,12 @@ use std::path::Path;
 pub struct KeyEntry {
     pub public_key: String,
     pub first_seen: String,
+    /// Relay base URL routing hint (spec §3.1): where mail for this name is
+    /// deposited when no local identity exists. Pure routing — never affects
+    /// trust. Absent in v0.2 keyrings; skipped on save when unset so old
+    /// files round-trip byte-stably.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub route: Option<String>,
 }
 
 #[derive(Debug, Default, Serialize, Deserialize)]
@@ -48,6 +54,7 @@ impl KeyRing {
                     KeyEntry {
                         public_key: public_key.to_string(),
                         first_seen: now_rfc3339(),
+                        route: None,
                     },
                 );
                 Ok(())
@@ -57,6 +64,25 @@ impl KeyRing {
 
     pub fn remove(&mut self, name: &str) -> bool {
         self.entries.remove(name).is_some()
+    }
+
+    /// Set (`Some`) or clear (`None`) the relay route on an existing entry.
+    /// Errors on an unknown name: routes attach to known keys only.
+    pub fn set_route(&mut self, name: &str, url: Option<&str>) -> Result<()> {
+        match self.entries.get_mut(name) {
+            Some(entry) => {
+                entry.route = url.map(str::to_string);
+                Ok(())
+            }
+            None => Err(CoreError::Config(format!(
+                "keyring has no entry for '{name}'; add it first (cmail keyring add)"
+            ))),
+        }
+    }
+
+    /// The entry's relay route, if any (None for unknown names and unset routes).
+    pub fn get_route(&self, name: &str) -> Option<String> {
+        self.entries.get(name).and_then(|e| e.route.clone())
     }
 
     pub fn list(&self) -> Vec<(String, KeyEntry)> {
@@ -114,5 +140,76 @@ mod tests {
         kr.add("alice", "a2V5").unwrap();
         assert!(kr.remove("alice"));
         assert!(!kr.remove("alice"));
+    }
+
+    #[test]
+    fn route_set_get_clear() {
+        let mut kr = KeyRing::default();
+        kr.add("alice", "a2V5").unwrap();
+        assert_eq!(kr.get_route("alice"), None);
+        kr.set_route("alice", Some("https://relay.example.com"))
+            .unwrap();
+        assert_eq!(
+            kr.get_route("alice").as_deref(),
+            Some("https://relay.example.com")
+        );
+        // None clears
+        kr.set_route("alice", None).unwrap();
+        assert_eq!(kr.get_route("alice"), None);
+    }
+
+    #[test]
+    fn route_on_unknown_name_is_config_error() {
+        let mut kr = KeyRing::default();
+        let err = kr
+            .set_route("ghost", Some("https://relay.example.com"))
+            .unwrap_err();
+        assert!(matches!(err, CoreError::Config(_)), "{err}");
+        assert!(
+            err.to_string().contains("ghost"),
+            "must name the missing entry: {err}"
+        );
+        assert!(matches!(
+            kr.set_route("ghost", None).unwrap_err(),
+            CoreError::Config(_)
+        ));
+    }
+
+    #[test]
+    fn route_persists_round_trip() {
+        let root = TempDir::new().unwrap();
+        let mut kr = KeyRing::default();
+        kr.add("alice", "a2V5").unwrap();
+        kr.set_route("alice", Some("https://relay.example.com"))
+            .unwrap();
+        kr.save(root.path()).unwrap();
+        let mut reloaded = KeyRing::load(root.path()).unwrap();
+        assert_eq!(
+            reloaded.get_route("alice").as_deref(),
+            Some("https://relay.example.com")
+        );
+        reloaded.set_route("alice", None).unwrap();
+        reloaded.save(root.path()).unwrap();
+        assert_eq!(KeyRing::load(root.path()).unwrap().get_route("alice"), None);
+    }
+
+    #[test]
+    fn old_keyring_without_route_parses_and_reserializes_without_it() {
+        let root = TempDir::new().unwrap();
+        // hand-written v0.2-format keyring: no `route` key anywhere
+        std::fs::write(
+            root.path().join("keyring.json"),
+            r#"{"alice": {"public_key": "a2V5", "first_seen": "2026-01-01T00:00:00Z"}}"#,
+        )
+        .unwrap();
+        let kr = KeyRing::load(root.path()).unwrap();
+        assert_eq!(kr.get("alice").unwrap().public_key, "a2V5");
+        assert_eq!(kr.get_route("alice"), None);
+        kr.save(root.path()).unwrap();
+        let text = std::fs::read_to_string(root.path().join("keyring.json")).unwrap();
+        assert!(
+            !text.contains("route"),
+            "re-saving an old keyring must not churn bytes with a route key: {text}"
+        );
     }
 }

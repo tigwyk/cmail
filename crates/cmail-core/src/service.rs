@@ -794,6 +794,43 @@ impl Cmail {
         Ok(())
     }
 
+    /// Set (`Some`) or clear (`None`) a keyring entry's relay route (spec
+    /// §3.1). Human-only routing decision: audited as `key_route` on both set
+    /// and clear.
+    pub fn keyring_route(&self, name: &str, url: Option<&str>) -> Result<()> {
+        let mut kr = KeyRing::load(&self.root)?;
+        kr.set_route(name, url)?;
+        kr.save(&self.root)?;
+        let mut rec = AuditRecord::now(AuditEvent::KeyRoute, "human")
+            .counterpart(name)
+            .outcome(if url.is_some() { "set" } else { "cleared" });
+        if let Some(u) = url {
+            rec = rec.detail(u);
+        }
+        append(&self.root, &rec)?;
+        Ok(())
+    }
+
+    /// Set (`Some`) or clear (`None`) the pickup relay url (spec §3.3).
+    /// Human-only config decision: audited as `relay_set`.
+    pub fn relay_set(&self, url: Option<&str>) -> Result<()> {
+        // Load fresh: other config edits may have landed after this handle was
+        // opened (long-lived MCP process), mirroring allow_add.
+        let mut cfg = Config::load_or_init(&self.root)?;
+        cfg.relay.url = url.map(str::to_string);
+        cfg.save(&self.root)?;
+        let mut rec = AuditRecord::now(AuditEvent::RelaySet, "human").outcome(if url.is_some() {
+            "set"
+        } else {
+            "cleared"
+        });
+        if let Some(u) = url {
+            rec = rec.detail(u);
+        }
+        append(&self.root, &rec)?;
+        Ok(())
+    }
+
     fn find_any_envelope(&self, id: &str) -> Result<Envelope> {
         for owner in crate::identity::list_identities(&self.root) {
             for d in [
@@ -1571,5 +1608,53 @@ mod tests {
             c.store.list_ids(&c.store.quarantine_dir("zoe")),
             vec![env.id.clone()]
         );
+    }
+
+    // --- Task R3 tests: keyring routes + relay url config ---
+
+    #[test]
+    fn keyring_route_sets_clears_and_audits() {
+        let (_root, c) = svc();
+        c.keyring_add("zoe", KeySource::LocalIdentity).unwrap();
+        c.keyring_route("zoe", Some("https://relay.example.com"))
+            .unwrap();
+        assert_eq!(
+            KeyRing::load(&c.root).unwrap().get_route("zoe").as_deref(),
+            Some("https://relay.example.com")
+        );
+        c.keyring_route("zoe", None).unwrap();
+        assert_eq!(KeyRing::load(&c.root).unwrap().get_route("zoe"), None);
+        // unknown name errors instead of silently creating an entry
+        assert!(c
+            .keyring_route("ghost", Some("https://relay.example.com"))
+            .is_err());
+        assert!(KeyRing::load(&c.root).unwrap().get("ghost").is_none());
+        // both set and clear audited as key_route by the human
+        let recs = c.audit_tail(10).unwrap();
+        let routes: Vec<_> = recs
+            .iter()
+            .filter(|r| r.event == AuditEvent::KeyRoute && r.counterpart.as_deref() == Some("zoe"))
+            .collect();
+        assert_eq!(routes.len(), 2, "set and clear must each audit: {recs:?}");
+    }
+
+    #[test]
+    fn relay_set_persists_and_audits() {
+        let (_root, c) = svc();
+        assert_eq!(Config::load_or_init(&c.root).unwrap().relay_url(), None);
+        c.relay_set(Some("https://pickup.example.com")).unwrap();
+        assert_eq!(
+            Config::load_or_init(&c.root)
+                .unwrap()
+                .relay_url()
+                .as_deref(),
+            Some("https://pickup.example.com")
+        );
+        c.relay_set(None).unwrap();
+        assert_eq!(Config::load_or_init(&c.root).unwrap().relay_url(), None);
+        let recs = c.audit_tail(10).unwrap();
+        assert!(recs
+            .iter()
+            .any(|r| r.event == AuditEvent::RelaySet && r.actor == "human"));
     }
 }

@@ -98,6 +98,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: KeyringCommand,
     },
+    /// Manage the pickup relay (human-only)
+    Relay {
+        #[command(subcommand)]
+        cmd: RelayCommand,
+    },
     /// Inspect quarantine (human-only)
     Quarantine {
         #[command(subcommand)]
@@ -127,8 +132,28 @@ pub enum KeyringCommand {
         key_file: Option<PathBuf>,
         #[arg(long)]
         from_message: Option<String>,
+        /// Relay base URL for this name (set the route at add time)
+        #[arg(long)]
+        route: Option<String>,
+    },
+    /// Set or clear a name's relay route (human-only)
+    Route {
+        name: String,
+        url: Option<String>,
+        #[arg(long, conflicts_with = "url")]
+        clear: bool,
     },
     List,
+}
+
+#[derive(Subcommand)]
+pub enum RelayCommand {
+    /// Set the pickup relay url
+    Set { url: String },
+    /// Clear the pickup relay url
+    Clear,
+    /// Show the configured pickup relay url
+    Show,
 }
 
 #[derive(Subcommand)]
@@ -169,12 +194,27 @@ fn map_keyring(cmd: &KeyringCommand) -> commands::admin::KeyringCmd {
             name,
             key_file,
             from_message,
+            route,
         } => commands::admin::KeyringCmd::Add {
             name: name.clone(),
             key_file: key_file.clone(),
             from_message: from_message.clone(),
+            route: route.clone(),
+        },
+        KeyringCommand::Route { name, url, clear } => commands::admin::KeyringCmd::Route {
+            name: name.clone(),
+            url: url.clone(),
+            clear: *clear,
         },
         KeyringCommand::List => commands::admin::KeyringCmd::List,
+    }
+}
+
+fn map_relay(cmd: &RelayCommand) -> commands::admin::RelayCmd {
+    match cmd {
+        RelayCommand::Set { url } => commands::admin::RelayCmd::Set { url: url.clone() },
+        RelayCommand::Clear => commands::admin::RelayCmd::Clear,
+        RelayCommand::Show => commands::admin::RelayCmd::Show,
     }
 }
 
@@ -239,6 +279,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Approve { id, remember } => commands::admin::approve(cli, id, *remember),
         Commands::Reject { id } => commands::admin::reject(cli, id),
         Commands::Keyring { cmd } => commands::admin::keyring(cli, map_keyring(cmd)),
+        Commands::Relay { cmd } => commands::admin::relay(cli, map_relay(cmd)),
         Commands::Quarantine { cmd } => commands::admin::quarantine(cli, map_quarantine(cmd)),
         Commands::Audit { tail } => commands::admin::audit(cli, *tail),
         Commands::Mcp => cmail_mcp::run_server(
