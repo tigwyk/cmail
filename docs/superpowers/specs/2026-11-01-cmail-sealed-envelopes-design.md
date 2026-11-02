@@ -51,12 +51,15 @@ Per message:
 1. Fresh ephemeral X25519 keypair → `epk` (32 bytes, base64).
 2. `ikm = X25519(ephemeral_secret, recipient_x25519_public)`.
 3. `salt = SHA256(epk || recipient_x25519_public)`.
-4. `msg_key = HKDF-SHA256(ikm, salt, info="cmail/v1/msg")` → ChaCha20-Poly1305 key.
+4. `msg_key = HKDF-SHA256(ikm, salt, info="cmail/v1/msg")` → XChaCha20-Poly1305
+   key (the 24-byte-nonce variant of ChaCha20-Poly1305).
 5. AEAD-encrypt the canonical-JSON payload (§3) with a fresh 24-byte `nonce`.
 
-Per attachment (index `i`, zero-based): `att_key_i = HKDF-SHA256(msg_key,
-salt=<none>, info="cmail/v1/att/<i>")`; AEAD-encrypt the file bytes with a fresh
-nonce per file. One ECDH per message; independent AEAD per attachment.
+Per attachment (index `i`, zero-based): `att_key_i = HKDF-SHA256(ikm, salt,
+info="cmail/v1/att/<i>")` — derived directly from the same ECDH `ikm` with the
+label as domain separator (equivalent independence to key-chaining, one less
+derivation layer); AEAD-encrypt the file bytes with a fresh nonce per file. One
+ECDH per message; independent AEAD per attachment.
 
 New dependencies: `x25519-dalek`, `hkdf`, `chacha20poly1305` (`sha2` already
 present). All RustCrypto/dalek-family, consistent with the existing tree.
