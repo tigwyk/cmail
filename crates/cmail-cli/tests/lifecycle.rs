@@ -38,10 +38,11 @@ fn approve_all_held(root: &TempDir) {
 
 /// Tamper with zoe's single inbox message by rewriting its `created` value in
 /// the on-disk envelope. `write_envelope` emits pretty JSON, so the timestamp
-/// is serialized as `"created": "2026-…"`; changing the year invalidates the
-/// self-signature without making the file unparseable. (`created` is a
-/// header field, present on both plain and sealed envelopes — a subject
-/// rewrite would miss sealed mail, which has no top-level subject.)
+/// is serialized as `"created": "2026-…"`; backdating the year (2xxx → 1xxx,
+/// matched on the leading digit so the pattern stays year-agnostic)
+/// invalidates the self-signature without making the file unparseable.
+/// (`created` is a header field, present on both plain and sealed envelopes —
+/// a subject rewrite would miss sealed mail, which has no top-level subject.)
 fn tamper_zoe_inbox_created(root: &TempDir) {
     let inbox_dir = root.path().join("mailboxes/zoe/inbox");
     let mut entries = std::fs::read_dir(&inbox_dir).unwrap();
@@ -51,7 +52,7 @@ fn tamper_zoe_inbox_created(root: &TempDir) {
         "expected exactly one inbox message to tamper"
     );
     let raw = std::fs::read_to_string(&mail_file).unwrap();
-    let tampered = raw.replace("\"created\": \"2026-", "\"created\": \"1999-");
+    let tampered = raw.replace("\"created\": \"2", "\"created\": \"1");
     assert_ne!(
         raw, tampered,
         "created tamper pattern not found in envelope"
@@ -119,7 +120,21 @@ fn full_lifecycle_with_json_shapes() {
     );
     assert_eq!(approved["status"], "approved");
 
-    // zoe inbox: one untrusted item
+    // sealed on the wire (spec 4.1): zoe's inbox file carries only the `enc`
+    // ciphertext — the sent body appears nowhere in plaintext
+    let raw = std::fs::read_to_string(
+        root.path()
+            .join("mailboxes")
+            .join("zoe")
+            .join("inbox")
+            .join(format!("{id}.mail")),
+    )
+    .unwrap();
+    assert!(raw.contains("\"enc\""));
+    assert!(!raw.contains("the state"));
+
+    // zoe inbox: one untrusted item, listed with sealed placeholders (spec 4.2:
+    // listings never reveal sealed content fields)
     let inbox = json_out(
         cmail(&root)
             .arg("--as")
@@ -131,8 +146,11 @@ fn full_lifecycle_with_json_shapes() {
     assert_eq!(arr.len(), 1);
     assert_eq!(arr[0]["trust"], "untrusted");
     assert_eq!(arr[0]["id"], id.as_str());
+    assert_eq!(arr[0]["subject"], "<sealed>");
+    assert_eq!(arr[0]["kind"], "sealed");
 
-    // read: wrapped body + fingerprint present
+    // read: decrypts back to the plaintext body, wrapped as untrusted +
+    // fingerprint present
     let read = json_out(
         cmail(&root)
             .arg("--as")
@@ -145,6 +163,7 @@ fn full_lifecycle_with_json_shapes() {
         .as_str()
         .unwrap()
         .contains("UNTRUSTED MAIL BODY"));
+    assert!(read["body"].as_str().unwrap().contains("the state"));
     assert_eq!(
         read["body"].as_str().unwrap().lines().next(),
         Some(UNTRUSTED_OPEN)

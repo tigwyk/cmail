@@ -144,7 +144,11 @@ impl Cmail {
         reply_to: Option<&str>,
     ) -> Result<SendOutcome> {
         let from = self.resolve_identity(as_name)?;
-        if !identity_exists(&self.root, to) {
+        // A valid recipient is either a local identity or a keyring-known name
+        // (the synced-root cross-machine case: only the remote machine holds
+        // identities/<to>/; locally the keyring entry carries the encrypt-to
+        // key, resolved by recipient_x25519 below).
+        if !identity_exists(&self.root, to) && KeyRing::load(&self.root)?.get(to).is_none() {
             return Err(CoreError::UnknownRecipient(to.to_string()));
         }
         if let Some(parent) = reply_to {
@@ -1423,6 +1427,39 @@ mod tests {
             .read_raw(&c.store.inbox_dir("alice"), &ids[0])
             .unwrap();
         assert!(raw.contains("\"enc\""));
+    }
+
+    #[test]
+    fn keyring_known_recipient_without_local_identity_is_sendable() {
+        let (root, c) = svc();
+        // Synced-root cross-machine case: zoe's key was promoted to the keyring
+        // while her identity existed, but only her remote machine has the
+        // identity — locally she is keyring-only (no identities/zoe/).
+        c.keyring_add("zoe", KeySource::LocalIdentity).unwrap();
+        std::fs::remove_dir_all(root.path().join("identities").join("zoe")).unwrap();
+
+        // The outbound gate still applies: not allowlisted -> Held (NOT
+        // UnknownRecipient — the keyring entry makes zoe a valid recipient).
+        let out = c
+            .send(Some("alice"), "zoe", "note", "s", "secret body", &[], None)
+            .unwrap();
+        let hid = match out {
+            SendOutcome::Held { id, .. } => id,
+            other => panic!("expected Held, got {other:?}"),
+        };
+        c.reject(&hid).unwrap();
+
+        // Allowlisted -> Sent, sealed on the wire, delivered to zoe's inbox.
+        c.allow_add("zoe").unwrap();
+        let SendOutcome::Sent { id } = c
+            .send(Some("alice"), "zoe", "note", "s2", "secret body", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let raw = c.store.read_raw(&c.store.inbox_dir("zoe"), &id).unwrap();
+        assert!(raw.contains("\"enc\""));
+        assert!(!raw.contains("secret body"));
     }
 
     #[test]

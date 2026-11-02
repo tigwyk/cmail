@@ -200,6 +200,9 @@ fn inbox_read_reply_wait_covered_via_mcp() {
         .as_str()
         .unwrap()
         .contains("UNTRUSTED MAIL BODY"));
+    // the decrypted body text itself comes back (sealed transport is
+    // transparent through the MCP read path, same JSON shape as the CLI)
+    assert!(read["body"].as_str().unwrap().contains("hello via core"));
     assert_eq!(read["fingerprint"].as_str().unwrap().len(), 16);
     let reply: serde_json::Value =
         serde_json::from_str(out[3]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();

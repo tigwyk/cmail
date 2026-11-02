@@ -238,7 +238,7 @@ read/observe commands), `--root <path>` (debug/testing).
 |---|---|
 | `cmail init --name <n>` | Create identity (idempotent). |
 | `cmail whoami` | Active identity name + root path. |
-| `cmail send --to <n> [--kind k] [--subject s] [--body t \| --body-file f] [--attach p]... [--reply-to <id>]` | Outbound via gate (4.1). Prints/returns `sent` or `held`. Fails fast if recipient identity does not exist, with a hint. |
+| `cmail send --to <n> [--kind k] [--subject s] [--body t \| --body-file f] [--attach p]... [--reply-to <id>]` | Outbound via gate (4.1). Prints/returns `sent` or `held`. Fails fast if the recipient is neither a local identity nor keyring-known, with a hint. |
 | `cmail inbox` | Unread list: id, from, kind, subject, trust, age. |
 | `cmail read <id>` | Full message (trust-annotated), moves inbox → archive. |
 | `cmail reply <id> [--body ...]` | Send with `in_reply_to` set (still gated). |
