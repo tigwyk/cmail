@@ -1,7 +1,10 @@
+use crate::crypto::{self, att_label, SealSession};
 use crate::envelope::{
     Attachment, Envelope, MAX_ATTACHMENTS, MAX_ATTACHMENT_BYTES, MAX_TOTAL_ATTACHMENT_BYTES,
 };
 use crate::error::{CoreError, Result};
+use base64::engine::general_purpose::STANDARD as B64;
+use base64::Engine;
 use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -174,6 +177,100 @@ impl MailStore {
         Ok(out)
     }
 
+    /// Sealed counterpart of [`MailStore::copy_attachments`], same H3-hardened
+    /// structure (count gate before any dir creation, rollback wrapper): each
+    /// file is AEAD-sealed under the session's per-attachment subkey
+    /// `cmail/v1/att/<i>` and written as raw `epk || nonce || ct` to
+    /// `attachments/<id>/att-<i>.bin`. The returned metadata (name/hash/size)
+    /// describes the PLAINTEXT; no plaintext bytes reach the disk.
+    pub fn seal_attachments(
+        &self,
+        session: &SealSession,
+        id: &str,
+        paths: &[PathBuf],
+    ) -> Result<Vec<Attachment>> {
+        if paths.len() > MAX_ATTACHMENTS {
+            return Err(CoreError::LimitExceeded(format!(
+                "more than {MAX_ATTACHMENTS} attachments"
+            )));
+        }
+        let dir = self.attachments_dir(id);
+        fs::create_dir_all(&dir)?;
+        match self.seal_attachments_inner(&dir, session, paths) {
+            Ok(out) => Ok(out),
+            Err(e) => {
+                // Roll back so a failed seal never leaves a half-populated
+                // attachments dir behind.
+                let _ = fs::remove_dir_all(&dir);
+                Err(e)
+            }
+        }
+    }
+
+    fn seal_attachments_inner(
+        &self,
+        dir: &Path,
+        session: &SealSession,
+        paths: &[PathBuf],
+    ) -> Result<Vec<Attachment>> {
+        let mut out = Vec::new();
+        let mut total: u64 = 0;
+        for (i, p) in paths.iter().enumerate() {
+            let meta = fs::metadata(p).map_err(CoreError::Io)?;
+            if meta.len() > MAX_ATTACHMENT_BYTES {
+                return Err(CoreError::LimitExceeded(format!(
+                    "{} exceeds {} bytes",
+                    p.display(),
+                    MAX_ATTACHMENT_BYTES
+                )));
+            }
+            total += meta.len();
+            if total > MAX_TOTAL_ATTACHMENT_BYTES {
+                return Err(CoreError::LimitExceeded(
+                    "attachments exceed 25 MiB total".into(),
+                ));
+            }
+            let bytes = fs::read(p)?;
+            let sealed = session.seal(&att_label(i), &bytes)?;
+            let raw = sealed_to_raw(&sealed)?;
+            // Framing adds 72B (epk + nonce) to pt + 16B tag, so the plaintext
+            // caps keep this bound structurally; enforce it anyway — cheap.
+            if raw.len() as u64 > MAX_ATTACHMENT_BYTES + 1024 {
+                return Err(CoreError::LimitExceeded(format!(
+                    "sealed {} exceeds {} bytes",
+                    p.display(),
+                    MAX_ATTACHMENT_BYTES + 1024
+                )));
+            }
+            fs::write(dir.join(format!("att-{i}.bin")), &raw)?;
+            out.push(Attachment {
+                filename: safe_filename(p),
+                sha256: hex::encode(Sha256::digest(&bytes)),
+                size: meta.len(),
+            });
+        }
+        Ok(out)
+    }
+
+    /// Open sealed attachment `index` of message `id` for the recipient holding
+    /// `recipient_secret`. Missing file → `MessageNotFound`; wrong key, label
+    /// mismatch, tampered bytes, or a truncated file → `DecryptFailed`.
+    pub fn open_attachment(
+        &self,
+        recipient_secret: &x25519_dalek::StaticSecret,
+        id: &str,
+        index: usize,
+    ) -> Result<Vec<u8>> {
+        let name = format!("att-{index}.bin");
+        let path = self.attachments_dir(id).join(&name);
+        let raw = fs::read(&path).map_err(|e| match e.kind() {
+            std::io::ErrorKind::NotFound => CoreError::MessageNotFound(format!("{id}/{name}")),
+            _ => CoreError::Io(e),
+        })?;
+        let sealed = sealed_from_raw(&raw)?;
+        crypto::open(recipient_secret, &sealed, &att_label(index))
+    }
+
     pub fn find_pending(&self, id: &str) -> Result<(String, Envelope)> {
         let mailboxes = self.root.join("mailboxes");
         if let Ok(entries) = fs::read_dir(&mailboxes) {
@@ -239,6 +336,36 @@ fn safe_filename(p: &Path) -> String {
     } else {
         cleaned
     }
+}
+
+/// `att-<i>.bin` framing: raw `epk(32) || nonce(24) || ct`, i.e. plaintext +
+/// 88B overhead. Binary rather than the base64 JSON `SealedBox` form so the
+/// ciphertext-file cap (`MAX_ATTACHMENT_BYTES + 1024`) follows from the
+/// plaintext caps.
+fn sealed_to_raw(sb: &crypto::SealedBox) -> Result<Vec<u8>> {
+    let fail = || CoreError::DecryptFailed("malformed sealed attachment".into());
+    let epk = B64.decode(&sb.epk).map_err(|_| fail())?;
+    let nonce = B64.decode(&sb.nonce).map_err(|_| fail())?;
+    let ct = B64.decode(&sb.ct).map_err(|_| fail())?;
+    let mut raw = Vec::with_capacity(epk.len() + nonce.len() + ct.len());
+    raw.extend_from_slice(&epk);
+    raw.extend_from_slice(&nonce);
+    raw.extend_from_slice(&ct);
+    Ok(raw)
+}
+
+fn sealed_from_raw(raw: &[u8]) -> Result<crypto::SealedBox> {
+    const HEADER: usize = 32 + 24; // epk || nonce ahead of the ciphertext
+    if raw.len() < HEADER {
+        return Err(CoreError::DecryptFailed(
+            "truncated sealed attachment".into(),
+        ));
+    }
+    Ok(crypto::SealedBox {
+        epk: B64.encode(&raw[..32]),
+        nonce: B64.encode(&raw[32..HEADER]),
+        ct: B64.encode(&raw[HEADER..]),
+    })
 }
 
 #[cfg(test)]
@@ -384,6 +511,39 @@ mod tests {
         let store = MailStore::new(root.path());
         fs::create_dir_all(store.inbox_dir("zoe").join("trap.mail")).unwrap();
         assert!(store.list_ids(&store.inbox_dir("zoe")).is_empty());
+    }
+
+    #[test]
+    fn seal_attachments_round_trip() {
+        let root = TempDir::new().unwrap();
+        let store = MailStore::new(root.path());
+        let recipient = SigningKey::generate(&mut OsRng);
+        let session = crate::crypto::SealSession::new(&crate::crypto::x25519_public(
+            &recipient.verifying_key(),
+        ));
+        let src = root.path().join("plain.txt");
+        fs::write(&src, b"hello attachment").unwrap();
+        let meta = store.seal_attachments(&session, "att1", &[src]).unwrap();
+        assert_eq!(meta[0].filename, "plain.txt");
+        assert_eq!(meta[0].size, 16);
+        assert_eq!(
+            meta[0].sha256,
+            hex::encode(Sha256::digest(b"hello attachment"))
+        );
+        // on-disk bytes are ciphertext: raw epk(32) + nonce(24) + ct(pt + 16B
+        // tag), and the plaintext substring appears nowhere in them
+        let raw = fs::read(store.attachments_dir("att1").join("att-0.bin")).unwrap();
+        assert_eq!(raw.len(), 16 + 32 + 24 + 16);
+        assert!(!raw.windows(6).any(|w| w == b"hello "));
+        let opened = store
+            .open_attachment(&crate::crypto::x25519_secret(&recipient), "att1", 0)
+            .unwrap();
+        assert_eq!(opened, b"hello attachment");
+        // wrong key fails
+        let other = SigningKey::generate(&mut OsRng);
+        assert!(store
+            .open_attachment(&crate::crypto::x25519_secret(&other), "att1", 0)
+            .is_err());
     }
 
     #[test]
