@@ -47,9 +47,11 @@ jobs:
           mkdir -p "${stage}" "dist"
           if [ "${{ matrix.target }}" = "x86_64-pc-windows-msvc" ]; then
             cp "target/${{ matrix.target }}/release/cmail.exe" "${stage}/"
+            cp "target/${{ matrix.target }}/release/cmail-relayd.exe" "${stage}/"
             7z a "dist/${stage}.zip" "${stage}" > /dev/null
           else
             cp "target/${{ matrix.target }}/release/cmail" "${stage}/"
+            cp "target/${{ matrix.target }}/release/cmail-relayd" "${stage}/"
             tar -czf "dist/${stage}.tar.gz" "${stage}"
           fi
       - name: Upload artifact

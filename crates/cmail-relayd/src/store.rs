@@ -170,10 +170,13 @@ impl RelayStore {
         fs::create_dir_all(self.mailbox_dir(fp))?;
         let meta = self.meta_path(fp);
         if !meta.exists() {
-            fs::write(
-                &meta,
-                json!({"pubkey": pubkey_b64, "created": rfc3339(now_unix())}).to_string(),
-            )?;
+            // Atomic like the parcel/sidecar writes below: a crash mid-write
+            // must not leave a truncated meta — `mailbox_pubkey` would then
+            // fail closed (mailbox 404s forever) while deposits keep
+            // "succeeding" on this existence check alone.
+            let meta_json =
+                json!({"pubkey": pubkey_b64, "created": rfc3339(now_unix())}).to_string();
+            atomic_write(&meta, meta_json.as_bytes())?;
         }
         let id = self.fresh_id(fp);
         // Atomic parcel + sidecar writes (write BOTH temps, rename BOTH): a
@@ -648,6 +651,31 @@ mod tests {
         );
         // ...while the properly sidecarred deposit survives
         assert_eq!(store.list(&fp).len(), 1);
+    }
+
+    #[test]
+    fn meta_round_trips_atomically_and_corrupt_meta_fails_closed() {
+        let root = tempfile::tempdir().unwrap();
+        let store = RelayStore::new(root.path().to_path_buf(), 7);
+        let (_, pubkey, fp) = key_and_fp();
+
+        // deposit twice: the meta written (atomically) at the FIRST deposit
+        // round-trips and is never rewritten — the pubkey stays pinned
+        store.deposit(&fp, &pubkey, br#"{"v":1}"#).unwrap();
+        let meta_file = store.meta_path(&fp);
+        let first = fs::read_to_string(&meta_file).unwrap();
+        store.deposit(&fp, &pubkey, br#"{"v":2}"#).unwrap();
+        assert_eq!(
+            fs::read_to_string(&meta_file).unwrap(),
+            first,
+            "meta is pinned at first deposit"
+        );
+        assert_eq!(store.mailbox_pubkey(&fp).as_deref(), Some(pubkey.as_str()));
+
+        // a corrupt meta (a truncated write only pre-atomic-write stores could
+        // produce) fails CLOSED: the mailbox reads as unknown, never half-open
+        fs::write(&meta_file, b"garbage{").unwrap();
+        assert_eq!(store.mailbox_pubkey(&fp), None, "corrupt meta fails closed");
     }
 
     #[test]

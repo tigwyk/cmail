@@ -183,7 +183,14 @@ fn ensure_fp_matches(pubkey_b64: &str, fp: &str) -> Result<()> {
 }
 
 fn agent() -> ureq::Agent {
-    ureq::AgentBuilder::new().timeout(REQUEST_TIMEOUT).build()
+    // Redirects are disabled (ureq follows up to 5 by default): a malicious
+    // or compromised relay must not be able to 30x cmail traffic — sealed
+    // parcels, signatures — off to an arbitrary origin. A 3xx surfaces as a
+    // typed RelayStatus error instead. The reference relayd never redirects.
+    ureq::AgentBuilder::new()
+        .redirects(0)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
 }
 
 /// `ureq::Response::into_string` caps at 10 MB — parcels reach ~36 MB
