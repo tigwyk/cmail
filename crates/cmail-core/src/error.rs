@@ -14,6 +14,8 @@ pub enum CoreError {
     LimitExceeded(String),
     #[error("{0}")]
     Config(String),
+    #[error("relay: {0}")]
+    Relay(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]

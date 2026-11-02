@@ -7,6 +7,7 @@ pub mod error;
 pub mod fsutil;
 pub mod identity;
 pub mod keyring;
+pub mod relay;
 pub mod service;
 pub mod store;
 pub mod trust;
