@@ -36,11 +36,13 @@ fn approve_all_held(root: &TempDir) {
     }
 }
 
-/// Tamper with zoe's single inbox message by rewriting its (empty) subject in
-/// the on-disk envelope. `write_envelope` emits pretty JSON, so an empty
-/// subject is serialized as `"subject": ""`; changing it invalidates the
-/// self-signature without making the file unparseable.
-fn tamper_zoe_inbox_subject(root: &TempDir) {
+/// Tamper with zoe's single inbox message by rewriting its `created` value in
+/// the on-disk envelope. `write_envelope` emits pretty JSON, so the timestamp
+/// is serialized as `"created": "2026-…"`; changing the year invalidates the
+/// self-signature without making the file unparseable. (`created` is a
+/// header field, present on both plain and sealed envelopes — a subject
+/// rewrite would miss sealed mail, which has no top-level subject.)
+fn tamper_zoe_inbox_created(root: &TempDir) {
     let inbox_dir = root.path().join("mailboxes/zoe/inbox");
     let mut entries = std::fs::read_dir(&inbox_dir).unwrap();
     let mail_file = entries.next().unwrap().unwrap().path();
@@ -49,10 +51,10 @@ fn tamper_zoe_inbox_subject(root: &TempDir) {
         "expected exactly one inbox message to tamper"
     );
     let raw = std::fs::read_to_string(&mail_file).unwrap();
-    let tampered = raw.replace("\"subject\": \"\"", "\"subject\": \"injected\"");
+    let tampered = raw.replace("\"created\": \"2026-", "\"created\": \"1999-");
     assert_ne!(
         raw, tampered,
-        "subject tamper pattern not found in envelope"
+        "created tamper pattern not found in envelope"
     );
     std::fs::write(&mail_file, tampered).unwrap();
 }
@@ -302,9 +304,9 @@ fn corrupt_lands_in_quarantine_never_inbox() {
         .success();
     approve_all_held(&root);
 
-    // tamper: rewrite the subject in zoe's inbox file -> signature no longer
-    // matches the envelope content -> quarantined on the next scan
-    tamper_zoe_inbox_subject(&root);
+    // tamper: rewrite the created timestamp in zoe's inbox file -> signature
+    // no longer matches the envelope content -> quarantined on the next scan
+    tamper_zoe_inbox_created(&root);
 
     let inbox = json_out(
         cmail(&root)
@@ -445,7 +447,7 @@ fn quarantine_release_success_moves_to_archive_and_reads() {
     approve_all_held(&root);
 
     // break the signature; the next scan quarantines it (corrupt path)
-    tamper_zoe_inbox_subject(&root);
+    tamper_zoe_inbox_created(&root);
     let inbox = json_out(
         cmail(&root)
             .arg("--as")

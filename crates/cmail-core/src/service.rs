@@ -1,6 +1,7 @@
 use crate::audit::{append, AuditEvent, AuditRecord};
 use crate::config::{Config, InboundMode, OutboundMode};
-use crate::envelope::{build_and_sign, new_id, Envelope, EnvelopeContent, NewEnvelope};
+use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
+use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
 use crate::error::{CoreError, Result};
 use crate::identity::{create_identity, identity_exists, load_identity, now_rfc3339};
 use crate::keyring::KeyRing;
@@ -155,7 +156,10 @@ impl Cmail {
         }
         let id = new_id();
         let identity = load_identity(&self.root, &from)?;
-        let attachment_meta = self.store.copy_attachments(&id, attachments)?;
+        // Spec 4.1: one SealSession per message (one ECDH, one epk) shared by
+        // the body and every attachment.
+        let session = SealSession::new(&self.recipient_x25519(to)?);
+        let attachment_meta = self.store.seal_attachments(&session, &id, attachments)?;
         let outcome = self.send_gated(
             &id,
             &identity,
@@ -166,12 +170,29 @@ impl Cmail {
             body,
             attachment_meta,
             reply_to,
+            &session,
         );
         if outcome.is_err() {
             // no orphaned attachments/<id>/ on any failure (review hardening)
             let _ = std::fs::remove_dir_all(self.store.attachments_dir(&id));
         }
         outcome
+    }
+
+    /// Recipient encrypt-to key (spec 4.1): the X25519 (Montgomery) form of
+    /// `identities/<to>`'s Ed25519 public key, falling back to the keyring
+    /// entry's stored key — the cross-machine case on future synced roots.
+    fn recipient_x25519(&self, to: &str) -> Result<x25519_dalek::PublicKey> {
+        let public_key_b64 = if identity_exists(&self.root, to) {
+            load_identity(&self.root, to)?.public_key_b64()
+        } else {
+            KeyRing::load(&self.root)?
+                .get(to)
+                .map(|e| e.public_key.clone())
+                .ok_or_else(|| CoreError::UnknownRecipient(to.to_string()))?
+        };
+        recipient_public_from_b64(&public_key_b64)
+            .ok_or_else(|| CoreError::Config(format!("recipient '{to}' has no usable public key")))
     }
 
     #[expect(clippy::too_many_arguments)]
@@ -186,10 +207,13 @@ impl Cmail {
         body: &str,
         attachment_meta: Vec<crate::envelope::Attachment>,
         reply_to: Option<&str>,
+        session: &SealSession,
     ) -> Result<SendOutcome> {
-        let env = build_and_sign(
+        // Spec 4.1: content always travels sealed — same args as a v1 send,
+        // sealed to the recipient's identity key via the shared session.
+        let env = seal_and_sign(
             id,
-            &NewEnvelope {
+            &NewSealedMessage {
                 from: from.to_string(),
                 from_key: identity.public_key_b64(),
                 to: to.to_string(),
@@ -198,8 +222,9 @@ impl Cmail {
                 body: body.to_string(),
                 attachments: attachment_meta,
                 in_reply_to: reply_to.map(str::to_string),
-                created: now_rfc3339(),
             },
+            session,
+            &now_rfc3339(),
             &identity.signing,
         )?;
         self.store.ensure_mailbox(from)?;
@@ -494,23 +519,33 @@ impl Cmail {
         let env = self.load_envelope_from(std::slice::from_ref(src), id)?;
         let keyring = KeyRing::load(&self.root)?;
         let tr = crate::trust::evaluate(&env, &keyring);
+        // Spec 4.2: signature and trust come from the visible header (above);
+        // content is recovered here — a sealed envelope is opened with the
+        // reader's X25519 identity key, a plain envelope passes through. A
+        // decrypt failure (wrong identity, tampered ciphertext) or an invalid
+        // decrypted payload returns BEFORE the inbox→archive move, so the
+        // message stays in place, audited as corrupt (spec 5).
+        let my = load_identity(&self.root, &me)?;
+        let opened = match open_envelope(&env, &x25519_secret(&my.signing)) {
+            Ok(opened) => opened,
+            Err(e) => {
+                self.audit_corrupt(id, "decrypt failed")?;
+                return Err(e);
+            }
+        };
         // Spec 4.2 wrapping rule: every trust level other than `verified` is
         // presented behind the untrusted fence — a spoof-suspect or invalid
         // message a human released from quarantine is never shown unfenced.
-        // Sealed bodies are opaque here; E5 wires real decryption.
-        let body = match (&env.content, tr.level) {
-            (EnvelopeContent::Plain { body, .. }, TrustLevel::Verified) => body.clone(),
-            (EnvelopeContent::Plain { body, .. }, _) => wrap_untrusted(body),
-            (EnvelopeContent::Sealed { .. }, _) => "<sealed>".to_string(),
+        let body = if tr.level == TrustLevel::Verified {
+            opened.body.clone()
+        } else {
+            wrap_untrusted(&opened.body)
         };
-        let attachments = match &env.content {
-            EnvelopeContent::Plain { attachments, .. } => attachments
-                .iter()
-                .map(|a| a.filename.clone())
-                .collect::<Vec<_>>(),
-            // Sealed attachments travel inside the ciphertext; E5 wires real decryption.
-            EnvelopeContent::Sealed { .. } => Vec::new(),
-        };
+        let attachments = opened
+            .attachments
+            .iter()
+            .map(|a| a.filename.clone())
+            .collect::<Vec<_>>();
         if in_inbox {
             self.store.move_message(&inbox, &archive, id)?;
         }
@@ -520,18 +555,15 @@ impl Cmail {
                 .msg(id)
                 .counterpart(&env.from),
         )?;
-        let kind = env.kind_label().to_string();
-        let subject = env.subject_label().to_string();
-        let in_reply_to = env.in_reply_to_ref().map(str::to_string);
         Ok(ReadMessage {
             id: env.id,
             from: env.from,
             to: env.to,
-            kind,
-            subject,
+            kind: opened.kind,
+            subject: opened.subject,
             body,
             attachments,
-            in_reply_to,
+            in_reply_to: opened.in_reply_to,
             created: env.created,
             trust: tr.level.as_str().to_string(),
             fingerprint: tr.fingerprint,
@@ -566,6 +598,13 @@ impl Cmail {
             &[self.store.inbox_dir(&me), self.store.archive_dir(&me)],
             id,
         )?;
+        // Spec 4.3: load the parent, decrypting it if sealed — a parent this
+        // identity cannot open (sealed for someone else) fails cleanly here
+        // instead of producing a reply to content the sender never saw. The
+        // threading fields come from the envelope itself: in_reply_to is the
+        // parent's id and the recipient is parent.from (both header-visible).
+        let my = load_identity(&self.root, &me)?;
+        open_envelope(&parent, &x25519_secret(&my.signing))?;
         let subject = subject
             .map(str::to_string)
             .unwrap_or_else(|| format!("re: {}", parent.subject_label()));
@@ -646,27 +685,36 @@ impl Cmail {
     }
 
     /// Inspect a quarantined message without moving it; the body is always
-    /// wrapped as untrusted regardless of evaluated trust.
+    /// wrapped as untrusted regardless of evaluated trust. Sealed mail is
+    /// decrypted for the owner (spec 4.4); if decryption fails, the header
+    /// still shows, with a `<sealed>` body note carrying the error.
     pub fn quarantine_show(&self, owner: Option<&str>, id: &str) -> Result<ReadMessage> {
         let me = self.resolve_identity(owner)?;
         let env = Envelope::parse(&self.store.read_raw(&self.store.quarantine_dir(&me), id)?)?;
         let keyring = KeyRing::load(&self.root)?;
         let tr = crate::trust::evaluate(&env, &keyring);
-        // Sealed bodies are opaque here; E5 wires real decryption.
-        let body = match &env.content {
-            EnvelopeContent::Plain { body, .. } => wrap_untrusted(body),
-            EnvelopeContent::Sealed { .. } => "<sealed>".to_string(),
-        };
-        let attachments = match &env.content {
-            EnvelopeContent::Plain { attachments, .. } => attachments
-                .iter()
-                .map(|a| a.filename.clone())
-                .collect::<Vec<_>>(),
-            EnvelopeContent::Sealed { .. } => Vec::new(),
-        };
-        let kind = env.kind_label().to_string();
-        let subject = env.subject_label().to_string();
-        let in_reply_to = env.in_reply_to_ref().map(str::to_string);
+        let my = load_identity(&self.root, &me)?;
+        let (kind, subject, body, attachments, in_reply_to) =
+            match open_envelope(&env, &x25519_secret(&my.signing)) {
+                Ok(opened) => (
+                    opened.kind,
+                    opened.subject,
+                    wrap_untrusted(&opened.body),
+                    opened
+                        .attachments
+                        .iter()
+                        .map(|a| a.filename.clone())
+                        .collect::<Vec<_>>(),
+                    opened.in_reply_to,
+                ),
+                Err(e) => (
+                    env.kind_label().to_string(),
+                    env.subject_label().to_string(),
+                    wrap_untrusted(&format!("<sealed>\n{e}")),
+                    Vec::new(),
+                    env.in_reply_to_ref().map(str::to_string),
+                ),
+            };
         Ok(ReadMessage {
             id: env.id,
             from: env.from,
@@ -767,6 +815,7 @@ fn fs_ensure_root(root: &Path) -> Result<()> {
 mod tests {
     use super::*;
     use crate::config::OutboundMode;
+    use crate::envelope::{build_and_sign, NewEnvelope};
     use crate::error::CoreError;
     use tempfile::TempDir;
 
@@ -1045,8 +1094,12 @@ mod tests {
         };
         let raw = c.store.read_raw(&c.store.inbox_dir("alice"), &rid).unwrap();
         let env = Envelope::parse(&raw).unwrap();
-        assert_eq!(env.in_reply_to_ref(), Some(id.as_str()));
-        assert!(env.subject_label().starts_with("re:"));
+        // sends are sealed now (spec 4.1): open the reply with alice's key to
+        // see the threading fields that used to sit on the plain wire
+        let alice = load_identity(&c.root, "alice").unwrap();
+        let opened = open_envelope(&env, &x25519_secret(&alice.signing)).unwrap();
+        assert_eq!(opened.in_reply_to.as_deref(), Some(id.as_str()));
+        assert!(opened.subject.starts_with("re:"));
     }
 
     #[test]
@@ -1266,5 +1319,151 @@ mod tests {
         assert_eq!(recs[0].msg_id.as_deref(), Some(id.as_str()));
         assert_eq!(recs[0].counterpart.as_deref(), Some(""));
         assert_eq!(recs[0].outcome, "deleted (unparseable pending message)");
+    }
+
+    // --- Task E5 tests: transparent sealing and opening (spec 4) ---
+
+    #[test]
+    fn send_seals_and_read_opens() {
+        let (_root, c) = svc();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        c.allow_add("zoe").unwrap();
+        let SendOutcome::Sent { id } = c
+            .send(
+                Some("alice"),
+                "zoe",
+                "handoff",
+                "proj",
+                "the state",
+                &[],
+                None,
+            )
+            .unwrap()
+        else {
+            panic!()
+        };
+        // wire: sealed, no plaintext
+        let raw = c.store.read_raw(&c.store.inbox_dir("zoe"), &id).unwrap();
+        assert!(raw.contains("\"enc\""));
+        assert!(!raw.contains("the state"));
+        // listings use placeholders
+        let inbox = c.inbox(Some("zoe")).unwrap();
+        assert_eq!(inbox[0].subject, "<sealed>");
+        assert_eq!(inbox[0].kind, "sealed");
+        // read decrypts: first message is from trusted alice (keyring_add above)
+        let msg = c.read_message(Some("zoe"), &id).unwrap();
+        assert_eq!(msg.body, "the state");
+        assert_eq!(msg.kind, "handoff");
+        assert_eq!(msg.attachments, Vec::<String>::new());
+        // second send arrives AFTER removing alice's trust -> untrusted, fenced post-decrypt
+        let mut kr = crate::keyring::KeyRing::load(_root.path()).unwrap();
+        kr.remove("alice");
+        kr.save(_root.path()).unwrap();
+        let SendOutcome::Sent { id: id2 } = c
+            .send(Some("alice"), "zoe", "note", "s2", "secret2", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let msg2 = c.read_message(Some("zoe"), &id2).unwrap();
+        assert!(msg2.body.contains("UNTRUSTED MAIL BODY"));
+        assert!(msg2.body.contains("secret2"));
+    }
+
+    #[test]
+    fn decrypt_failure_is_clean_and_audited() {
+        let (_root, c) = svc();
+        c.allow_add("zoe").unwrap();
+        let SendOutcome::Sent { id } = c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        // re-seal for a DIFFERENT recipient by swapping in a foreign inbox: simulate by
+        // delivering into mallory's mailbox instead (mallory has no matching key)
+        c.init("mallory").unwrap();
+        c.store.ensure_mailbox("mallory").unwrap(); // init only creates the identity
+        let raw = c.store.read_raw(&c.store.inbox_dir("zoe"), &id).unwrap();
+        std::fs::write(c.store.inbox_dir("mallory").join(format!("{id}.mail")), raw).unwrap();
+        let err = c.read_message(Some("mallory"), &id).unwrap_err();
+        assert!(matches!(err, CoreError::DecryptFailed(_)), "{err}");
+        // message stays in place
+        assert!(c
+            .store
+            .inbox_dir("mallory")
+            .join(format!("{id}.mail"))
+            .exists());
+        let recs = c.audit_tail(5).unwrap();
+        assert!(recs
+            .iter()
+            .any(|r| r.detail.as_deref() == Some("decrypt failed")));
+    }
+
+    #[test]
+    fn reply_from_sealed_parent_and_sealed_approvals_subject() {
+        let (_root, c) = svc();
+        let SendOutcome::Held { id, .. } = c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        else {
+            panic!()
+        };
+        let apps = c.approvals(None).unwrap();
+        assert_eq!(apps[0].subject, "<sealed>");
+        c.approve(&id, true).unwrap();
+        c.keyring_add("zoe", KeySource::LocalIdentity).unwrap();
+        c.allow_add("alice").unwrap(); // allow zoe->alice for the reply to send directly
+        let out = c.reply(Some("zoe"), &id, "roger", None).unwrap();
+        assert!(matches!(out, SendOutcome::Sent { .. }));
+        // reply envelope is sealed with in_reply_to set (check wire on alice's side)
+        let ids = c.store.list_ids(&c.store.inbox_dir("alice"));
+        let raw = c
+            .store
+            .read_raw(&c.store.inbox_dir("alice"), &ids[0])
+            .unwrap();
+        assert!(raw.contains("\"enc\""));
+    }
+
+    #[test]
+    fn spoof_of_sealed_mail_quarantines_without_decryption() {
+        let (_root, c) = svc();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        c.init("mallory").unwrap();
+        let mallory = crate::identity::load_identity(_root.path(), "mallory").unwrap();
+        let rx = crate::crypto::recipient_public_from_b64(
+            &crate::identity::load_identity(_root.path(), "zoe")
+                .unwrap()
+                .public_key_b64(),
+        )
+        .unwrap();
+        let parts = crate::envelope::NewSealedMessage {
+            from: "alice".into(),
+            from_key: mallory.public_key_b64(),
+            to: "zoe".into(),
+            kind: "note".into(),
+            subject: "fake".into(),
+            body: "imposter".into(),
+            attachments: vec![],
+            in_reply_to: None,
+        };
+        let session = crate::crypto::SealSession::new(&rx);
+        let env = crate::envelope::seal_and_sign(
+            &crate::envelope::new_id(),
+            &parts,
+            &session,
+            "2026-11-01T12:00:00Z",
+            &mallory.signing,
+        )
+        .unwrap();
+        c.store.ensure_mailbox("zoe").unwrap();
+        c.store
+            .write_envelope(&c.store.inbox_dir("zoe"), &env)
+            .unwrap();
+        assert!(c.inbox(Some("zoe")).unwrap().is_empty());
+        assert_eq!(
+            c.store.list_ids(&c.store.quarantine_dir("zoe")),
+            vec![env.id.clone()]
+        );
     }
 }
