@@ -206,7 +206,9 @@ owner.
 
 JSONL at `<root>/audit.log`, append-only. Events: `init`, `send`, `held`,
 `approve`, `reject`, `read`, `allow_add`, `allow_remove`, `key_add`,
-`spoof_suspected`, `corrupt`, `quarantine_release`. Each line: `{ts, event, actor
+`spoof_suspected`, `corrupt`, `quarantine_release`, plus the v0.3 relay
+events `key_route`, `relay_set`, `send_relay`, `fetch` (see the relays
+spec, §3.4). Each line: `{ts, event, actor
 (identity, "human", or "system" for automated routing decisions such as
 spoof/corrupt quarantine), msg_id, counterpart, outcome, detail}`. `cmail audit
 [--tail N]` reads it. No tooling beyond tail in v1. The strict-mode unknown-sender
@@ -243,14 +245,18 @@ read/observe commands), `--root <path>` (debug/testing).
 | `cmail read <id>` | Full message (trust-annotated), moves inbox → archive. |
 | `cmail reply <id> [--body ...]` | Send with `in_reply_to` set (still gated). |
 | `cmail wait [--timeout 30s]` | Block until new inbox mail for active identity, then print inbox. Polls at 250 ms. |
+| `cmail fetch [--wait] [--timeout 30s]` | Pull pending sealed parcels from the configured relay into the local inbox (explicit, never automatic; see relays spec §3.3). |
 | `cmail list [--all]` | Inbox (+ archive with `--all`). |
 | `cmail allow add\|remove\|list` | Allowlist management. |
 | `cmail approvals` | Held outbound mail (all identities by default, `--as` to scope). |
 | `cmail approve <id> [--remember]` | Deliver held mail; optionally allowlist recipient. |
 | `cmail reject <id>` | Delete held mail. |
-| `cmail keyring add <n> [--key-file f \| --from-message <id>] \| list` | Trust management (human-only). Default: promotes a local identity's public key from `identities/<n>/`; `--key-file` imports an external public key; `--from-message` promotes the `from_key` of a message you're reading (the TOFU first-contact flow). `list` shows names, fingerprints, first-seen. |
+| `cmail keyring add <n> [--key-file f \| --from-message <id>] [--route <url>] \| list` | Trust management (human-only). Default: promotes a local identity's public key from `identities/<n>/`; `--key-file` imports an external public key; `--from-message` promotes the `from_key` of a message you're reading (the TOFU first-contact flow). `list` shows names, fingerprints, first-seen. |
+| `cmail keyring route <n> <url> \| <n> --clear` | Set or clear a name's relay route (human-only, audited `key_route`): where mail for a keyring-only name is deposited. Pure routing — never affects trust. |
+| `cmail relay set <url> \| clear \| show` | Manage this root's pickup relay (human-only, audited `relay_set`): the URL `cmail fetch` pulls from. |
 | `cmail quarantine list\|show\|release` | Quarantine management (human-only). `release` moves to archive (reviewed, retained, not re-shown); see §4.2 release semantics. |
 | `cmail audit [--tail N]` | Tail audit log. |
+| `cmail relay-serve --root <dir> [--addr 127.0.0.1:8080] [--retention-days 7]` | Run the reference relay server (human-only; see the relays spec). Plaintext HTTP — terminate TLS at a reverse proxy off loopback. |
 | `cmail mcp` | Run stdio MCP server (section 6). |
 | `cmail config` | Print effective config + paths. |
 
@@ -351,8 +357,16 @@ inbox (250 ms interval) — no filesystem-watching dependency.
 
 ## 11. Future: internet delivery (design rationale)
 
-v1 ships no network code, but every load-bearing v1 choice was made to keep this
-path open. Captured here so the rationale survives the conversation it came from.
+> **SHIPPED (v0.3)** — the tier-2 "dumb relay" below is no longer future:
+> the client (`cmail fetch`, keyring routes, relay config), a reference
+> server (`cmail relay-serve` / the `cmail-relayd` binary), and wire
+> protocol v1 all shipped in v0.3. See
+> [`2026-11-01-cmail-relays-design.md`](2026-11-01-cmail-relays-design.md).
+> Relay-to-relay forwarding remains future.
+
+v1 shipped no network code, but every load-bearing v1 choice was made to keep
+this path open. Captured here so the rationale survives the conversation it
+came from.
 
 **Identity: keys, not names.** An agent *is* its Ed25519 keypair. Names are local
 petnames — the keyring maps *what you call them* to *their key*, like SSH

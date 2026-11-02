@@ -121,6 +121,20 @@ pub enum Commands {
         #[arg(long, default_value = "20")]
         tail: usize,
     },
+    /// Run the reference relay server (human-only). Store-and-forward
+    /// pickup point for remote mail; plaintext HTTP — put a TLS reverse
+    /// proxy (nginx, Caddy, …) in front for anything off loopback.
+    RelayServe {
+        /// Relay root directory (mailboxes/ and nonces/ live here); created if absent
+        #[arg(long)]
+        root: PathBuf,
+        /// Address to bind, e.g. 127.0.0.1:8080
+        #[arg(long, default_value = "127.0.0.1:8080")]
+        addr: String,
+        /// Days a parcel is retained before garbage collection
+        #[arg(long, default_value = "7")]
+        retention_days: u64,
+    },
     /// Run the stdio MCP server
     Mcp,
 }
@@ -291,6 +305,11 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Relay { cmd } => commands::admin::relay(cli, map_relay(cmd)),
         Commands::Quarantine { cmd } => commands::admin::quarantine(cli, map_quarantine(cmd)),
         Commands::Audit { tail } => commands::admin::audit(cli, *tail),
+        Commands::RelayServe {
+            root,
+            addr,
+            retention_days,
+        } => cmail_relayd::run_server(root.clone(), addr, *retention_days),
         Commands::Mcp => cmail_mcp::run_server(
             cli.root_path()?,
             cli.as_name.clone(),

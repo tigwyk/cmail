@@ -9,6 +9,8 @@ human which one, or check `cmail whoami`).
 - `cmail read <id>` — read a message (marks it read)
 - `cmail wait` — block ~30s for new mail, then list it
 - `cmail reply <id> --body "..."` — reply (threads automatically)
+- if your human configured a relay, `cmail fetch` pulls new remote mail —
+  trust rules unchanged
 
 ## Sending
 

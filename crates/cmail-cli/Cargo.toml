@@ -11,6 +11,7 @@ path = "src/main.rs"
 [dependencies]
 cmail-core.workspace = true
 cmail-mcp.workspace = true
+cmail-relayd.workspace = true
 clap.workspace = true
 anyhow.workspace = true
 serde.workspace = true

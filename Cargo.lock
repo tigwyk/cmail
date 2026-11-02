@@ -241,13 +241,14 @@ checksum = "1c133bc6a41be0d194c306b5506d15e6feeea7b1d6604bd3f8310dfb2ca96486"
 
 [[package]]
 name = "cmail-cli"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
  "clap",
  "cmail-core",
  "cmail-mcp",
+ "cmail-relayd",
  "predicates",
  "serde",
  "serde_json",
@@ -257,7 +258,7 @@ dependencies = [
 
 [[package]]
 name = "cmail-core"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "base64",
  "chacha20poly1305",
@@ -280,7 +281,7 @@ dependencies = [
 
 [[package]]
 name = "cmail-mcp"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "cmail-core",
@@ -291,7 +292,7 @@ dependencies = [
 
 [[package]]
 name = "cmail-relayd"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",

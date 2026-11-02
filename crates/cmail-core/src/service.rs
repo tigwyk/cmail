@@ -7,7 +7,7 @@ use crate::identity::{
     create_identity, fingerprint_of, identity_exists, load_identity, now_rfc3339,
 };
 use crate::keyring::KeyRing;
-use crate::relay::{build_parcel, deposit, fetch_parcel, list_pending, normalize_base};
+use crate::relay::{build_parcel, deposit, fetch_parcel, normalize_base};
 use crate::store::MailStore;
 use crate::trust::TrustLevel;
 use serde::{Deserialize, Serialize};
@@ -903,7 +903,8 @@ impl Cmail {
         let mut deferred: Option<CoreError> = None;
         let start = std::time::Instant::now();
         loop {
-            let ids = list_pending_or_empty(&base, &fp, &identity.signing)?;
+            // 404-as-empty is `list_pending`'s own typed-status policy (relay.rs)
+            let ids = crate::relay::list_pending(&base, &fp, &identity.signing)?;
             if !ids.is_empty() {
                 for id in ids {
                     let parcel = match fetch_parcel(&base, &fp, &id, &identity.signing) {
@@ -1167,23 +1168,6 @@ impl Cmail {
             }
         }
         Err(CoreError::MessageNotFound(id.to_string()))
-    }
-}
-
-/// `list_pending` for fetch (spec §3.3): a relay only knows a mailbox after
-/// its first deposit, so "unknown mailbox" (404) IS the empty case for an
-/// identity that has never been mailed — never an error. Every other failure
-/// (transport, auth, 5xx) propagates: fetch is explicit and must not paper
-/// over a broken relay with a silent "no mail".
-fn list_pending_or_empty(
-    base: &str,
-    fp: &str,
-    signing: &ed25519_dalek::SigningKey,
-) -> Result<Vec<String>> {
-    match list_pending(base, fp, signing) {
-        Ok(ids) => Ok(ids),
-        Err(CoreError::Relay(msg)) if msg.contains("HTTP 404") => Ok(Vec::new()),
-        Err(e) => Err(e),
     }
 }
 
@@ -2119,12 +2103,11 @@ mod tests {
             SendOutcome::Held { id, .. } => id,
             _ => unreachable!(),
         };
-        // nothing on the relay yet (a never-deposited mailbox cannot even be
-        // listed — auth needs its stored pubkey — so 404 also means "empty")
-        match crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing) {
-            Ok(ids) => assert!(ids.is_empty()),
-            Err(e) => assert!(e.to_string().contains("404"), "{e}"),
-        }
+        // nothing on the relay yet: a never-deposited mailbox cannot even be
+        // listed (auth needs its stored pubkey), and list_pending's typed
+        // 404-as-empty policy makes that exactly Ok(no mail)
+        let ids = crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing).unwrap();
+        assert!(ids.is_empty());
         sender.approve(&id, true).unwrap(); // approve performs the POST
         assert_eq!(
             crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing)

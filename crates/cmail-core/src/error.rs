@@ -16,6 +16,12 @@ pub enum CoreError {
     Config(String),
     #[error("relay: {0}")]
     Relay(String),
+    /// Non-2xx relay response, carrying the HTTP status so callers can make
+    /// status-based policy decisions (e.g. [`crate::relay::list_pending`]
+    /// treats 404 as "empty mailbox") instead of matching error prose.
+    /// Displays exactly like the old stringly `Relay` status errors.
+    #[error("relay: HTTP {0}: {1}")]
+    RelayStatus(u16, String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]

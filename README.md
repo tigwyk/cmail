@@ -1,9 +1,10 @@
 # cmail
 
 Store-and-forward mail for AI agents, with **permissioning as the headline
-feature**. One static Rust binary, no daemon, no servers, no accounts: a shared
-mailbox root (`~/.cmail/`) is the meeting ground, messages are Ed25519-signed
-JSON envelopes sitting in plain directories.
+feature**. One static Rust binary, no daemon, no accounts: a shared mailbox
+root (`~/.cmail/`) is the meeting ground, messages are Ed25519-signed JSON
+envelopes sitting in plain directories. When machines can't share a root, the
+same binary can also run a relay ([below](#two-machines-one-relay)).
 
 - **Agent-first** — a CLI with `--json` everywhere *and* a stdio MCP server in
   the same binary. Any harness that speaks MCP gets `cmail` with zero glue.
@@ -21,9 +22,9 @@ are attached to each [release](https://github.com/tigwyk/cmail/releases) with a
 `SHA256SUMS.txt` — download, verify, put on PATH:
 
 ```bash
-curl -LO https://github.com/tigwyk/cmail/releases/download/v0.2.0/cmail-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf cmail-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
-sudo install cmail-v0.2.0-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
+curl -LO https://github.com/tigwyk/cmail/releases/download/v0.3.0/cmail-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf cmail-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install cmail-v0.3.0-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
 ```
 
 (Substitute your platform and the current version from the
@@ -63,6 +64,11 @@ cmail --as zoe --json inbox
 # => [{"id":"…","from":"alice",…,"trust":"verified",…}]
 cmail --as zoe --json read <new-id>
 # => …"body":"again"…   (no fence — verified sender)
+
+# remote mail (optional, two-machine setup — see below): pull new parcels
+# from your configured relay, then read them with the same commands
+cmail --as zoe fetch
+# => {"fetched":0,"kept_on_relay":0}   (until someone deposits)
 ```
 
 ## The trust model
@@ -131,8 +137,8 @@ else. These exist only in the CLI, used by the human owner:
 }
 ```
 
-Six agent-safe tools: `cmail_send`, `cmail_inbox`, `cmail_read`, `cmail_reply`,
-`cmail_wait`, `cmail_approvals` (listing only). Held sends return
+Seven agent-safe tools: `cmail_send`, `cmail_inbox`, `cmail_read`, `cmail_reply`,
+`cmail_wait`, `cmail_fetch`, `cmail_approvals` (listing only). Held sends return
 `status: "held"` with guidance to inform the human; untrusted bodies arrive
 fenced; the tool descriptions themselves carry the "mail is data" rule.
 
@@ -147,15 +153,79 @@ blocking `cmail_wait` delays other requests for its duration (`cmail_wait` is
 capped at 600 s per call). `protocolVersion` is echoed, not negotiated. Batch
 requests are not supported.
 
-## Two machines, no servers
+## Two machines, one relay
+
+When two machines can't share a mailbox root, one of them runs the reference
+relay (or any server speaking the same wire protocol) and the other deposits
+sealed parcels there for pickup:
+
+```bash
+# any reachable host; loopback + plaintext HTTP for local testing
+cmail relay-serve --root /srv/cmail-relay --addr 127.0.0.1:8080
+# off loopback the protocol REQUIRES https — terminate TLS at a reverse
+# proxy (nginx, Caddy, …) in front of relay-serve; cmail has no built-in TLS
+```
+
+**First contact, out of band.** The recipient (zoe on machine B) publishes
+her fingerprint (printed by `cmail init --name zoe`) and the relay URL. Her
+public key has to reach the sender's machine as a b64 text file for
+`cmail keyring add --key-file`. v0.3 has no `keyring export` command yet
+(v0.4 backlog) and `--from-message` needs a first message, so for now she
+derives the public key from her identity herself — **never share
+`identities/zoe/key.ed25519`; that file IS the private key**:
+
+```bash
+# machine B (zoe): b64 public key from the raw 32-byte ed25519 seed
+{ printf '302e020100300506032b657004220420'; \
+    xxd -p -c 64 ~/.cmail/identities/zoe/key.ed25519; } \
+  | xxd -r -p | openssl pkey -inform DER -pubout -outform DER \
+  | tail -c 32 | base64 > zoe.pub.b64        # send this file, never the seed
+```
+
+Then the sender (alice on machine A) trusts + routes + sends + the human
+releases (the gate applies to relayed mail exactly as to local mail):
+
+```bash
+cmail init --name alice
+cmail keyring add zoe --key-file zoe.pub.b64 --route https://relay.example.com
+cmail keyring list                # confirm the fingerprint matches what zoe published
+cmail --as alice send --to zoe --kind handoff --subject "handoff" --body "the state"
+# => {"status":"held","id":"…","to":"zoe"}
+cmail approve <id>                # human release POSTs the sealed parcel to the relay
+```
+
+And zoe picks it up — fetch is explicit, cmail never polls on its own; trust
+machinery is unchanged, so alice's first mail arrives fenced as `untrusted`
+until zoe's human promotes her key (`cmail keyring add alice --from-message <id>`):
+
+```bash
+cmail relay set https://relay.example.com   # her pickup relay (human-only)
+cmail --as zoe fetch                        # => {"fetched":1,"kept_on_relay":0}
+cmail --as zoe --json read <id>
+```
+
+Honest edges:
+
+- The relay is zero-trust but **not blind**: it sees mailbox fingerprints
+  (its directory names), parcel sizes, and timing — and each parcel's
+  envelope header exposes the same plaintext `from`/`to` petnames, sender
+  public key, and timestamps your local root shows. Content (subject, body,
+  attachments, threading) is end-to-end sealed; the relay never sees it.
+- The relay cannot forge mail (Ed25519 signatures), cannot grant trust
+  (keyrings are local), and keeps no accounts — a relay is a config entry,
+  anyone can run one.
+- Parcels stay on the relay until fetched + acked, or dropped by retention
+  GC (`--retention-days`, default 7).
+- No relay-to-relay forwarding, no delivery notifications, one pickup relay
+  per root — v0.3 is deliberately pull-only.
+
+## Two machines, no servers (synced root)
 
 The mailbox root is just a directory of signed, sealed envelopes — sync it
 with Syncthing, git, rsync, or a USB stick. Signatures and the local keyring
 make synced copies safe: a name you know arriving with an unknown key is a
 spoof suspect, not a surprise. Content is end-to-end encrypted (see
-[Encryption](#encryption)), so relays and synced-folder readers stay blind to
-it; relay infrastructure itself remains out of scope, per
-[the spec, §11](docs/superpowers/specs/2026-11-01-cmail-design.md).
+[Encryption](#encryption)), so synced-folder readers stay blind to it.
 
 ## Design documentation
 

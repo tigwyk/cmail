@@ -198,18 +198,16 @@ fn read_body(resp: ureq::Response) -> Result<String> {
         .map_err(|e| CoreError::Relay(format!("relay response is not UTF-8: {e}")))
 }
 
-/// Error text for a non-2xx response: status plus the body (the relay's
-/// `{"error": "..."}`), truncated to ~200 chars.
+/// Error for a non-2xx response: the typed [`CoreError::RelayStatus`] carrying
+/// status plus the body (the relay's `{"error": "..."}`), truncated to ~200
+/// chars, so callers can make status-based decisions (see [`list_pending`]).
 fn status_error(status: u16, body: &str) -> CoreError {
-    CoreError::Relay(format!(
-        "HTTP {status}: {}",
-        body.chars().take(200).collect::<String>()
-    ))
+    CoreError::RelayStatus(status, body.chars().take(200).collect::<String>())
 }
 
 /// Map a finished ureq call to the response body string: 2xx → body;
-/// non-2xx (ureq surfaces >= 400 as `Error::Status`) → `CoreError::Relay`
-/// carrying the response body text; transport failures → `CoreError::Relay`.
+/// non-2xx (ureq surfaces >= 400 as `Error::Status`) → `CoreError::RelayStatus`
+/// carrying status + response body text; transport failures → `CoreError::Relay`.
 fn map_ureq(result: std::result::Result<ureq::Response, ureq::Error>) -> Result<String> {
     match result {
         Ok(resp) | Err(ureq::Error::Status(_, resp)) => {
@@ -289,10 +287,14 @@ pub fn deposit(base_url: &str, fp: &str, parcel: &Parcel) -> Result<()> {
     Ok(())
 }
 
-/// `GET /mailbox/{fp}` (auth) → pending parcel ids.
+/// `GET /mailbox/{fp}` (auth) → pending parcel ids. Client-side policy: a
+/// relay only knows a mailbox after its first deposit, so HTTP 404 (unknown
+/// mailbox) IS "no pending mail" for an identity that has never been mailed
+/// — returned as an empty list, not an error. Every other status and all
+/// transport failures propagate untouched.
 pub fn list_pending(base_url: &str, fp: &str, signing: &SigningKey) -> Result<Vec<String>> {
     let base = normalize_base(base_url)?;
-    let body = authed(
+    let body = match authed(
         &agent(),
         &base,
         "GET",
@@ -300,7 +302,11 @@ pub fn list_pending(base_url: &str, fp: &str, signing: &SigningKey) -> Result<Ve
         fp,
         signing,
         None,
-    )?;
+    ) {
+        Ok(body) => body,
+        Err(CoreError::RelayStatus(404, _)) => return Ok(Vec::new()),
+        Err(e) => return Err(e),
+    };
     #[derive(Deserialize)]
     struct IdList {
         ids: Vec<String>,
@@ -437,6 +443,23 @@ mod tests {
         key.verifying_key()
             .verify(nonce.as_bytes(), &ed25519_dalek::Signature::from_bytes(&b))
             .unwrap();
+    }
+
+    #[test]
+    fn status_error_is_typed_and_displays_like_relay_prose() {
+        // typed so list_pending can match 404 without prose sniffing…
+        let e = status_error(404, "{\"error\":\"no such mailbox\"}");
+        assert!(matches!(e, CoreError::RelayStatus(404, _)));
+        // …but the display keeps the exact "relay: HTTP <s>: <body>" shape
+        // callers and tests have always matched on
+        assert_eq!(
+            e.to_string(),
+            "relay: HTTP 404: {\"error\":\"no such mailbox\"}"
+        );
+        // long bodies are truncated to ~200 chars
+        let long = "x".repeat(500);
+        let e = status_error(500, &long);
+        assert!(e.to_string().ends_with(&"x".repeat(200)));
     }
 
     #[test]
