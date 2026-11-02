@@ -122,6 +122,27 @@ pub fn wait(cli: &Cli, timeout_secs: u64) -> Result<()> {
     Ok(())
 }
 
+/// Pull pending mail from the configured relay (spec §3.3). Delivered mail
+/// shows up in `inbox` like any other — remote senders still go through the
+/// normal trust rules.
+pub fn fetch(cli: &Cli, wait: bool, timeout_secs: u64) -> Result<()> {
+    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let report = c.fetch(
+        cli.as_name.as_deref(),
+        wait,
+        Duration::from_secs(timeout_secs),
+    )?;
+    if cli.json {
+        output::print_json(&report);
+    } else {
+        println!(
+            "fetched {} ({} kept on relay)",
+            report.fetched, report.kept_on_relay
+        );
+    }
+    Ok(())
+}
+
 pub fn list(cli: &Cli, all: bool) -> Result<()> {
     let c = cmail_core::Cmail::open(&cli.root_path()?)?;
     let items = c.list(cli.as_name.as_deref(), all)?;

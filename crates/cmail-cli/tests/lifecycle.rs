@@ -567,6 +567,31 @@ fn no_identity_errors_cleanly() {
         .stdout(contains("\"error\""));
 }
 
+/// Task R5: `fetch` with no relay configured is a clean guided error under
+/// --json. The happy path needs a live relay, which the CLI harness can't
+/// provide (tests spawn the binary; the in-process relayd fixture lives in
+/// the cmail-core service tests) — the CLI happy path is R6's manual demo.
+#[test]
+fn fetch_without_relay_errors_cleanly() {
+    let root = TempDir::new().unwrap();
+    cmail(&root)
+        .arg("--json")
+        .arg("init")
+        .arg("--name")
+        .arg("zoe")
+        .assert()
+        .success();
+    cmail(&root)
+        .arg("--as")
+        .arg("zoe")
+        .arg("--json")
+        .arg("fetch")
+        .assert()
+        .code(1)
+        .stdout(contains("no relay configured"))
+        .stdout(contains("cmail relay set"));
+}
+
 /// Task R3: keyring routes and the pickup-relay config round-trip through the
 /// CLI — `keyring add --route` / `keyring route` set→list→clear, and
 /// `relay set`→`config` shows the url→`relay clear`, with `key_route` and

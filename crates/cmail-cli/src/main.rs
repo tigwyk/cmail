@@ -73,6 +73,14 @@ pub enum Commands {
         #[arg(long = "timeout", default_value = "30")]
         timeout_secs: u64,
     },
+    /// Pull pending mail from the configured relay
+    Fetch {
+        /// Poll every 5s until mail arrives (up to --timeout)
+        #[arg(long)]
+        wait: bool,
+        #[arg(long = "timeout", default_value = "30")]
+        timeout_secs: u64,
+    },
     /// List inbox (and archive with --all)
     List {
         #[arg(long)]
@@ -273,6 +281,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             commands::mail::reply(cli, id, body.clone(), subject.clone())
         }
         Commands::Wait { timeout_secs } => commands::mail::wait(cli, *timeout_secs),
+        Commands::Fetch { wait, timeout_secs } => commands::mail::fetch(cli, *wait, *timeout_secs),
         Commands::List { all } => commands::mail::list(cli, *all),
         Commands::Allow { cmd } => commands::admin::allow(cli, map_allow(cmd)),
         Commands::Approvals => commands::admin::approvals(cli),

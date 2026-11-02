@@ -51,6 +51,17 @@ pub fn tool_specs() -> Vec<Value> {
             }
         }),
         json!({
+            "name": "cmail_fetch",
+            "description": "Pull pending mail from YOUR configured network relay (contacts the relay). Remote mail goes through normal trust rules.",
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "wait": {"type": "boolean"},
+                    "timeout_seconds": {"type": "integer"}
+                }
+            }
+        }),
+        json!({
             "name": "cmail_approvals",
             "description": "List YOUR outbound mail held for human approval (read-only; you cannot approve your own mail).",
             "inputSchema": {"type": "object", "properties": {}}
@@ -139,6 +150,16 @@ pub fn call(svc: &Cmail, as_name: Option<&str>, params: &Value) -> Value {
                 .and_then(Value::as_u64)
                 .unwrap_or(30);
             svc.wait(as_name, Duration::from_secs(clamp_wait_secs(secs)))
+                .map_err(internal)
+                .and_then(|v| serde_json::to_value(v).map_err(internal))
+        }
+        "cmail_fetch" => {
+            let wait = args.get("wait").and_then(Value::as_bool).unwrap_or(false);
+            let secs = args
+                .get("timeout_seconds")
+                .and_then(Value::as_u64)
+                .unwrap_or(30);
+            svc.fetch(as_name, wait, Duration::from_secs(clamp_wait_secs(secs)))
                 .map_err(internal)
                 .and_then(|v| serde_json::to_value(v).map_err(internal))
         }

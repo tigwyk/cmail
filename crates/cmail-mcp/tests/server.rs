@@ -54,6 +54,7 @@ fn initialize_and_tools_list() {
             "cmail_read",
             "cmail_reply",
             "cmail_wait",
+            "cmail_fetch",
             "cmail_approvals"
         ]
     );
@@ -153,6 +154,33 @@ fn wait_seconds_clamped_to_600() {
     assert_eq!(cmail_mcp::tools::clamp_wait_secs(30), 30);
     assert_eq!(cmail_mcp::tools::clamp_wait_secs(600), 600);
     assert_eq!(cmail_mcp::tools::clamp_wait_secs(u64::MAX), 600);
+}
+
+/// Task R5: `cmail_fetch` surfaces the no-relay misconfiguration as an
+/// isError tool result carrying the `cmail relay set` guidance (the happy
+/// path against a live relay is covered by the cmail-core service tests).
+#[test]
+fn fetch_without_relay_configured_is_guided_error() {
+    let root = setup();
+    let out = drive(
+        root.path(),
+        &[
+            r#"{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2025-06-18","capabilities":{},"clientInfo":{"name":"t","version":"0"}}}"#,
+            r#"{"jsonrpc":"2.0","method":"notifications/initialized"}"#,
+            r#"{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"cmail_fetch","arguments":{}}}"#,
+        ],
+    );
+    let resp = &out[1];
+    assert!(
+        resp.get("error").is_none(),
+        "tool failure must be JSON-RPC success"
+    );
+    assert_eq!(resp["result"]["isError"], true);
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    let parsed: serde_json::Value = serde_json::from_str(text).unwrap();
+    let msg = parsed["error"].as_str().unwrap();
+    assert!(msg.contains("no relay configured"), "got: {msg}");
+    assert!(msg.contains("cmail relay set"), "got: {msg}");
 }
 
 #[test]

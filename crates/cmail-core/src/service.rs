@@ -7,7 +7,7 @@ use crate::identity::{
     create_identity, fingerprint_of, identity_exists, load_identity, now_rfc3339,
 };
 use crate::keyring::KeyRing;
-use crate::relay::{build_parcel, deposit};
+use crate::relay::{build_parcel, deposit, fetch_parcel, list_pending, normalize_base};
 use crate::store::MailStore;
 use crate::trust::TrustLevel;
 use serde::{Deserialize, Serialize};
@@ -67,6 +67,18 @@ pub const UNTRUSTED_CLOSE: &str = "--- END UNTRUSTED MAIL BODY ---";
 pub fn wrap_untrusted(body: &str) -> String {
     format!("{UNTRUSTED_OPEN}\n{body}\n{UNTRUSTED_CLOSE}")
 }
+
+/// One `cmail fetch` run (spec §3.3): how many parcels were verified and
+/// delivered locally, and how many were left on the relay (bad parcels are
+/// skipped and NOT acked, so they stay pending for retry/manual inspection).
+#[derive(Debug, Default, Serialize, Deserialize, PartialEq)]
+pub struct FetchReport {
+    pub fetched: usize,
+    pub kept_on_relay: usize,
+}
+
+/// `--wait` poll cadence for `fetch` (spec §3.3: re-list every 5s).
+const FETCH_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Where `keyring_add` obtains a public key from.
 #[derive(Debug, Clone)]
@@ -848,6 +860,136 @@ impl Cmail {
         }
     }
 
+    /// Spec §3.3: pull pending parcels from MY configured relay. Explicit
+    /// (never automatic), authenticated with my identity key, delivered BY
+    /// KEY — names inside the envelopes are the senders' petnames and are
+    /// displayed as-is; decryption success is the proof of addressing. Each
+    /// parcel must parse and self-verify before anything is written; bad
+    /// parcels are skipped, audited `corrupt` and left on the relay (NOT
+    /// acked). Good parcels land in my inbox — frames written BEFORE the ack,
+    /// so a crash between the two re-delivers idempotently instead of losing
+    /// mail — and flow through the normal trust machinery on the next scan.
+    /// One `fetch` audit record per run ("n fetched, m kept"). A mid-run
+    /// per-parcel failure (fetch/write/ack) is deferred: the audit record is
+    /// still written with the honest partial counts, then the error
+    /// propagates. `wait=true` polls the relay list every 5s until a listing
+    /// is non-empty or the timeout elapses.
+    pub fn fetch(
+        &self,
+        as_name: Option<&str>,
+        wait: bool,
+        timeout: std::time::Duration,
+    ) -> Result<FetchReport> {
+        let me = self.resolve_identity(as_name)?;
+        let identity = load_identity(&self.root, &me)?;
+        // Load fresh from disk: relay set/clear may have happened after this
+        // handle was opened (long-lived MCP process), mirroring relay_set.
+        let raw_url = Config::load_or_init(&self.root)?
+            .relay_url()
+            .ok_or_else(|| {
+                CoreError::Config("no relay configured; run: cmail relay set <url>".into())
+            })?;
+        let base = normalize_base(&raw_url)?;
+        let fp = identity.fingerprint();
+        let mut report = FetchReport::default();
+        // corrupt audits are deduped per relay id: wait-mode re-listings keep
+        // serving a bad parcel, and one run must not spam the log per poll
+        let mut audited_corrupt = std::collections::HashSet::new();
+        // A per-parcel failure AFTER progress (write or ack) is deferred: the
+        // run's audit record is still written with the honest partial counts
+        // (mail already delivered IS local), then the error surfaces.
+        // Fetching stops — the network is likely gone and every later request
+        // would fail the same way.
+        let mut deferred: Option<CoreError> = None;
+        let start = std::time::Instant::now();
+        loop {
+            let ids = list_pending_or_empty(&base, &fp, &identity.signing)?;
+            if !ids.is_empty() {
+                for id in ids {
+                    let parcel = match fetch_parcel(&base, &fp, &id, &identity.signing) {
+                        Ok(p) => p,
+                        Err(e) => {
+                            deferred = Some(e);
+                            break;
+                        }
+                    };
+                    let Some(env) = verified_envelope(&parcel) else {
+                        report.kept_on_relay += 1;
+                        if audited_corrupt.insert(id.clone()) {
+                            self.audit_corrupt(&id, "remote parcel failed verification")?;
+                        }
+                        continue;
+                    };
+                    if let Err(e) = self.deliver_remote(&me, &env, &parcel.attachments) {
+                        deferred = Some(e);
+                        break;
+                    }
+                    report.fetched += 1;
+                    if let Err(e) = crate::relay::ack(&base, &fp, &id, &identity.signing) {
+                        deferred = Some(e);
+                        break;
+                    }
+                }
+                break;
+            }
+            if !wait || start.elapsed() >= timeout {
+                break;
+            }
+            std::thread::sleep(FETCH_POLL_INTERVAL);
+        }
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::Fetch, &me).detail(&format!(
+                "{} fetched, {} kept",
+                report.fetched, report.kept_on_relay
+            )),
+        )?;
+        match deferred {
+            Some(e) => Err(e),
+            None => Ok(report),
+        }
+    }
+
+    /// Write one verified remote parcel into my local mail tree (spec §3.3):
+    /// frames FIRST under `attachments/<id>/att-<i>.bin`, envelope LAST into
+    /// my inbox — the message only becomes visible to a scan once everything
+    /// it references is on disk. Any failure rolls the frames back, and the
+    /// envelope having not been written yet means no half-delivered mail.
+    fn deliver_remote(
+        &self,
+        me: &str,
+        env: &Envelope,
+        attachments: &[crate::relay::ParcelAttachment],
+    ) -> Result<()> {
+        self.store.ensure_mailbox(me)?;
+        let dir = self.store.attachments_dir(&env.id);
+        if !attachments.is_empty() {
+            std::fs::create_dir_all(&dir)?;
+            let frames = (|| -> Result<()> {
+                for att in attachments {
+                    use base64::engine::general_purpose::STANDARD as B64;
+                    use base64::Engine;
+                    let raw = B64
+                        .decode(&att.data)
+                        .map_err(|_| CoreError::InvalidEnvelope {
+                            reason: format!("parcel attachment {} is not valid base64", att.i),
+                        })?;
+                    std::fs::write(dir.join(format!("att-{}.bin", att.i)), raw)?;
+                }
+                Ok(())
+            })();
+            if let Err(e) = frames {
+                let _ = std::fs::remove_dir_all(&dir);
+                return Err(e);
+            }
+        }
+        if let Err(e) = self.store.write_envelope(&self.store.inbox_dir(me), env) {
+            let _ = std::fs::remove_dir_all(&dir);
+            return Err(e);
+        }
+        Ok(())
+    }
+
     pub fn quarantine_list(&self, owner: Option<&str>) -> Result<Vec<InboxItem>> {
         let me = self.resolve_identity(owner)?;
         let mut out = Vec::new();
@@ -1026,6 +1168,33 @@ impl Cmail {
         }
         Err(CoreError::MessageNotFound(id.to_string()))
     }
+}
+
+/// `list_pending` for fetch (spec §3.3): a relay only knows a mailbox after
+/// its first deposit, so "unknown mailbox" (404) IS the empty case for an
+/// identity that has never been mailed — never an error. Every other failure
+/// (transport, auth, 5xx) propagates: fetch is explicit and must not paper
+/// over a broken relay with a silent "no mail".
+fn list_pending_or_empty(
+    base: &str,
+    fp: &str,
+    signing: &ed25519_dalek::SigningKey,
+) -> Result<Vec<String>> {
+    match list_pending(base, fp, signing) {
+        Ok(ids) => Ok(ids),
+        Err(CoreError::Relay(msg)) if msg.contains("HTTP 404") => Ok(Vec::new()),
+        Err(e) => Err(e),
+    }
+}
+
+/// Parcel verification for fetch (spec §3.3 step 1): the envelope must parse
+/// (full envelope validation — `fetch_parcel`'s serde pass alone skips it)
+/// AND carry a valid self-signature against its own `from_key` before
+/// anything is written locally or acked. Anything else is a bad parcel.
+fn verified_envelope(parcel: &crate::relay::Parcel) -> Option<Envelope> {
+    let raw = serde_json::to_string(&parcel.envelope).ok()?;
+    let env = Envelope::parse(&raw).ok()?;
+    env.verify_self_signature().then_some(env)
 }
 
 fn fs_ensure_root(root: &Path) -> Result<()> {
@@ -2018,5 +2187,264 @@ mod tests {
                 .unwrap_or(0),
             0
         );
+    }
+
+    // --- Task R5 tests: fetch — verified remote delivery (spec §3.3) ---
+
+    /// The full cross-machine picture on ONE shared relay: alice's machine
+    /// (sender root), zoe's machine (her own root, keyring, config), and the
+    /// relay root kept alive so tests can reach the stored `.parcel` files
+    /// (tamper case). Same rules as `relay_fix`: the in-process server is the
+    /// only sanctioned relay fixture and all handles outlive the test body.
+    struct FetchFix {
+        sender_root: tempfile::TempDir,
+        sender: Cmail,
+        // drop guard: zoe's root must outlive `recipient` (pure liveness, never read)
+        _recv_root: tempfile::TempDir,
+        recipient: Cmail,
+        zoe: crate::identity::Identity,
+        relay_root: tempfile::TempDir,
+        _server: cmail_relayd::RelayServer,
+        base: String,
+    }
+
+    fn fetch_fix() -> FetchFix {
+        let sender_root = tempfile::tempdir().unwrap();
+        let recv_root = tempfile::tempdir().unwrap();
+        let relay_root = tempfile::tempdir().unwrap();
+        let server =
+            cmail_relayd::RelayServer::start("127.0.0.1:0", relay_root.path().to_path_buf(), 7)
+                .unwrap();
+        let base = server.base_url();
+        let sender = Cmail::open(sender_root.path()).unwrap();
+        sender.init("alice").unwrap();
+        let zoe = crate::identity::create_identity(recv_root.path(), "zoe").unwrap();
+        let recipient = Cmail::open(recv_root.path()).unwrap();
+        // out-of-band key exchange + route on the sender's side (through the
+        // gate); the pickup relay configured on zoe's side
+        sender
+            .keyring_add("zoe", KeySource::KeyFile(keyfile_of(&zoe)))
+            .unwrap();
+        sender.keyring_route("zoe", Some(&base)).unwrap();
+        sender.allow_add("zoe").unwrap();
+        recipient.relay_set(Some(&base)).unwrap();
+        FetchFix {
+            sender_root,
+            sender,
+            _recv_root: recv_root,
+            recipient,
+            zoe,
+            relay_root,
+            _server: server,
+            base,
+        }
+    }
+
+    /// One remote alice→zoe send through the fixture's relay; returns the
+    /// message id.
+    fn remote_send(fix: &FetchFix, body: &str, attachment: bool) -> String {
+        let attachments = if attachment {
+            let p = fix.sender_root.path().join("note.txt");
+            std::fs::write(&p, "machine state").unwrap();
+            vec![p]
+        } else {
+            Vec::new()
+        };
+        match fix
+            .sender
+            .send(
+                Some("alice"),
+                "zoe",
+                "handoff",
+                "remote",
+                body,
+                &attachments,
+                None,
+            )
+            .unwrap()
+        {
+            SendOutcome::Sent { id } => id,
+            other => panic!("fixture send must deposit (allowlisted route): {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fetch_delivers_remote_mail_through_local_trust_machinery() {
+        let fix = fetch_fix();
+        let id = remote_send(&fix, "hello machine", true);
+        let report = fix
+            .recipient
+            .fetch(Some("zoe"), false, std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            report,
+            FetchReport {
+                fetched: 1,
+                kept_on_relay: 0
+            }
+        );
+        // the envelope landed in zoe's inbox, the frame under attachments/<id>/
+        assert!(fix
+            .recipient
+            .store
+            .inbox_dir("zoe")
+            .join(format!("{id}.mail"))
+            .exists());
+        let plain = fix
+            .recipient
+            .store
+            .open_attachment(&x25519_secret(&fix.zoe.signing), &id, 0)
+            .unwrap();
+        assert_eq!(plain, b"machine state");
+        // the relay mailbox is empty after the ack
+        assert!(
+            crate::relay::list_pending(&fix.base, &fix.zoe.fingerprint(), &fix.zoe.signing)
+                .unwrap()
+                .is_empty()
+        );
+        // one fetch audit record for the run, detail "n fetched, m kept"
+        let recs = fix.recipient.audit_tail(5).unwrap();
+        let fetches: Vec<_> = recs
+            .iter()
+            .filter(|r| r.event == AuditEvent::Fetch)
+            .collect();
+        assert_eq!(fetches.len(), 1, "{recs:?}");
+        assert_eq!(fetches[0].actor, "zoe");
+        assert_eq!(fetches[0].detail.as_deref(), Some("1 fetched, 0 kept"));
+        // normal trust machinery applies on the next scan: the remote alice is
+        // unknown on zoe's machine -> untrusted, but listed (permissive mode)
+        let inbox = fix.recipient.inbox(Some("zoe")).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].id, id);
+        assert_eq!(inbox[0].trust, "untrusted");
+        // sealed to zoe's key: read decrypts, and the body is fenced
+        let msg = fix.recipient.read_message(Some("zoe"), &id).unwrap();
+        assert_eq!(msg.trust, "untrusted");
+        assert_eq!(msg.body, wrap_untrusted("hello machine"));
+        assert_eq!(msg.attachments, vec!["note.txt".to_string()]);
+    }
+
+    #[test]
+    fn fetch_keeps_bad_parcels_on_relay_and_audits_corrupt() {
+        let fix = fetch_fix();
+        let _id = remote_send(&fix, "hello machine", false);
+        // hand-tamper the stored parcel in the relay root: backdate the
+        // envelope's `created` year (compact JSON, leading digit swap) — the
+        // parcel stays shape-valid but the self-signature no longer matches
+        let mbox = fix
+            .relay_root
+            .path()
+            .join("mailboxes")
+            .join(fix.zoe.fingerprint());
+        let parcel_path = std::fs::read_dir(&mbox)
+            .unwrap()
+            .flatten()
+            .find(|e| e.path().extension().and_then(|x| x.to_str()) == Some("parcel"))
+            .expect("one stored parcel")
+            .path();
+        let raw = std::fs::read_to_string(&parcel_path).unwrap();
+        let tampered = raw.replace("\"created\":\"2", "\"created\":\"1");
+        assert_ne!(raw, tampered, "created tamper pattern not found in parcel");
+        std::fs::write(&parcel_path, &tampered).unwrap();
+        let relay_id = parcel_path
+            .file_stem()
+            .unwrap()
+            .to_str()
+            .unwrap()
+            .to_string();
+
+        let report = fix
+            .recipient
+            .fetch(Some("zoe"), false, std::time::Duration::from_secs(10))
+            .unwrap();
+        assert_eq!(
+            report,
+            FetchReport {
+                fetched: 0,
+                kept_on_relay: 1
+            }
+        );
+        // NOT acked: the tampered parcel is still listed on the relay
+        assert_eq!(
+            crate::relay::list_pending(&fix.base, &fix.zoe.fingerprint(), &fix.zoe.signing)
+                .unwrap(),
+            vec![relay_id.clone()]
+        );
+        // audited corrupt, exactly once, with the pinned detail
+        let recs = fix.recipient.audit_tail(5).unwrap();
+        let corrupts: Vec<_> = recs
+            .iter()
+            .filter(|r| r.event == AuditEvent::Corrupt && r.msg_id.as_deref() == Some(&relay_id))
+            .collect();
+        assert_eq!(corrupts.len(), 1, "{recs:?}");
+        assert_eq!(
+            corrupts[0].detail.as_deref(),
+            Some("remote parcel failed verification")
+        );
+        // and nothing landed locally
+        assert!(fix
+            .recipient
+            .store
+            .list_ids(&fix.recipient.store.inbox_dir("zoe"))
+            .is_empty());
+        assert!(fix.recipient.inbox(Some("zoe")).unwrap().is_empty());
+    }
+
+    #[test]
+    fn fetch_without_relay_configured_is_clean_error() {
+        let (_root, c) = svc();
+        let err = c
+            .fetch(Some("zoe"), false, std::time::Duration::from_secs(1))
+            .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "no relay configured; run: cmail relay set <url>"
+        );
+    }
+
+    #[test]
+    fn fetch_report_serde_shape() {
+        let v = serde_json::to_value(FetchReport {
+            fetched: 2,
+            kept_on_relay: 1,
+        })
+        .unwrap();
+        assert_eq!(v["fetched"], 2);
+        assert_eq!(v["kept_on_relay"], 1);
+        assert_eq!(v.as_object().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn fetch_wait_polls_until_mail_lands() {
+        let fix = std::sync::Arc::new(fetch_fix());
+        // wait-mode fetch polls the relay list every 5s against a mailbox that
+        // does not exist yet (404 = empty); deposit one second in so the next
+        // poll observes it — fetch must return once the mail is in, not run
+        // out the 30s timeout
+        let sender_fix = std::sync::Arc::clone(&fix);
+        std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_secs(1));
+            remote_send(&sender_fix, "delayed hello", false);
+        });
+        let start = std::time::Instant::now();
+        let report = fix
+            .recipient
+            .fetch(Some("zoe"), true, std::time::Duration::from_secs(30))
+            .unwrap();
+        assert_eq!(
+            report,
+            FetchReport {
+                fetched: 1,
+                kept_on_relay: 0
+            }
+        );
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(15),
+            "wait-mode fetch must return once mail lands (took {:?})",
+            start.elapsed()
+        );
+        let inbox = fix.recipient.inbox(Some("zoe")).unwrap();
+        assert_eq!(inbox.len(), 1);
+        assert_eq!(inbox[0].trust, "untrusted");
     }
 }
