@@ -233,8 +233,9 @@ impl MailStore {
             let bytes = fs::read(p)?;
             let sealed = session.seal(&att_label(i), &bytes)?;
             let raw = sealed_to_raw(&sealed)?;
-            // Framing adds 72B (epk + nonce) to pt + 16B tag, so the plaintext
-            // caps keep this bound structurally; enforce it anyway — cheap.
+            // Frame = epk[32] || nonce[24] || ct[pt + 16], so a sealed file is
+            // plaintext + 72B overhead; the plaintext caps keep this bound
+            // structurally — enforce it anyway, it's cheap.
             if raw.len() as u64 > MAX_ATTACHMENT_BYTES + 1024 {
                 return Err(CoreError::LimitExceeded(format!(
                     "sealed {} exceeds {} bytes",
@@ -338,15 +339,20 @@ fn safe_filename(p: &Path) -> String {
     }
 }
 
-/// `att-<i>.bin` framing: raw `epk(32) || nonce(24) || ct`, i.e. plaintext +
-/// 88B overhead. Binary rather than the base64 JSON `SealedBox` form so the
-/// ciphertext-file cap (`MAX_ATTACHMENT_BYTES + 1024`) follows from the
-/// plaintext caps.
+/// `att-<i>.bin` framing: raw `epk[32] || nonce[24] || ct[pt + 16]`, i.e.
+/// plaintext + 72B overhead. Binary rather than the base64 JSON `SealedBox`
+/// form so the ciphertext-file cap (`MAX_ATTACHMENT_BYTES + 1024`) follows
+/// from the plaintext caps.
 fn sealed_to_raw(sb: &crypto::SealedBox) -> Result<Vec<u8>> {
     let fail = || CoreError::DecryptFailed("malformed sealed attachment".into());
     let epk = B64.decode(&sb.epk).map_err(|_| fail())?;
     let nonce = B64.decode(&sb.nonce).map_err(|_| fail())?;
     let ct = B64.decode(&sb.ct).map_err(|_| fail())?;
+    // Frame invariant: epk/nonce are fixed-width fields; anything else is a
+    // malformed box, fail closed rather than write a bogus frame.
+    if epk.len() != 32 || nonce.len() != 24 {
+        return Err(fail());
+    }
     let mut raw = Vec::with_capacity(epk.len() + nonce.len() + ct.len());
     raw.extend_from_slice(&epk);
     raw.extend_from_slice(&nonce);
@@ -355,8 +361,12 @@ fn sealed_to_raw(sb: &crypto::SealedBox) -> Result<Vec<u8>> {
 }
 
 fn sealed_from_raw(raw: &[u8]) -> Result<crypto::SealedBox> {
-    const HEADER: usize = 32 + 24; // epk || nonce ahead of the ciphertext
-    if raw.len() < HEADER {
+    // Minimum frame: epk[32] || nonce[24] || ct[16] — anything shorter can't
+    // hold a full AEAD tag, so reject up front (truncated files must fail
+    // DecryptFailed here, regardless of downstream handling).
+    const HEADER: usize = 32 + 24;
+    const MIN_FRAME: usize = HEADER + 16; // + ct == tag (empty plaintext)
+    if raw.len() < MIN_FRAME {
         return Err(CoreError::DecryptFailed(
             "truncated sealed attachment".into(),
         ));
@@ -544,6 +554,25 @@ mod tests {
         assert!(store
             .open_attachment(&crate::crypto::x25519_secret(&other), "att1", 0)
             .is_err());
+    }
+
+    #[test]
+    fn open_attachment_rejects_sub_tag_length_frame() {
+        let root = TempDir::new().unwrap();
+        let store = MailStore::new(root.path());
+        let recipient = SigningKey::generate(&mut OsRng);
+        // 60 bytes = 56..71 zone: header fits but the ct is shorter than the
+        // 16-byte AEAD tag — must fail DecryptFailed, not panic downstream
+        let dir = store.attachments_dir("att1");
+        fs::create_dir_all(&dir).unwrap();
+        fs::write(dir.join("att-0.bin"), vec![0u8; 60]).unwrap();
+        let err = store
+            .open_attachment(&crate::crypto::x25519_secret(&recipient), "att1", 0)
+            .unwrap_err();
+        assert!(
+            matches!(err, crate::error::CoreError::DecryptFailed(_)),
+            "expected DecryptFailed, got {err:?}"
+        );
     }
 
     #[test]
