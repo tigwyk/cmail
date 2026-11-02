@@ -20,11 +20,14 @@ future work (v0.4+) — sender POSTs directly to the recipient's known relay.
 
 ### What the relay sees (honest edges, README'd)
 
-Fingerprints, ciphertext, sizes, and deposit/fetch timing. Never names, content,
-or subjects (sealing, v0.2.0, guarantees this). A malicious relay can delay,
-drop, or refuse — never forge (Ed25519), never read (X25519+AEAD), never alter
-trust (keyrings are local). No metadata-anonymity is claimed: fetch and deposit
-timing is visible to the relay operator.
+Fingerprints, ciphertext, sizes, and deposit/fetch timing — AND, because sealed
+envelopes keep their header in the clear (v1.1's by-design choice so trust
+works without decrypting), every parcel's plaintext `from`/`to` petnames,
+sender `from_key`, and `created` timestamp. What sealing (v0.2.0) protects:
+subject, kind, body, attachments, threading — content, never. A malicious
+relay can delay, drop, or refuse — never forge (Ed25519), never read content
+(X25519+AEAD), never alter trust (keyrings are local). No metadata-anonymity
+is claimed: fetch and deposit timing is visible to the relay operator.
 
 ## 2. Wire protocol (v1)
 
