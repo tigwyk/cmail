@@ -21,9 +21,9 @@ are attached to each [release](https://github.com/tigwyk/cmail/releases) with a
 `SHA256SUMS.txt` — download, verify, put on PATH:
 
 ```bash
-curl -LO https://github.com/tigwyk/cmail/releases/download/v0.1.0/cmail-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf cmail-v0.1.0-x86_64-unknown-linux-gnu.tar.gz
-sudo install cmail-v0.1.0-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
+curl -LO https://github.com/tigwyk/cmail/releases/download/v0.2.0/cmail-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf cmail-v0.2.0-x86_64-unknown-linux-gnu.tar.gz
+sudo install cmail-v0.2.0-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
 ```
 
 (Substitute your platform and the current version from the
@@ -79,6 +79,32 @@ never stored in (or forgeable via) the message.
 | `spoof_suspect` | Claims a known name but a *different* key signed it | Never reaches the inbox — quarantined, audited |
 | `invalid` | Signature fails against its own inline key | Quarantined, audited |
 
+Trust never requires decrypting — it is computed from the signed header, so it
+works identically on sealed mail (next section).
+
+## Encryption
+
+Every send seals its content end-to-end to the recipient — transparently, with
+no new commands, flags, or key ceremonies. The recipient's existing identity
+key does double duty (Ed25519 for signatures, converted to X25519 for the key
+exchange), so there is nothing extra to generate, exchange, or manage — and no
+opt-out: new mail is always sealed.
+
+- **Sealed** (ciphertext at rest and on the wire): subject, kind, body,
+  attachments, and threading (`in_reply_to`).
+- **Still visible by design**: who mailed whom (`from`/`to`), timestamps, and
+  message/attachment sizes — the header the trust model above runs on.
+
+Honest edges:
+
+- **No forward secrecy** — there is no ratchet. A stolen identity key decrypts
+  everything sealed to that identity.
+- **No metadata privacy** — anyone holding the mailbox root can see who mailed
+  whom, when, and how large.
+- Listings and approvals show `"<sealed>"` / `"sealed"` placeholders for
+  subject and kind; the real values appear only on `read`.
+- v1 (unsealed) mail remains readable forever.
+
 ## Human-only powers
 
 Agents can send, read, reply, wait, and list their own held mail — nothing
@@ -123,17 +149,21 @@ requests are not supported.
 
 ## Two machines, no servers
 
-The mailbox root is just a directory of signed envelopes — sync it with
-Syncthing, git, rsync, or a USB stick. Signatures and the local keyring make
-synced copies safe: a name you know arriving with an unknown key is a spoof
-suspect, not a surprise. Relays/encryption-at-rest are deliberately out of
-scope for v1; the design path is written down in
+The mailbox root is just a directory of signed, sealed envelopes — sync it
+with Syncthing, git, rsync, or a USB stick. Signatures and the local keyring
+make synced copies safe: a name you know arriving with an unknown key is a
+spoof suspect, not a surprise. Content is end-to-end encrypted (see
+[Encryption](#encryption)), so relays and synced-folder readers stay blind to
+it; relay infrastructure itself remains out of scope, per
 [the spec, §11](docs/superpowers/specs/2026-11-01-cmail-design.md).
 
 ## Design documentation
 
 Spec (envelope format, trust/permissioning model, CLI reference, audit events):
 [`docs/superpowers/specs/2026-11-01-cmail-design.md`](docs/superpowers/specs/2026-11-01-cmail-design.md)
+
+Sealed envelopes (v1.1 end-to-end encryption):
+[`docs/superpowers/specs/2026-11-01-cmail-sealed-envelopes-design.md`](docs/superpowers/specs/2026-11-01-cmail-sealed-envelopes-design.md)
 
 Agent-facing cheat sheet: [`AGENTS.md`](AGENTS.md)
 
