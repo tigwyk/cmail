@@ -1,6 +1,11 @@
 [workspace]
 resolver = "2"
-members = ["crates/cmail-core", "crates/cmail-cli", "crates/cmail-mcp"]
+members = [
+    "crates/cmail-core",
+    "crates/cmail-cli",
+    "crates/cmail-mcp",
+    "crates/cmail-relayd",
+]
 
 [workspace.package]
 version = "0.2.0"
@@ -29,3 +34,4 @@ anyhow = "1"
 tempfile = "3"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
 url = "2"
+tiny_http = "0.12"
