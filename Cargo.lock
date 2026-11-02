@@ -330,6 +330,7 @@ version = "0.3.0"
 dependencies = [
  "anyhow",
  "base64",
+ "cmail-core",
  "ed25519-dalek",
  "hex",
  "serde",
