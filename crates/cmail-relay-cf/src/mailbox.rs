@@ -31,8 +31,8 @@
 //! file-lock commits.
 
 use crate::calc::{
-    cap_status, is_expired, nonce_slot_available, DEFAULT_RETENTION_DAYS, MAX_MAILBOX_ENTRIES,
-    NONCE_TTL_SECS,
+    cap_status, is_expired, nonce_slot_available, prune_decision, PruneDecision,
+    DEFAULT_RETENTION_DAYS, MAX_MAILBOX_ENTRIES, NONCE_TTL_SECS,
 };
 use crate::{bad_request, json_response, not_found};
 use base64::engine::general_purpose::STANDARD as B64;
@@ -60,6 +60,9 @@ const MARKER_TTL_SECS: i64 = 7 * 86400;
 /// round per Worker request, per the internal contract).
 const SWEEP_CLAIM_LIMIT: i64 = 64;
 const DAY_SECS: i64 = 86400;
+/// When only unexpired nonces defer the prune, re-attempt after this long
+/// (max nonce TTL is 5 minutes, so a retry well past that reaps them all).
+const PRUNE_RETRY_SECS: i64 = 60;
 
 /// Ed25519-verify `sig_b64` over the nonce's ASCII bytes with the b64 pubkey —
 /// byte-for-byte relayd's `verify_challenge_sig` (a failed verify never
@@ -255,8 +258,12 @@ impl DurableObject for Mailbox {
             if !is_expired(row.received_unix, retention_days, now) {
                 continue;
             }
+            // OR REPLACE, not OR IGNORE: re-writing a surviving marker must
+            // refresh marked_unix so the marker TTL restarts from THIS
+            // expiry (a stale timestamp could otherwise drop a marker for a
+            // blob whose deletion the Worker still owes).
             self.query(
-                "INSERT OR IGNORE INTO cmail_orphans(id, marked_unix) VALUES(?, ?)",
+                "INSERT OR REPLACE INTO cmail_orphans(id, marked_unix) VALUES(?, ?)",
                 vec![row.id.clone().into(), now.into()],
             )?;
             self.query(
@@ -382,16 +389,38 @@ impl Mailbox {
     /// relayd prune rule: only a mailbox the retention sweep emptied is
     /// deleted outright (meta included); one emptied by acks keeps its meta.
     /// Runs once every marker is claimed, so the last thing to go is the
-    /// record of blobs that still needed deleting.
+    /// record of blobs that still needed deleting. Expired nonces are swept
+    /// BEFORE counting (they never defer the prune); if only UNEXPIRED
+    /// nonces remain, a short retry alarm replaces the final one so the
+    /// prune is deferred until they lapse — never permanently blocked.
     async fn prune_if_sweep_emptied(&self) -> Result<()> {
-        if self.count("cmail_entries")? == 0
-            && self.count("cmail_orphans")? == 0
-            && self.count("cmail_nonces")? == 0
-            && self.meta_get("swept_empty")?.as_deref() == Some("1")
-        {
-            let storage = self.state.storage();
-            storage.delete_all().await?;
-            storage.delete_alarm().await?;
+        let now = now_unix();
+        self.query(
+            "DELETE FROM cmail_nonces WHERE expires_unix <= ?",
+            vec![now.into()],
+        )?;
+        let decision = prune_decision(
+            self.count("cmail_entries")?,
+            self.count("cmail_orphans")?,
+            self.count("cmail_nonces")?,
+            self.meta_get("swept_empty")?.as_deref() == Some("1"),
+        );
+        let storage = self.state.storage();
+        match decision {
+            PruneDecision::Prune => {
+                storage.delete_all().await?;
+                storage.delete_alarm().await?;
+            }
+            PruneDecision::RetryNonces => {
+                // Shortest-wins, like the deposit path: never push out an
+                // earlier alarm, only pull the retry in.
+                let retry_ms = now.saturating_add(PRUNE_RETRY_SECS).saturating_mul(1000);
+                match storage.get_alarm().await? {
+                    Some(existing) if existing <= retry_ms => {}
+                    _ => storage.set_alarm(retry_ms).await?,
+                }
+            }
+            PruneDecision::Leave => {}
         }
         Ok(())
     }
@@ -454,8 +483,18 @@ impl Mailbox {
         self.meta_put("swept_empty", "0")?;
         self.query(
             "INSERT INTO cmail_entries(id, size, received_unix) VALUES(?, ?, ?)",
-            vec![b.id.into(), (b.size as i64).into(), b.received_unix.into()],
+            vec![
+                b.id.clone().into(),
+                (b.size as i64).into(),
+                b.received_unix.into(),
+            ],
         )?;
+        // Ids are content-addressed: a re-sent parcel reuses its id, so a
+        // marker left by a PREVIOUS expiry of this id would send the
+        // Worker's sweep after the NEW blob (deleting it under a live index
+        // row). The new deposit invalidates any such marker — clear it in
+        // the same serialized accept path.
+        self.query("DELETE FROM cmail_orphans WHERE id = ?", vec![b.id.into()])?;
 
         // Shortest wait wins (spec §4): only pull the alarm in.
         let retention_secs = (b.retention_days as i64).saturating_mul(DAY_SECS);

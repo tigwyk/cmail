@@ -42,6 +42,42 @@ pub fn nonce_slot_available(outstanding: usize) -> bool {
     outstanding < MAX_OUTSTANDING_NONCES
 }
 
+/// What the deferred prune should do with a mailbox's post-sweep state.
+/// `unexpired_nonces` counts only nonces still live — the caller sweeps
+/// expired rows BEFORE counting, so an expired-but-unswept nonce can never
+/// defer (let alone permanently block) the prune.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PruneDecision {
+    /// Sweep-emptied and fully reaped (no entries, no markers, no live
+    /// nonces): delete the mailbox outright, meta included.
+    Prune,
+    /// Unexpired nonces are the only thing left: don't prune yet — retry
+    /// shortly after the last one lapses (the DO sets a short alarm).
+    RetryNonces,
+    /// A live entry or marker remains, or the sweep never emptied this
+    /// mailbox (ack-emptied ones keep their meta): leave it alone.
+    Leave,
+}
+
+/// relayd prune rule as a pure decision: only a mailbox the retention
+/// sweep emptied is pruned; outstanding (unexpired) challenge nonces defer
+/// the prune briefly instead of blocking it forever.
+pub fn prune_decision(
+    entries: i64,
+    orphans: i64,
+    unexpired_nonces: i64,
+    swept_empty: bool,
+) -> PruneDecision {
+    if entries > 0 || orphans > 0 || !swept_empty {
+        return PruneDecision::Leave;
+    }
+    if unexpired_nonces == 0 {
+        PruneDecision::Prune
+    } else {
+        PruneDecision::RetryNonces
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -117,5 +153,39 @@ mod tests {
         assert!(nonce_slot_available(MAX_OUTSTANDING_NONCES - 1));
         assert!(!nonce_slot_available(MAX_OUTSTANDING_NONCES));
         assert!(!nonce_slot_available(MAX_OUTSTANDING_NONCES + 5));
+    }
+
+    #[test]
+    fn prune_decision_prunes_fully_reaped_sweep_emptied() {
+        assert_eq!(prune_decision(0, 0, 0, true), PruneDecision::Prune);
+    }
+
+    #[test]
+    fn prune_decision_retries_when_only_unexpired_nonces_remain() {
+        // An unexpired nonce defers the prune (retry), never blocks it —
+        // one nonce or a full outstanding set makes no difference.
+        assert_eq!(prune_decision(0, 0, 1, true), PruneDecision::RetryNonces);
+        assert_eq!(
+            prune_decision(0, 0, MAX_OUTSTANDING_NONCES as i64, true),
+            PruneDecision::RetryNonces
+        );
+    }
+
+    #[test]
+    fn prune_decision_leaves_live_mailboxes_alone() {
+        // Any entry or orphan marker blocks the prune outright (no retry).
+        assert_eq!(prune_decision(1, 0, 0, true), PruneDecision::Leave);
+        assert_eq!(prune_decision(0, 1, 0, true), PruneDecision::Leave);
+        // Even with unexpired nonces around — they are not the blocker.
+        assert_eq!(prune_decision(1, 0, 3, true), PruneDecision::Leave);
+        assert_eq!(prune_decision(0, 2, 3, true), PruneDecision::Leave);
+    }
+
+    #[test]
+    fn prune_decision_leaves_ack_emptied_mailboxes_alone() {
+        // relayd prunes only what the SWEEP emptied; a mailbox emptied by
+        // acks (swept_empty unset) keeps its meta no matter what.
+        assert_eq!(prune_decision(0, 0, 0, false), PruneDecision::Leave);
+        assert_eq!(prune_decision(0, 0, 2, false), PruneDecision::Leave);
     }
 }
