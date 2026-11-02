@@ -455,15 +455,17 @@ impl SealedEnc {
     }
 }
 
-/// Seal and sign a message for `recipient_x25519`: validate the plaintext
-/// (the same rules plain envelopes face, so garbage is never encrypted),
-/// canonical-JSON the payload `{kind, subject, body, attachments,
-/// in_reply_to}`, seal it with one [`SealSession`] under `MSG_LABEL`, and
-/// sign the resulting sealed envelope with the sender's Ed25519 key.
+/// Seal and sign a message: validate the plaintext (the same rules plain
+/// envelopes face, so garbage is never encrypted), canonical-JSON the payload
+/// `{kind, subject, body, attachments, in_reply_to}`, seal it with the
+/// caller's shared [`SealSession`] under `MSG_LABEL`, and sign the resulting
+/// sealed envelope with the sender's Ed25519 key. Spec §2.2 mandates exactly
+/// one ECDH per message, so the session is supplied by the caller — the same
+/// session also seals the message's attachments (spec §2.2, per-index labels).
 pub fn seal_and_sign(
     id: &str,
     parts: &NewSealedMessage,
-    recipient_x25519: &x25519_dalek::PublicKey,
+    session: &SealSession,
     created: &str,
     key: &SigningKey,
 ) -> Result<Envelope> {
@@ -490,7 +492,7 @@ pub fn seal_and_sign(
             "sealed payload exceeds the 1 MiB ciphertext budget".into(),
         ));
     }
-    let sealed = SealSession::new(recipient_x25519).seal(MSG_LABEL, msg.as_bytes())?;
+    let sealed = session.seal(MSG_LABEL, msg.as_bytes())?;
     build_and_sign_sealed(
         id,
         &parts.from,
@@ -757,6 +759,8 @@ mod tests {
         let (recipient, _) = fixtures();
         let from_key = B64.encode(alice.verifying_key().as_bytes());
         let rx = crate::crypto::x25519_public(&recipient.verifying_key());
+        // caller owns the session (one ECDH per message, shared with attachments)
+        let session = SealSession::new(&rx);
         let msg = NewSealedMessage {
             from: "alice".into(),
             from_key: from_key.clone(),
@@ -774,7 +778,7 @@ mod tests {
         let env = seal_and_sign(
             "aa".repeat(16).as_str(),
             &msg,
-            &rx,
+            &session,
             "2026-11-01T12:00:00Z",
             &alice,
         )
@@ -806,7 +810,7 @@ mod tests {
         assert!(seal_and_sign(
             "cc".repeat(16).as_str(),
             &bad,
-            &rx,
+            &session,
             "2026-11-01T12:00:00Z",
             &alice
         )
@@ -825,7 +829,7 @@ mod tests {
             seal_and_sign(
                 "dd".repeat(16).as_str(),
                 &huge,
-                &rx,
+                &session,
                 "2026-11-01T12:00:00Z",
                 &alice
             ),
