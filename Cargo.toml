@@ -5,6 +5,7 @@ members = [
     "crates/cmail-cli",
     "crates/cmail-mcp",
     "crates/cmail-relayd",
+    "crates/cmail-relay-cf",
 ]
 
 [workspace.package]
@@ -17,6 +18,8 @@ edition = "2021"
 cmail-core = { path = "crates/cmail-core" }
 cmail-mcp = { path = "crates/cmail-mcp" }
 cmail-relayd = { path = "crates/cmail-relayd" }
+cmail-relay-cf = { path = "crates/cmail-relay-cf" }
+worker = "0.8"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
