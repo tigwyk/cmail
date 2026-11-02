@@ -95,7 +95,8 @@ fn now_unix() -> i64 {
 /// `crypto.getRandomValues` via js_sys reflection — worker 0.8 exposes no
 /// typed binding (its web-sys features lack `Crypto`), and this crate adds no
 /// dependencies for it. Bounded well under the 65536-byte API limit.
-fn random_bytes(len: u32) -> Result<Vec<u8>> {
+/// Also used by the Worker entry (`lib.rs`) for fresh parcel blob ids.
+pub(crate) fn random_bytes(len: u32) -> Result<Vec<u8>> {
     use worker::js_sys::{global, Reflect, Uint8Array};
     use worker::wasm_bindgen::{JsCast, JsValue};
     let err = |e: JsValue| worker::Error::from(e);

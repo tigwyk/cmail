@@ -1,0 +1,4 @@
+# worker-build output (wrangler deploy/dev runs it via wrangler.toml [build])
+/build
+# wrangler deploy --dry-run --outdir=dist artifacts
+/dist
