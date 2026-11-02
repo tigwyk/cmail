@@ -1,4 +1,5 @@
 use crate::canonical::canonical_json;
+use crate::crypto::{self, SealSession, SealedBox, MSG_LABEL};
 use crate::error::{CoreError, Result};
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
@@ -15,6 +16,8 @@ pub const MAX_ATTACHMENT_BYTES: u64 = 10 * 1024 * 1024;
 pub const MAX_TOTAL_ATTACHMENT_BYTES: u64 = 25 * 1024 * 1024;
 /// Decoded budget for a sealed envelope's ciphertext (`enc.ct`).
 pub const MAX_SEALED_CT_BYTES: usize = 1024 * 1024;
+/// XChaCha20-Poly1305 tag appended to the plaintext inside `enc.ct`.
+const AEAD_TAG_BYTES: usize = 16;
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct Attachment {
@@ -87,34 +90,53 @@ pub fn new_id() -> String {
 }
 
 fn validate(p: &NewEnvelope, id: &str) -> Result<()> {
+    validate_id_created(id, &p.created)?;
+    validate_content(
+        &p.kind,
+        &p.subject,
+        &p.body,
+        &p.attachments,
+        p.in_reply_to.as_deref(),
+    )
+}
+
+/// Content rules shared by plain and sealed mail: applied to plain envelopes
+/// at build/parse time, to sealed mail at seal time (garbage is never
+/// encrypted) and again to the decrypted payload at open time.
+fn validate_content(
+    kind: &str,
+    subject: &str,
+    body: &str,
+    attachments: &[Attachment],
+    in_reply_to: Option<&str>,
+) -> Result<()> {
     let bad = |reason: &str| {
         Err(CoreError::InvalidEnvelope {
             reason: reason.to_string(),
         })
     };
-    validate_id_created(id, &p.created)?;
-    if !KINDS.contains(&p.kind.as_str()) {
+    if !KINDS.contains(&kind) {
         return bad("kind must be one of note|status|handoff|question");
     }
-    if p.subject.chars().count() > MAX_SUBJECT_LEN {
+    if subject.chars().count() > MAX_SUBJECT_LEN {
         return bad("subject exceeds 200 chars");
     }
-    if p.subject.contains('\n') || p.subject.contains('\r') {
+    if subject.contains('\n') || subject.contains('\r') {
         return bad("subject must be a single line");
     }
-    if p.body.len() > MAX_BODY_BYTES {
+    if body.len() > MAX_BODY_BYTES {
         return bad("body exceeds 256 KiB");
     }
-    if p.attachments.len() > MAX_ATTACHMENTS {
+    if attachments.len() > MAX_ATTACHMENTS {
         return bad("more than 8 attachments");
     }
-    if p.attachments.iter().any(|a| a.size > MAX_ATTACHMENT_BYTES) {
+    if attachments.iter().any(|a| a.size > MAX_ATTACHMENT_BYTES) {
         return bad("attachment exceeds 10 MiB");
     }
-    if p.attachments.iter().map(|a| a.size).sum::<u64>() > MAX_TOTAL_ATTACHMENT_BYTES {
+    if attachments.iter().map(|a| a.size).sum::<u64>() > MAX_TOTAL_ATTACHMENT_BYTES {
         return bad("attachments exceed 25 MiB total");
     }
-    if let Some(parent) = &p.in_reply_to {
+    if let Some(parent) = in_reply_to {
         if parent.len() != 32 || !parent.chars().all(|c| c.is_ascii_hexdigit()) {
             return bad("in_reply_to must be a message id");
         }
@@ -372,6 +394,162 @@ pub fn build_and_sign_sealed(
     })
 }
 
+/// Plaintext parts of a message to seal. Like [`NewEnvelope`] but without
+/// `created` (passed to [`seal_and_sign`] separately) — the mail fields
+/// travel inside the ciphertext, not on the wire.
+#[derive(Debug, Clone)]
+pub struct NewSealedMessage {
+    pub from: String,
+    pub from_key: String,
+    pub to: String,
+    pub kind: String,
+    pub subject: String,
+    pub body: String,
+    pub attachments: Vec<Attachment>,
+    pub in_reply_to: Option<String>,
+}
+
+/// Mail fields recovered from an envelope: the content of a plain envelope,
+/// or the decrypted payload of a sealed one.
+#[derive(Debug, Clone, PartialEq)]
+pub struct OpenedContent {
+    pub kind: String,
+    pub subject: String,
+    pub body: String,
+    pub attachments: Vec<Attachment>,
+    pub in_reply_to: Option<String>,
+}
+
+/// Wire form of the decrypted sealed payload. All fields are required
+/// (`in_reply_to` travels as an explicit null, matching v1's
+/// `unsigned_value` convention) and unknown fields are rejected so a
+/// foreign payload cannot slip data past the validators.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SealedPayload {
+    kind: String,
+    subject: String,
+    body: String,
+    attachments: Vec<Attachment>,
+    in_reply_to: Option<String>,
+}
+
+impl SealedEnc {
+    fn from_sealed_box(b: SealedBox) -> Self {
+        Self {
+            v: 1,
+            epk: b.epk,
+            nonce: b.nonce,
+            ct: b.ct,
+        }
+    }
+
+    // `v` is ignored here: `Envelope::parse`/`validate_sealed_enc` already
+    // pinned it to 1 before any bytes reach the crypto layer.
+    fn to_sealed_box(&self) -> SealedBox {
+        SealedBox {
+            epk: self.epk.clone(),
+            nonce: self.nonce.clone(),
+            ct: self.ct.clone(),
+        }
+    }
+}
+
+/// Seal and sign a message for `recipient_x25519`: validate the plaintext
+/// (the same rules plain envelopes face, so garbage is never encrypted),
+/// canonical-JSON the payload `{kind, subject, body, attachments,
+/// in_reply_to}`, seal it with one [`SealSession`] under `MSG_LABEL`, and
+/// sign the resulting sealed envelope with the sender's Ed25519 key.
+pub fn seal_and_sign(
+    id: &str,
+    parts: &NewSealedMessage,
+    recipient_x25519: &x25519_dalek::PublicKey,
+    created: &str,
+    key: &SigningKey,
+) -> Result<Envelope> {
+    validate_id_created(id, created)?;
+    validate_content(
+        &parts.kind,
+        &parts.subject,
+        &parts.body,
+        &parts.attachments,
+        parts.in_reply_to.as_deref(),
+    )?;
+    let payload = json!({
+        "kind": parts.kind,
+        "subject": parts.subject,
+        "body": parts.body,
+        "attachments": parts.attachments,
+        "in_reply_to": parts.in_reply_to,
+    });
+    let msg = canonical_json(&payload);
+    // ct = payload + AEAD tag must stay inside the 1 MiB sealed-ct budget
+    // that `validate_sealed_enc` enforces when the envelope is built.
+    if msg.len() + AEAD_TAG_BYTES > MAX_SEALED_CT_BYTES {
+        return Err(CoreError::LimitExceeded(
+            "sealed payload exceeds the 1 MiB ciphertext budget".into(),
+        ));
+    }
+    let sealed = SealSession::new(recipient_x25519).seal(MSG_LABEL, msg.as_bytes())?;
+    build_and_sign_sealed(
+        id,
+        &parts.from,
+        &parts.from_key,
+        &parts.to,
+        created,
+        SealedEnc::from_sealed_box(sealed),
+        key,
+    )
+}
+
+/// Recover the mail fields from an envelope. Plain envelopes return their
+/// content directly; sealed envelopes are opened with the recipient's X25519
+/// secret under `MSG_LABEL`, then the payload is parsed and re-validated.
+/// Wrong identity or tampered bytes yield [`CoreError::DecryptFailed`];
+/// a well-decrypted but malformed/invalid payload yields
+/// [`CoreError::InvalidEnvelope`].
+pub fn open_envelope(
+    env: &Envelope,
+    recipient_secret: &x25519_dalek::StaticSecret,
+) -> Result<OpenedContent> {
+    match &env.content {
+        EnvelopeContent::Plain {
+            kind,
+            subject,
+            body,
+            attachments,
+            in_reply_to,
+        } => Ok(OpenedContent {
+            kind: kind.clone(),
+            subject: subject.clone(),
+            body: body.clone(),
+            attachments: attachments.clone(),
+            in_reply_to: in_reply_to.clone(),
+        }),
+        EnvelopeContent::Sealed { enc } => {
+            let plaintext = crypto::open(recipient_secret, &enc.to_sealed_box(), MSG_LABEL)?;
+            let payload: SealedPayload =
+                serde_json::from_slice(&plaintext).map_err(|e| CoreError::InvalidEnvelope {
+                    reason: format!("sealed payload: {e}"),
+                })?;
+            validate_content(
+                &payload.kind,
+                &payload.subject,
+                &payload.body,
+                &payload.attachments,
+                payload.in_reply_to.as_deref(),
+            )?;
+            Ok(OpenedContent {
+                kind: payload.kind,
+                subject: payload.subject,
+                body: payload.body,
+                attachments: payload.attachments,
+                in_reply_to: payload.in_reply_to,
+            })
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -571,6 +749,88 @@ mod tests {
             "sig": "AAAA"
         });
         assert!(Envelope::parse(&raw.to_string()).is_err());
+    }
+
+    #[test]
+    fn seal_and_open_round_trip() {
+        let (alice, _) = fixtures(); // alice = SENDER; recipient pair needed
+        let (recipient, _) = fixtures();
+        let from_key = B64.encode(alice.verifying_key().as_bytes());
+        let rx = crate::crypto::x25519_public(&recipient.verifying_key());
+        let msg = NewSealedMessage {
+            from: "alice".into(),
+            from_key: from_key.clone(),
+            to: "zoe".into(),
+            kind: "handoff".into(),
+            subject: "s".into(),
+            body: "the state".into(),
+            attachments: vec![Attachment {
+                filename: "notes.txt".into(),
+                sha256: "0".repeat(64),
+                size: 3,
+            }],
+            in_reply_to: None,
+        };
+        let env = seal_and_sign(
+            "aa".repeat(16).as_str(),
+            &msg,
+            &rx,
+            "2026-11-01T12:00:00Z",
+            &alice,
+        )
+        .unwrap();
+        assert!(env.is_sealed());
+        // raw wire carries no plaintext
+        let wire = serde_json::to_string(&env).unwrap();
+        assert!(!wire.contains("the state") && !wire.contains("handoff"));
+        let opened = open_envelope(&env, &crate::crypto::x25519_secret(&recipient)).unwrap();
+        assert_eq!(opened.body, "the state");
+        assert_eq!(opened.kind, "handoff");
+        assert_eq!(opened.attachments.len(), 1);
+        // wrong identity cannot open
+        let (other, _) = fixtures();
+        assert!(open_envelope(&env, &crate::crypto::x25519_secret(&other)).is_err());
+        // plain envelopes pass through unchanged
+        let plain = build_and_sign(
+            "bb".repeat(16).as_str(),
+            &parts("alice", &from_key, "zoe"),
+            &alice,
+        )
+        .unwrap();
+        let opened = open_envelope(&plain, &crate::crypto::x25519_secret(&other)).unwrap();
+        assert_eq!(opened.body, "here is the state");
+        assert_eq!(opened.kind, "handoff");
+        // seal-time validation: garbage never gets sealed
+        let mut bad = msg.clone();
+        bad.kind = "shout".into();
+        assert!(seal_and_sign(
+            "cc".repeat(16).as_str(),
+            &bad,
+            &rx,
+            "2026-11-01T12:00:00Z",
+            &alice
+        )
+        .is_err());
+        // payload size guard trips before any crypto work
+        let mut huge = msg.clone();
+        huge.attachments = vec![
+            Attachment {
+                filename: "f".repeat(400_000),
+                sha256: "0".repeat(64),
+                size: 1,
+            };
+            4
+        ];
+        assert!(matches!(
+            seal_and_sign(
+                "dd".repeat(16).as_str(),
+                &huge,
+                &rx,
+                "2026-11-01T12:00:00Z",
+                &alice
+            ),
+            Err(CoreError::LimitExceeded(_))
+        ));
     }
 
     #[test]
