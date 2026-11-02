@@ -46,7 +46,7 @@ pub fn evaluate(env: &Envelope, keyring: &KeyRing) -> TrustResult {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::envelope::{build_and_sign, NewEnvelope};
+    use crate::envelope::{build_and_sign, EnvelopeContent, NewEnvelope};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
@@ -102,14 +102,18 @@ mod tests {
         // invalid self-signature -> invalid (tamper the body after signing)
         let (kr, _) = keyring_with("alice", &alice);
         let mut env = signed("alice", &alice, "zoe");
-        env.body = "tampered".into();
+        if let EnvelopeContent::Plain { body, .. } = &mut env.content {
+            *body = "tampered".into();
+        }
         assert_eq!(evaluate(&env, &kr).level, TrustLevel::Invalid);
 
         // tampered envelope CLAIMING a keyring-known name, signed by an impostor:
         // signature check must win -> Invalid, not SpoofSuspect
         let (kr, _) = keyring_with("alice", &alice);
         let mut env = signed("alice", &mallory, "zoe");
-        env.body = "tampered".into();
+        if let EnvelopeContent::Plain { body, .. } = &mut env.content {
+            *body = "tampered".into();
+        }
         assert_eq!(evaluate(&env, &kr).level, TrustLevel::Invalid);
     }
 

@@ -1,6 +1,6 @@
 use crate::audit::{append, AuditEvent, AuditRecord};
 use crate::config::{Config, InboundMode, OutboundMode};
-use crate::envelope::{build_and_sign, new_id, Envelope, NewEnvelope};
+use crate::envelope::{build_and_sign, new_id, Envelope, EnvelopeContent, NewEnvelope};
 use crate::error::{CoreError, Result};
 use crate::identity::{create_identity, identity_exists, load_identity, now_rfc3339};
 use crate::keyring::KeyRing;
@@ -243,13 +243,16 @@ impl Cmail {
             for id in self.store.list_ids(&self.store.pending_dir(&o)) {
                 let raw = self.store.read_raw(&self.store.pending_dir(&o), &id)?;
                 match Envelope::parse(&raw) {
-                    Ok(env) => out.push(HeldMessage {
-                        id: env.id,
-                        from: env.from,
-                        to: env.to,
-                        subject: env.subject,
-                        created: env.created,
-                    }),
+                    Ok(env) => {
+                        let subject = env.subject_label().to_string();
+                        out.push(HeldMessage {
+                            id: env.id,
+                            from: env.from,
+                            to: env.to,
+                            subject,
+                            created: env.created,
+                        })
+                    }
                     // A pending file that no longer parses must stay visible to
                     // the human, not silently disappear from the approval list
                     // (review hardening).
@@ -415,14 +418,18 @@ impl Cmail {
                     self.store.move_message(&inbox, &quarantine, &id)?;
                     self.audit_corrupt(&id, "strict mode: unknown sender")?;
                 }
-                level => items.push(InboxItem {
-                    id: env.id,
-                    from: env.from,
-                    kind: env.kind,
-                    subject: env.subject,
-                    trust: level.as_str().to_string(),
-                    created: env.created,
-                }),
+                level => {
+                    let kind = env.kind_label().to_string();
+                    let subject = env.subject_label().to_string();
+                    items.push(InboxItem {
+                        id: env.id,
+                        from: env.from,
+                        kind,
+                        subject,
+                        trust: level.as_str().to_string(),
+                        created: env.created,
+                    })
+                }
             }
         }
         Ok(items)
@@ -490,10 +497,19 @@ impl Cmail {
         // Spec 4.2 wrapping rule: every trust level other than `verified` is
         // presented behind the untrusted fence — a spoof-suspect or invalid
         // message a human released from quarantine is never shown unfenced.
-        let body = if tr.level == TrustLevel::Verified {
-            env.body.clone()
-        } else {
-            wrap_untrusted(&env.body)
+        // Sealed bodies are opaque here; E5 wires real decryption.
+        let body = match (&env.content, tr.level) {
+            (EnvelopeContent::Plain { body, .. }, TrustLevel::Verified) => body.clone(),
+            (EnvelopeContent::Plain { body, .. }, _) => wrap_untrusted(body),
+            (EnvelopeContent::Sealed { .. }, _) => "<sealed>".to_string(),
+        };
+        let attachments = match &env.content {
+            EnvelopeContent::Plain { attachments, .. } => attachments
+                .iter()
+                .map(|a| a.filename.clone())
+                .collect::<Vec<_>>(),
+            // Sealed attachments travel inside the ciphertext; E5 wires real decryption.
+            EnvelopeContent::Sealed { .. } => Vec::new(),
         };
         if in_inbox {
             self.store.move_message(&inbox, &archive, id)?;
@@ -504,15 +520,18 @@ impl Cmail {
                 .msg(id)
                 .counterpart(&env.from),
         )?;
+        let kind = env.kind_label().to_string();
+        let subject = env.subject_label().to_string();
+        let in_reply_to = env.in_reply_to_ref().map(str::to_string);
         Ok(ReadMessage {
             id: env.id,
             from: env.from,
             to: env.to,
-            kind: env.kind,
-            subject: env.subject,
+            kind,
+            subject,
             body,
-            attachments: env.attachments.iter().map(|a| a.filename.clone()).collect(),
-            in_reply_to: env.in_reply_to,
+            attachments,
+            in_reply_to,
             created: env.created,
             trust: tr.level.as_str().to_string(),
             fingerprint: tr.fingerprint,
@@ -549,7 +568,7 @@ impl Cmail {
         )?;
         let subject = subject
             .map(str::to_string)
-            .unwrap_or_else(|| format!("re: {}", parent.subject));
+            .unwrap_or_else(|| format!("re: {}", parent.subject_label()));
         self.send(
             Some(&me),
             &parent.from,
@@ -571,11 +590,13 @@ impl Cmail {
                 let raw = self.store.read_raw(&archive, &id)?;
                 if let Ok(env) = Envelope::parse(&raw) {
                     let tr = crate::trust::evaluate(&env, &keyring);
+                    let kind = env.kind_label().to_string();
+                    let subject = env.subject_label().to_string();
                     items.push(InboxItem {
                         id: env.id,
                         from: env.from,
-                        kind: env.kind,
-                        subject: env.subject,
+                        kind,
+                        subject,
                         trust: tr.level.as_str().to_string(),
                         created: env.created,
                     });
@@ -609,11 +630,13 @@ impl Cmail {
         for id in self.store.list_ids(&self.store.quarantine_dir(&me)) {
             let raw = self.store.read_raw(&self.store.quarantine_dir(&me), &id)?;
             if let Ok(env) = Envelope::parse(&raw) {
+                let kind = env.kind_label().to_string();
+                let subject = env.subject_label().to_string();
                 out.push(InboxItem {
                     id: env.id,
                     from: env.from,
-                    kind: env.kind,
-                    subject: env.subject,
+                    kind,
+                    subject,
                     trust: "quarantined".into(),
                     created: env.created,
                 });
@@ -629,15 +652,30 @@ impl Cmail {
         let env = Envelope::parse(&self.store.read_raw(&self.store.quarantine_dir(&me), id)?)?;
         let keyring = KeyRing::load(&self.root)?;
         let tr = crate::trust::evaluate(&env, &keyring);
+        // Sealed bodies are opaque here; E5 wires real decryption.
+        let body = match &env.content {
+            EnvelopeContent::Plain { body, .. } => wrap_untrusted(body),
+            EnvelopeContent::Sealed { .. } => "<sealed>".to_string(),
+        };
+        let attachments = match &env.content {
+            EnvelopeContent::Plain { attachments, .. } => attachments
+                .iter()
+                .map(|a| a.filename.clone())
+                .collect::<Vec<_>>(),
+            EnvelopeContent::Sealed { .. } => Vec::new(),
+        };
+        let kind = env.kind_label().to_string();
+        let subject = env.subject_label().to_string();
+        let in_reply_to = env.in_reply_to_ref().map(str::to_string);
         Ok(ReadMessage {
             id: env.id,
             from: env.from,
             to: env.to,
-            kind: env.kind,
-            subject: env.subject,
-            body: wrap_untrusted(&env.body),
-            attachments: env.attachments.iter().map(|a| a.filename.clone()).collect(),
-            in_reply_to: env.in_reply_to,
+            kind,
+            subject,
+            body,
+            attachments,
+            in_reply_to,
             created: env.created,
             trust: tr.level.as_str().to_string(),
             fingerprint: tr.fingerprint,
@@ -1007,8 +1045,8 @@ mod tests {
         };
         let raw = c.store.read_raw(&c.store.inbox_dir("alice"), &rid).unwrap();
         let env = Envelope::parse(&raw).unwrap();
-        assert_eq!(env.in_reply_to.as_deref(), Some(id.as_str()));
-        assert!(env.subject.starts_with("re:"));
+        assert_eq!(env.in_reply_to_ref(), Some(id.as_str()));
+        assert!(env.subject_label().starts_with("re:"));
     }
 
     #[test]
