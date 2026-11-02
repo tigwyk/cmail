@@ -68,8 +68,11 @@ v1.1; remote delivery bundles them):
 Rules: `v == 1` (unknown → 400); relay verifies `fingerprint(pubkey) == {fp}`
 of the URL (400 otherwise); envelope is stored/fetched opaquely (the relay
 NEVER parses inside it); attachment entries are keyed by index, count ≤ 8,
-total encoded parcel size ≤ 36 MiB (413 otherwise). The client-side
-reconstruction writes `attachments/<id>/att-<i>.bin` verbatim from `data`.
+total DECODED attachment payload ≤ 36 MiB (validated post-parse → 413); the
+ENCODED request body is prechecked against 64 MiB before reading (413) — b64
+expansion means a decoded-36-MiB parcel encodes to ~48 MiB, so the encoded
+precheck must be the larger number. The client-side reconstruction writes
+`attachments/<id>/att-<i>.bin` verbatim from `data`.
 
 ### 2.2 Server behavior (reference implementation contract)
 
@@ -79,9 +82,12 @@ reconstruction writes `attachments/<id>/att-<i>.bin` verbatim from `data`.
   fp; consumed exactly on a successful authed request; garbage-collected
   lazily on every request touching `{fp}`.
 - Retention: entries older than `--retention-days` (default **7**) are deleted
-  lazily on mailbox access and on deposit; empty mailboxes are pruned.
-- Caps: parcel ≤ 36 MiB; per-mailbox ≤ 256 MiB and ≤ 1000 entries (413/429 on
-  exceed).
+  lazily on mailbox access and on deposit, PLUS a periodic sweep of ALL
+  mailboxes (every 10 minutes) so abandoned mailboxes cannot accumulate
+  unbounded across fingerprints; empty mailboxes are pruned.
+- Caps, status semantics: **413 = size** (encoded body precheck 64 MiB;
+  decoded payload 36 MiB; per-mailbox 256 MiB), **429 = count** (1000 entries
+  per mailbox; 8 outstanding nonces per fp).
 - No accounts, no admin API, no relay-to-relay. TLS is the deployer's
   responsibility (reverse proxy or `--tls-cert/--tls-key` flags on the
   reference server); the protocol REQUIRES TLS in production — plaintext HTTP
