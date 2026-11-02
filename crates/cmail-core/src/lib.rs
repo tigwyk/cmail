@@ -1,6 +1,7 @@
 pub mod audit;
 pub mod canonical;
 pub mod config;
+pub mod crypto;
 pub mod envelope;
 pub mod error;
 pub mod fsutil;

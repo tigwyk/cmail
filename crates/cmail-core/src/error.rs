@@ -18,6 +18,8 @@ pub enum CoreError {
     Io(#[from] std::io::Error),
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
+    #[error("{0}")]
+    DecryptFailed(String),
 }
 
 pub type Result<T> = std::result::Result<T, CoreError>;
