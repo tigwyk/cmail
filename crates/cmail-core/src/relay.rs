@@ -146,30 +146,26 @@ pub fn sign_challenge(signing: &SigningKey, nonce: &str) -> String {
 }
 
 /// Normalize a relay base URL: trim whitespace and trailing `/`; require
-/// `https://` unless the host is loopback (`127.0.0.1` / `localhost`),
-/// where plaintext HTTP is allowed for insecure-local testing (spec §2.2).
-pub fn normalize_base(url: &str) -> Result<String> {
-    let trimmed = url.trim();
-    let (scheme, rest) = trimmed
-        .split_once("://")
-        .ok_or_else(|| CoreError::Config(format!("relay url must include a scheme: {url}")))?;
-    let host = rest.split(&['/', ':'][..]).next().unwrap_or_default();
-    if host.is_empty() {
-        return Err(CoreError::Config(format!(
-            "relay url must include a host: {url}"
-        )));
-    }
-    let loopback = host.eq_ignore_ascii_case("127.0.0.1") || host.eq_ignore_ascii_case("localhost");
-    match scheme {
+/// `https://` unless the host is loopback (`127.0.0.1` / `localhost` /
+/// `[::1]`), where plaintext HTTP is allowed for insecure-local testing
+/// (spec §2.2). Parsed with `url::Url` so userinfo (`http://127.0.0.1@evil.com`)
+/// cannot spoof a loopback host into a plaintext exemption.
+pub fn normalize_base(raw: &str) -> Result<String> {
+    let trimmed = raw.trim().trim_end_matches('/');
+    let url = url::Url::parse(trimmed)
+        .map_err(|e| CoreError::Config(format!("invalid relay url: {e}")))?;
+    let host = url.host_str().unwrap_or_default();
+    let loopback = host == "127.0.0.1" || host.eq_ignore_ascii_case("localhost") || host == "[::1]";
+    match url.scheme() {
         "https" => {}
         "http" if loopback => {}
         _ => {
             return Err(CoreError::Config(format!(
-                "relay url must use https (http only for 127.0.0.1/localhost): {url}"
+                "relay url must be https (http allowed only for loopback): {raw}"
             )))
         }
     }
-    Ok(trimmed.trim_end_matches('/').to_string())
+    Ok(trimmed.to_string())
 }
 
 /// Client-side mirror of the relay's fp check (spec §2.1: fingerprint of
@@ -460,5 +456,10 @@ mod tests {
         assert!(normalize_base("http://relay.example.com").is_err());
         assert!(normalize_base("ftp://relay.example.com").is_err());
         assert!(normalize_base("relay.example.com").is_err());
+        assert!(
+            normalize_base("http://127.0.0.1:8080@evil.com/").is_err(),
+            "userinfo must not spoof loopback"
+        );
+        assert!(normalize_base("http://[::1]:8080").is_ok());
     }
 }

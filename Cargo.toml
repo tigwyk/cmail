@@ -28,3 +28,4 @@ clap = { version = "4", features = ["derive"] }
 anyhow = "1"
 tempfile = "3"
 ureq = { version = "2", default-features = false, features = ["tls", "json"] }
+url = "2"

@@ -261,6 +261,7 @@ dependencies = [
  "time",
  "toml",
  "ureq",
+ "url",
  "x25519-dalek",
 ]
 
