@@ -111,7 +111,12 @@ Rules:
   seal time).
 - Attachment payload files are stored as `attachments/<id>/att-<index>.bin`
   (index-named — real filenames are inside the payload). Plaintext sha256 and
-  size are recorded in the payload metadata only.
+  size are recorded in the payload metadata only. **On-disk frame (v1, pinned
+  for interop):** raw little-endian-free fixed-offset binary
+  `epk[32] || nonce[24] || ct[plaintext_len + 16]` — total file size =
+  plaintext + 72 bytes; frames shorter than 72 bytes are rejected as
+  DecryptFailed. No version byte in v1; a future format change must introduce
+  one.
 - `unsigned_value()` (the canonical signing input) for a sealed envelope
   includes `id, from, from_key, to, created, enc` — content fields are absent.
 
