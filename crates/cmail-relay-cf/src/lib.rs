@@ -301,15 +301,16 @@ async fn deposit(mut req: Request, env: &worker::Env, fp: &str) -> worker::Resul
         Ok(resp) if resp.status_code() == 200 => Ok(json_response(200, json!({ "ok": true }))),
         // Caps (429 count / 413 size, relayd's texts) or a contract
         // violation: the blob must not survive an unindexed deposit.
+        // Best-effort delete (sweep_orphans doctrine: a failure here never fails the request): a failed DELETE must not 500 over the DO's answer; the unmarked-leak window it opens is accepted (same class as the marked-orphan bounded leak, minus reclaim — noted for C6's docs).
         Ok(resp) => {
-            bucket.delete(&key).await?;
+            let _ = bucket.delete(&key).await;
             Ok(forward(resp).await?)
         }
         // Transport/SQL failure after the R2 put (e.g. a duplicate blob id —
-        // 2^-128 per pair, but handled): clean up, then 400 like relayd's
-        // bad-store paths.
+        // 2^-128 per pair, but handled): best-effort clean up, then 400 like
+        // relayd's bad-store paths.
         Err(_) => {
-            bucket.delete(&key).await?;
+            let _ = bucket.delete(&key).await;
             Ok(bad_request())
         }
     }
