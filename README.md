@@ -22,9 +22,9 @@ are attached to each [release](https://github.com/tigwyk/cmail/releases) with a
 `SHA256SUMS.txt` — download, verify, put on PATH:
 
 ```bash
-curl -LO https://github.com/tigwyk/cmail/releases/download/v0.3.0/cmail-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
-tar -xzf cmail-v0.3.0-x86_64-unknown-linux-gnu.tar.gz
-sudo install cmail-v0.3.0-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
+curl -LO https://github.com/tigwyk/cmail/releases/download/v0.3.1/cmail-v0.3.1-x86_64-unknown-linux-gnu.tar.gz
+tar -xzf cmail-v0.3.1-x86_64-unknown-linux-gnu.tar.gz
+sudo install cmail-v0.3.1-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
 ```
 
 (Substitute your platform and the current version from the
@@ -165,6 +165,44 @@ cmail relay-serve --root /srv/cmail-relay --addr 127.0.0.1:8080
 # off loopback the protocol REQUIRES https — terminate TLS at a reverse
 # proxy (nginx, Caddy, …) in front of relay-serve; cmail has no built-in TLS
 ```
+
+### Running a relay on Cloudflare
+
+No server to babysit? The same wire protocol also ships as a Cloudflare
+Worker — [`crates/cmail-relay-cf`](crates/cmail-relay-cf) — the dumb post
+office with **zero idle cost**: one Durable Object per mailbox fingerprint
+(SQLite-backed index + nonces), R2 for the sealed parcel blobs, DO alarms
+for retention. It is wire-identical to `cmail-relayd` — both implementations
+pass the same conformance suite — so every cmail client works against either
+unchanged; run whichever hosting suits you, and everything below (first
+contact, sending, pickup, honest edges) applies identically.
+
+```bash
+cd crates/cmail-relay-cf
+npx wrangler deploy
+```
+
+- First deploy prompts you to provision the `cmail-parcels` R2 bucket
+  (wrangler offers to create missing bindings; or create it yourself first:
+  `npx wrangler r2 bucket create cmail-parcels`).
+- Retention is the `CMAIL_RETENTION_DAYS` var in `wrangler.toml` (default
+  `7`) — same semantics as relayd's `--retention-days`.
+- Build note: wrangler 4 doesn't auto-detect Rust; the config's `[build]`
+  step runs `worker-build` (cargo → wasm32 → JS shim) and
+  `main = "build/index.js"` points at that output.
+
+Free-tier economics — a personal relay lives entirely in the free tiers:
+
+| Cloudflare free tier | Allowance |
+|---|---|
+| Workers | 100k requests/day |
+| Durable Objects (SQLite-backed) | free tier incl. SQLite storage |
+| R2 | 10 GB storage, zero egress fees |
+
+Honest note: Cloudflare sees request metadata — mailbox fingerprints in
+URLs, parcel sizes, timing — the same class of visibility any relay operator
+(including a self-hosted relayd) has. Parcels are end-to-end sealed, so the
+content is never exposed to the relay or to Cloudflare.
 
 **First contact, out of band.** The recipient (zoe on machine B) publishes
 her fingerprint (printed by `cmail init --name zoe`) and the relay URL. Her

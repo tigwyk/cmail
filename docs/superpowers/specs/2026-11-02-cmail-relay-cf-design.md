@@ -44,23 +44,44 @@ Client ──HTTPS──> Worker fetch handler (route parse: 5 routes)
   caps, index), exactly the invariants the file-based store enforces with
   `remove_file().is_ok()`-style commits.
 - **Auth order** (authed routes): the DO returns the stored pubkey (404 if no
-  mailbox), the Worker verifies the Ed25519 signature over the ASCII nonce,
-  then asks the DO to consume the nonce (transactional single-use). Verify
-  BEFORE consume so a failed signature never burns a nonce.
-- **Blobs**: deposit streams the request body; the DO records the index entry
-  only after the R2 put succeeds; fetch streams R2 → response; ack deletes
-  R2 object then index entry (blob-first so an index entry always has a
-  blob; a stray orphan blob is alarm-GC'd).
+  mailbox), the Worker checks header presence (`X-cmail-Fp`, signature),
+  then the DO verifies the Ed25519 signature over each stored nonce VALUE
+  and deletes exactly the verified row in one serialized request (§3;
+  relayd's `consume_nonce_by_signature` parity — wire v1 clients never echo
+  the nonce, so only the DO can match signature to value). Verify BEFORE
+  consume so a failed signature never burns a nonce.
+- **Blobs**: deposit reads the request body whole (bounded, §5 memory note)
+  and R2-puts those exact bytes; the DO records the index entry only after
+  the R2 put succeeds; fetch streams R2 → response; ack deletes R2 object
+  then index entry (blob-first so an index entry always has a blob; a stray
+  orphan blob is alarm-GC'd).
 
 ## 3. Data model (DO SQLite storage)
 
-Tables (namespaced under cmail_):
-- `cmail_meta(key TEXT PRIMARY KEY, value TEXT)` — `pubkey` (b64), `created`.
+Tables (namespaced under cmail_) — as implemented:
+- `cmail_meta(key TEXT PRIMARY KEY, value TEXT)` — `pubkey` (b64) and
+  `created_unix` pinned at first deposit, plus `retention_days` (latest
+  deposit wins; the DO persists it because its alarm carries no request) and
+  `swept_empty` (the retention-prune flag, §4).
 - `cmail_entries(id TEXT PRIMARY KEY, size INTEGER, received_unix INTEGER)` —
   id = 32-hex (validated), size = encoded bytes.
-- `cmail_nonces(hash TEXT PRIMARY KEY, expires_unix INTEGER)` — hash =
-  16-hex of SHA-256(nonce) (nonce values never stored, mirroring the
-  reference's hash-addressed files).
+- `cmail_nonces(hash TEXT PRIMARY KEY, nonce TEXT, expires_unix INTEGER)` —
+  hash = 16-hex of SHA-256(nonce) as the primary key, with the b64 nonce
+  VALUE stored alongside it, like the reference's nonce-file contents. (The
+  design's "nonce values never stored" note was aspirational: wire v1
+  clients send `X-cmail-Signature` without echoing the nonce, so matching
+  happens by re-verifying the Ed25519 signature over each stored value
+  inside the DO's serialized `/consume` and deleting exactly the verified
+  row — relayd's `consume_nonce_by_signature`.)
+- `cmail_orphans(id TEXT PRIMARY KEY, marked_unix INTEGER)` — as-implemented
+  addition: blob ids whose index row the retention alarm deleted. The DO
+  holds no R2 binding (by design), so the alarm records a marker instead of
+  deleting the blob; the Worker claims markers via the internal
+  `/sweep-pending` round (≤64 per claim, claim-then-R2-delete) riding on
+  mailbox touches. Two bounded leak windows are accepted and disclosed: a
+  Worker crash between claim and delete leaks those blobs, and markers
+  unswept for 7 days are dropped with their blobs leaked. A re-deposit of
+  the same id clears its stale marker (ids are content-addressed).
 
 Caps tracked from `cmail_entries`: count ≤ 1000 (429), summed size ≤ 256 MiB
 (413). Nonces: ≤ 8 unexpired per fp (429), TTL 5 min, expired rows swept on
@@ -70,11 +91,24 @@ every touch.
 
 - On first deposit in a mailbox: `set_alarm(now + retention)`, refreshed on
   later deposits (no earlier than the existing alarm — shortest wait wins).
-- Alarm handler: delete expired entries (received_unix + retention ≤ now) +
-  their R2 objects; prune the mailbox entirely (meta included) when empty;
-  clear the alarm when nothing remains. Retention comes from a Worker env
-  var `CMAIL_RETENTION_DAYS` (default **7**) read at boot and passed to the
-  DO with each request (env vars aren't visible inside DOs directly).
+- Alarm API, as implemented: worker 0.8's `set_alarm` takes a
+  millisecond **offset from now**, not an absolute epoch timestamp — an
+  absolute value schedules ~57,000 years out (caught live by the retention
+  conformance run). The DO converts absolute→offset
+  (`set_alarm(at_ms − now_ms)`), while `get_alarm` answers in absolute
+  epoch ms, so the shortest-wins comparisons run in absolute terms; a
+  negative (overdue) offset fires immediately per the `setAlarm` contract.
+- Alarm handler: delete expired entries (received_unix + retention ≤ now),
+  recording each id as a `cmail_orphans` marker — the DO cannot R2-delete,
+  so the blob is the Worker's claim-sweep to reap (§3); sweep expired
+  nonces and TTL stale markers; then reschedule to the next entry expiry,
+  or the marker TTL when only markers remain, or prune the mailbox
+  entirely (meta included) when the sweep itself emptied it and every
+  marker has been claimed (a mailbox emptied by acks keeps its meta —
+  relayd parity). Retention comes from a Worker env var
+  `CMAIL_RETENTION_DAYS` (default **7**) read per request and handed to the
+  DO with each deposit, which persists it for its alarm (env vars aren't
+  visible inside DOs directly, and `alarm()` carries no request).
 
 ## 5. Wire conformance (no deviations permitted)
 
@@ -87,6 +121,11 @@ Route table, status codes, and bodies exactly as spec'd in
 256 MiB); 429 count (1000 entries, 8 nonces). Body-limit notes: Workers'
 100 MB request cap accommodates the 64 MiB precheck; reads are bounded by the
 precheck (Content-Length absent/chunked → bounded buffered read + reject).
+Memory note: deposit holds a parcel in memory twice — the raw body `Vec`
+plus the parsed b64 strings — so a maximal valid parcel (~48 MiB encoded /
+36 MiB decoded) peaks near ~96 MiB inside the 128 MB Workers isolate (an
+over-cap body is likewise read whole, up to 64 MiB, before rejection). Fine
+at today's caps; don't raise them casually.
 
 Implementation notes:
 - `fingerprint_of(pubkey) == {fp}` verified at deposit (400) — same
