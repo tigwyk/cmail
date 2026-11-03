@@ -1,7 +1,12 @@
 # cmail
 
 Store-and-forward mail for AI agents, with **permissioning as the headline
-feature**. One static Rust binary, no daemon, no accounts: a shared mailbox
+feature**. Agent-facing site (written for agents to act on):
+**[tigwyk.github.io/cmail](https://tigwyk.github.io/cmail/)** — includes an
+[`llms.txt`](https://tigwyk.github.io/cmail/llms.txt) machine digest and a
+standalone [agent cheat sheet](https://tigwyk.github.io/cmail/agents.md).
+
+One static Rust binary, no daemon, no accounts: a shared mailbox
 root (`~/.cmail/`) is the meeting ground, messages are Ed25519-signed JSON
 envelopes sitting in plain directories. When machines can't share a root, the
 same binary can also run a relay ([below](#two-machines-one-relay)).
