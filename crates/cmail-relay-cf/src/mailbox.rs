@@ -92,6 +92,11 @@ fn now_unix() -> i64 {
     (worker::Date::now().as_millis() / 1000) as i64
 }
 
+/// Wall-clock unix milliseconds inside the Workers runtime.
+fn now_unix_ms() -> i64 {
+    worker::Date::now().as_millis() as i64
+}
+
 /// `crypto.getRandomValues` via js_sys reflection — worker 0.8 exposes no
 /// typed binding (its web-sys features lack `Crypto`), and this crate adds no
 /// dependencies for it. Bounded well under the 65536-byte API limit.
@@ -289,7 +294,6 @@ impl DurableObject for Mailbox {
 
         let entries = self.count("cmail_entries")?;
         let orphans = self.count("cmail_orphans")?;
-        let storage = self.state.storage();
         if entries > 0 {
             // Shortest wait wins: next alarm at the oldest remaining expiry.
             let min_received = self
@@ -299,18 +303,16 @@ impl DurableObject for Mailbox {
                 .next()
                 .and_then(|r| r.m)
                 .unwrap_or(now);
-            storage
-                .set_alarm(
-                    min_received
-                        .saturating_add(retention_secs)
-                        .saturating_mul(1000),
-                )
-                .await?;
+            self.set_alarm_at(
+                min_received
+                    .saturating_add(retention_secs)
+                    .saturating_mul(1000),
+            )
+            .await?;
         } else if orphans > 0 {
             // Nothing left to expire; reap the marker TTL later (or get
             // pruned sooner when the Worker claims the last marker).
-            storage
-                .set_alarm(now.saturating_add(MARKER_TTL_SECS).saturating_mul(1000))
+            self.set_alarm_at(now.saturating_add(MARKER_TTL_SECS).saturating_mul(1000))
                 .await?;
         } else {
             self.prune_if_sweep_emptied().await?;
@@ -321,6 +323,18 @@ impl DurableObject for Mailbox {
 
 impl Mailbox {
     // --- plumbing ---
+
+    /// Schedule the alarm at ABSOLUTE unix-ms `at_ms`. worker 0.8's
+    /// `Into<ScheduledTime> for i64` takes a millisecond OFFSET from now,
+    /// not an epoch timestamp (`schedule()` computes `Date(now + offset)` —
+    /// worker-0.8.7 durable.rs `From<i64> for ScheduledTime`); passing an
+    /// absolute value here scheduled retention ~57,000 years out, caught by
+    /// C5's retention conformance run. The offset form still targets the
+    /// absolute instant; a negative offset (overdue alarm) fires
+    /// immediately, per the `setAlarm` contract.
+    async fn set_alarm_at(&self, at_ms: i64) -> Result<()> {
+        self.state.storage().set_alarm(at_ms - now_unix_ms()).await
+    }
 
     fn query(&self, text: &str, binds: Vec<SqlStorageValue>) -> Result<SqlCursor> {
         self.state.storage().sql().exec(text, Some(binds))
@@ -414,11 +428,14 @@ impl Mailbox {
             }
             PruneDecision::RetryNonces => {
                 // Shortest-wins, like the deposit path: never push out an
-                // earlier alarm, only pull the retry in.
+                // earlier alarm, only pull the retry in. (`get_alarm` returns
+                // ABSOLUTE epoch ms, so the comparison is against the
+                // absolute retry instant; the scheduling itself goes through
+                // the offset-taking helper.)
                 let retry_ms = now.saturating_add(PRUNE_RETRY_SECS).saturating_mul(1000);
                 match storage.get_alarm().await? {
                     Some(existing) if existing <= retry_ms => {}
-                    _ => storage.set_alarm(retry_ms).await?,
+                    _ => self.set_alarm_at(retry_ms).await?,
                 }
             }
             PruneDecision::Leave => {}
@@ -497,16 +514,17 @@ impl Mailbox {
         // the same serialized accept path.
         self.query("DELETE FROM cmail_orphans WHERE id = ?", vec![b.id.into()])?;
 
-        // Shortest wait wins (spec §4): only pull the alarm in.
+        // Shortest wait wins (spec §4): only pull the alarm in. `get_alarm`
+        // answers in ABSOLUTE epoch ms; scheduling goes through the
+        // offset-taking helper (see `set_alarm_at`).
         let retention_secs = (b.retention_days as i64).saturating_mul(DAY_SECS);
         let candidate_ms = b
             .received_unix
             .saturating_add(retention_secs)
             .saturating_mul(1000);
-        let storage = self.state.storage();
-        match storage.get_alarm().await? {
+        match self.state.storage().get_alarm().await? {
             Some(existing) if existing <= candidate_ms => {}
-            _ => storage.set_alarm(candidate_ms).await?,
+            _ => self.set_alarm_at(candidate_ms).await?,
         }
         Ok(json_response(200, json!({ "ok": true })))
     }
