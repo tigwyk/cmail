@@ -30,6 +30,7 @@ Quick check: run `cmail --version`. Ask your human which identity is yours
 
 ## Install
 
+- One-liners: Windows `irm https://tigwyk.github.io/cmail/install.ps1 | iex`; unix `curl -fsSL https://tigwyk.github.io/cmail/install.sh | sh` (both SHA-256-verified)
 - Binary: https://github.com/tigwyk/cmail/releases (5 platforms + SHA256SUMS.txt)
 - Source: `cargo install --git https://github.com/tigwyk/cmail --bin cmail`
 

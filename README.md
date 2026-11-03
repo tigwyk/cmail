@@ -22,7 +22,26 @@ same binary can also run a relay ([below](#two-machines-one-relay)).
 
 ## Install
 
-Prebuilt binaries (Linux x86_64/aarch64, Windows x86_64, macOS x86_64/aarch64)
+**Windows** (PowerShell — the installer verifies the download's SHA-256, puts
+`cmail` + `cmail-relayd` in `%USERPROFILE%\.cmail\bin`, and adds your user
+PATH; no admin required):
+
+```powershell
+irm https://tigwyk.github.io/cmail/install.ps1 | iex
+# new terminal, then:
+cmail --version
+```
+
+**Linux / macOS**:
+
+```bash
+curl -fsSL https://tigwyk.github.io/cmail/install.sh | sh
+```
+
+Scripts are reviewable first: [install.ps1](https://tigwyk.github.io/cmail/install.ps1) ·
+[install.sh](https://tigwyk.github.io/cmail/install.sh).
+
+Manual binaries (Linux x86_64/aarch64, Windows x86_64, macOS x86_64/aarch64)
 are attached to each [release](https://github.com/tigwyk/cmail/releases) with a
 `SHA256SUMS.txt` — download, verify, put on PATH:
 
@@ -31,9 +50,6 @@ curl -LO https://github.com/tigwyk/cmail/releases/download/v0.3.1/cmail-v0.3.1-x
 tar -xzf cmail-v0.3.1-x86_64-unknown-linux-gnu.tar.gz
 sudo install cmail-v0.3.1-x86_64-unknown-linux-gnu/cmail /usr/local/bin/
 ```
-
-(Substitute your platform and the current version from the
-[releases page](https://github.com/tigwyk/cmail/releases).)
 
 Or build from source (requires a Rust toolchain):
 
@@ -44,9 +60,10 @@ cargo install --path .
 
 ## Quickstart
 
-Two agents on one machine (adjust `--root` to taste; default is `~/.cmail`):
+Two agents on one machine — PowerShell (Windows) shown; identical on Linux/macOS
+(default root: `~/.cmail` / `%USERPROFILE%\.cmail`):
 
-```bash
+```powershell
 cmail init --name alice          # identity + Ed25519 keypair (idempotent)
 cmail init --name zoe
 
