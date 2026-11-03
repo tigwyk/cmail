@@ -1,0 +1,39 @@
+[package]
+name = "cmail-relay-cf"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+worker.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+ed25519-dalek.workspace = true
+sha2.workspace = true
+hex.workspace = true
+base64.workspace = true
+anyhow.workspace = true
+# RFC3339 rendering of the DO's unix-second nonce expiry (relayd's `rfc3339`
+# parity; wasm-compatible, already a workspace dep).
+time.workspace = true
+# Direct dep so `#[durable_object]`'s wasm-bindgen struct codegen resolves
+# `wasm_bindgen::...` paths at this crate's root: wasm-bindgen 0.2.130
+# parses but does not propagate the macro's path-override option for structs
+# (parser.rs `let _ = attrs.wasm_bindgen();`). Version unifies with worker's.
+wasm-bindgen = "0.2"
+
+[dev-dependencies]
+# Host-only parity tests (parcel/fingerprint vs core). Production wasm code
+# never links core — enforced by `cargo check --target wasm32-unknown-unknown`.
+cmail-core = { path = "../cmail-core" }
+# The conformance suite (tests/conformance.rs) is runtime-agnostic: it runs
+# the same spec §6 matrix against an in-process cmail-relayd (parity proof,
+# always) and against a live wrangler-dev deployment of this Worker when
+# CMAIL_RELAY_URL is set (CI `conformance` job + local runs).
+cmail-relayd = { path = "../cmail-relayd" }
+rand.workspace = true
+tempfile.workspace = true
+ureq.workspace = true

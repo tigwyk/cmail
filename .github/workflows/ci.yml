@@ -28,3 +28,92 @@ jobs:
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: Tests
         run: cargo test --workspace
+
+  # Runtime-agnostic conformance suite (spec §6): the same matrix runs
+  # against an in-process cmail-relayd (always) and against this Worker
+  # served by `wrangler dev` (CMAIL_RELAY_URL). The dry-run deploy is the
+  # job's first validation step; the Worker serves on 127.0.0.1:8787 with
+  # the default retention (7) that the non-ignored matrix assumes. A second
+  # phase serves 127.0.0.1:8788 with retention 0 for the ignored matrix
+  # (DO alarm sweep).
+  conformance:
+    name: Conformance (wrangler dev + relayd)
+    runs-on: ubuntu-latest
+    needs: test
+    timeout-minutes: 30
+    env:
+      WRANGLER_SEND_ANALYTICS: "false"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          # worker-build compiles the Worker for wasm32 in the dry-run step
+          # and when wrangler dev builds.
+          targets: wasm32-unknown-unknown
+      - uses: Swatinem/rust-cache@v2
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: Cache npx (wrangler)
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm/_npx
+          key: wrangler-${{ runner.os }}-4.156.2
+      - name: Wrangler version
+        run: npx wrangler@4.156.2 --version
+      - name: Worker dry-run deploy (validation)
+        working-directory: crates/cmail-relay-cf
+        run: npx wrangler@4.156.2 deploy --dry-run --outdir=dist
+      - name: Start wrangler dev
+        working-directory: crates/cmail-relay-cf
+        run: |
+          nohup npx wrangler@4.156.2 dev --port 8787 > wrangler-dev.log 2>&1 &
+          echo $! > wrangler-dev.pid
+      - name: Wait for the dev server
+        run: |
+          for i in $(seq 1 90); do
+            if curl -s -o /dev/null http://127.0.0.1:8787/challenge/0000000000000000; then
+              echo "wrangler dev is up after ~$((i*2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::wrangler dev did not come up"
+          cat crates/cmail-relay-cf/wrangler-dev.log
+          exit 1
+      - name: Conformance suite (cf via wrangler dev, relayd in-process)
+        env:
+          CMAIL_RELAY_URL: http://127.0.0.1:8787
+        run: cargo test -p cmail-relay-cf --test conformance -- --test-threads=1
+      # Retention-0 phase: a second dev server with retention 0 exercises
+      # the ignored matrix's cf side (DO alarm sweep; ~120 s poll, see the
+      # test's doc comment).
+      - name: Start wrangler dev (retention 0)
+        working-directory: crates/cmail-relay-cf
+        run: |
+          nohup npx wrangler@4.156.2 dev --port 8788 --var CMAIL_RETENTION_DAYS:0 > wrangler-dev-retention.log 2>&1 &
+          echo $! > wrangler-dev-retention.pid
+      - name: Wait for the retention-0 dev server
+        run: |
+          for i in $(seq 1 90); do
+            if curl -s -o /dev/null http://127.0.0.1:8788/challenge/0000000000000000; then
+              echo "wrangler dev (retention 0) is up after ~$((i*2))s"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "::error::wrangler dev (retention 0) did not come up"
+          cat crates/cmail-relay-cf/wrangler-dev-retention.log
+          exit 1
+      - name: Conformance suite (retention 0, ignored tests)
+        env:
+          CMAIL_RELAY_URL: http://127.0.0.1:8788
+          CMAIL_RELAY_RETENTION_DAYS: "0"
+        run: cargo test -p cmail-relay-cf --test conformance -- --ignored --test-threads=1
+      - name: Stop wrangler dev
+        if: always()
+        working-directory: crates/cmail-relay-cf
+        run: |
+          kill "$(cat wrangler-dev.pid)" 2>/dev/null || true
+          kill "$(cat wrangler-dev-retention.pid)" 2>/dev/null || true
+          pkill -f workerd 2>/dev/null || true

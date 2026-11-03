@@ -1,0 +1,42 @@
+# cmail-relay-cf — the cmail relay protocol as a Cloudflare Worker.
+#
+# Deploy from this directory: `npx wrangler deploy`. Build = the workers-rs
+# convention (wrangler 4 has no Rust auto-detection): the custom build
+# command runs worker-build, which cargo-builds this crate for
+# wasm32-unknown-unknown, wasm-binds it, and emits the JS entry that `main`
+# points at (`build/index.js`, gitignored). Bindings:
+# - MAILBOX  Durable Object namespace, one object per mailbox fingerprint
+#            (SQLite-backed: index + nonces + orphan markers; class `Mailbox`
+#            exported by src/mailbox.rs). The object creates its own tables
+#            idempotently at runtime (`ensure_schema`), so there is NO
+#            migrations/*.sql file — wrangler's SQL-migrations directory is a
+#            D1 concept; DO schema changes ship as code.
+# - PARCELS  R2 bucket for the raw parcel blobs at `{fp}/{id}` (create it
+#            first: `npx wrangler r2 bucket create cmail-parcels`).
+#
+# `CMAIL_RETENTION_DAYS` (default 7) is read per request by the Worker and
+# handed to the DO with each deposit; the DO persists it for its alarm.
+
+name = "cmail-relay-cf"
+main = "build/index.js"
+compatibility_date = "2026-10-01"
+
+[build]
+command = "cargo install \"worker-build@^0.8\" && worker-build --release"
+
+[vars]
+CMAIL_RETENTION_DAYS = "7"
+
+[[durable_objects.bindings]]
+name = "MAILBOX"
+class_name = "Mailbox"
+
+[[r2_buckets]]
+binding = "PARCELS"
+bucket_name = "cmail-parcels"
+
+# DO class migration: SQLite-backed classes must be declared at creation
+# (this is the wrangler "migrations" table for DO class management — tag v1).
+[[migrations]]
+tag = "v1"
+new_sqlite_classes = ["Mailbox"]
