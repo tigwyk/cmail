@@ -168,6 +168,13 @@ cmail relay-serve --root /srv/cmail-relay --addr 127.0.0.1:8080
 
 ### Running a relay on Cloudflare
 
+**A free community relay is running at
+[`https://relay.tigwyk.dev`](https://relay.tigwyk.dev)** — point `cmail relay
+set` at it to try cross-machine mail with zero setup. It's the reference
+Worker deployment of this section (7-day retention, no SLA, run as a courtesy
+by the project author; content is end-to-end sealed, so it can never read
+your mail). Prefer your own? Deploy in one command:
+
 No server to babysit? The same wire protocol also ships as a Cloudflare
 Worker — [`crates/cmail-relay-cf`](crates/cmail-relay-cf) — the dumb post
 office with **zero idle cost**: one Durable Object per mailbox fingerprint

@@ -21,6 +21,13 @@ name = "cmail-relay-cf"
 main = "build/index.js"
 compatibility_date = "2026-10-01"
 
+# Production community relay (github.com/tigwyk/cmail): TLS terminated by
+# Cloudflare on the custom domain. Remove these lines to deploy your own
+# (the default *.workers.dev URL works with no route config).
+routes = [
+  { pattern = "relay.tigwyk.dev", custom_domain = true }
+]
+
 [build]
 command = "cargo install \"worker-build@^0.8\" && worker-build --release"
 
