@@ -795,16 +795,31 @@ fn init_fails_on_collision_and_reuse_is_explicit() {
 }
 
 #[test]
-fn authority_status_reports_no_backend() {
+fn authority_status_reports_backend_and_assurance() {
     let root = TempDir::new().unwrap();
     let out = json_out(cmail(&root).arg("--json").arg("authority").arg("status"));
-    assert_eq!(out["available"], false);
-    assert_eq!(out["backend"], "none");
-    assert_eq!(out["assurance"], "none");
-    assert!(out["fingerprint"].is_null());
-    assert!(out["last_grant"].is_null());
+    #[cfg(target_os = "macos")]
+    {
+        // Presence is never requested by status; a developer keychain may or
+        // may not already hold the authority item.
+        assert_eq!(out["backend"], "macos-keychain");
+        assert!(
+            out["assurance"] == "none" || out["assurance"] == "moderate",
+            "unexpected assurance: {}",
+            out["assurance"]
+        );
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        assert_eq!(out["available"], false);
+        assert_eq!(out["backend"], "none");
+        assert_eq!(out["assurance"], "none");
+        assert!(out["fingerprint"].is_null());
+        assert!(out["last_grant"].is_null());
+    }
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn authority_adopt_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();
@@ -822,6 +837,7 @@ fn authority_adopt_fails_closed_without_backend() {
     assert!(message.contains("authority unavailable"), "{message}");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn authority_init_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();
