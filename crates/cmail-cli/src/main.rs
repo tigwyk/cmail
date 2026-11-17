@@ -167,6 +167,9 @@ pub enum AuthorityCommand {
     Adopt,
     /// Report authority fingerprint, backend, and assurance
     Status,
+    /// Recover from a lost key: discard all signed policy and create a fresh
+    /// authority key (requires human presence)
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -301,6 +304,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
             AuthorityCommand::Init => commands::authority::init(cli),
             AuthorityCommand::Adopt => commands::authority::adopt(cli),
             AuthorityCommand::Status => commands::authority::status(cli),
+            AuthorityCommand::Reset => commands::authority::reset(cli),
         },
         Commands::Send {
             to,

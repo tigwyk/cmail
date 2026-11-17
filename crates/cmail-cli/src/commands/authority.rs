@@ -88,8 +88,8 @@ fn print_plan(plan: &AdoptionPlan) {
     }
 }
 
-fn confirm() -> Result<bool> {
-    eprint!("sign these records? [y/N] ");
+fn confirm(question: &str) -> Result<bool> {
+    eprint!("{question} [y/N] ");
     io::stderr().flush()?;
     let mut line = String::new();
     io::stdin().read_line(&mut line)?;
@@ -106,7 +106,7 @@ pub fn adopt(cli: &Cli) -> Result<()> {
     if !cli.json {
         print_plan(&plan);
     }
-    let confirmed = plan.pending.is_empty() || confirm()?;
+    let confirmed = plan.pending.is_empty() || confirm("sign these records?")?;
     let outcome = c.sign_adoption(authority, plan, confirmed)?;
     if cli.json {
         output::print_json(&outcome);
@@ -125,6 +125,31 @@ pub fn status(cli: &Cli) -> Result<()> {
     if cli.json {
         output::print_json(&status);
     } else {
+        print_status(&status);
+    }
+    Ok(())
+}
+
+pub fn reset(cli: &Cli) -> Result<()> {
+    let c = Cmail::open(&cli.root_path()?)?;
+    // Irreversible: say so before asking, on every output mode.
+    eprintln!(
+        "Back up the mailbox root now: reset deletes the authority log (every signed decision) \
+         and replaces the authority key. Old records are never trusted again."
+    );
+    if !confirm("reset the authority key and delete every signed decision?")? {
+        if cli.json {
+            output::print_json(&serde_json::json!({ "outcome": "declined" }));
+        } else {
+            println!("declined; nothing written");
+        }
+        return Ok(());
+    }
+    let status = c.reset_authority(authority(cli))?;
+    if cli.json {
+        output::print_json(&status);
+    } else {
+        println!("authority reset; previous signed decisions are gone");
         print_status(&status);
     }
     Ok(())

@@ -162,6 +162,23 @@ pub(super) fn load_policy(
     Ok(fold_records(&records, &key))
 }
 
+/// Presence-gated recovery: replace the backend's key material and pinned
+/// head, then delete the stale root-scoped log. The backend call runs first
+/// and owns the presence prompt, so a denial leaves the log untouched. Old
+/// records can never be trusted afterwards: the new key does not verify them.
+pub(super) fn reset(authority: &(impl Authority + ?Sized), root: &Path) -> Result<()> {
+    authority.reset_credentials()?;
+    // Serialize with appends so a concurrent sign cannot recreate the chain
+    // between the credential reset and this deletion.
+    std::fs::create_dir_all(root)?;
+    let _lock = LockFile::acquire(root)?;
+    match std::fs::remove_file(log_path(root)) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
 /// Sign one decision and append it durably under the root lock. Presence is
 /// the backend's gate inside `sign_bytes`; record bytes only exist once the
 /// chain position is known, so the lock is held across the prompt.
@@ -518,5 +535,70 @@ mod tests {
                 .len(),
             8
         );
+    }
+
+    #[test]
+    fn reset_requires_presence_and_denial_writes_nothing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let authority = authority();
+        sign(&authority, root.path(), "alice");
+        sign(&authority, root.path(), "bob");
+        let log = std::fs::read(log_path(root.path())).unwrap();
+        let pinned = authority.pinned_head().unwrap();
+        let fingerprint = authority.status().unwrap().fingerprint;
+
+        authority.deny_presence();
+        let err = crate::service::Cmail::open(root.path())
+            .unwrap()
+            .reset_authority(&authority)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert_eq!(std::fs::read(log_path(root.path())).unwrap(), log);
+        assert_eq!(authority.pinned_head().unwrap(), pinned);
+        assert_eq!(authority.status().unwrap().fingerprint, fingerprint);
+    }
+
+    #[test]
+    fn reset_clears_the_chain_and_a_new_process_loads_empty_policy() {
+        let root = tempfile::TempDir::new().unwrap();
+        let first = authority();
+        let previous = first.signing_key().unwrap();
+        sign(&first, root.path(), "alice");
+        sign(&first, root.path(), "bob");
+        let stale = std::fs::read(log_path(root.path())).unwrap();
+
+        let status = crate::service::Cmail::open(root.path())
+            .unwrap()
+            .reset_authority(&first)
+            .unwrap();
+        assert!(status.available);
+        assert!(first.pinned_head().unwrap().is_none());
+        assert!(!log_path(root.path()).exists());
+        let fresh = first.signing_key().unwrap();
+        assert_ne!(fresh.verifying_key(), previous.verifying_key());
+
+        // A new process holding only the fresh key sees an empty policy.
+        let second = InMemoryAuthority::with_signing_key(fresh);
+        assert!(second
+            .load_effective_policy(root.path())
+            .unwrap()
+            .decisions
+            .is_empty());
+
+        // Records signed by the previous key are never trusted again.
+        std::fs::write(log_path(root.path()), &stale).unwrap();
+        let err = second.load_effective_policy(root.path()).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err}");
+        assert!(err.to_string().contains("does not verify"), "{err}");
+    }
+
+    #[test]
+    fn reset_without_a_backend_writes_nothing() {
+        let root = tempfile::TempDir::new().unwrap();
+        let err = crate::authority::UnavailableAuthority
+            .reset(root.path())
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        assert!(!log_path(root.path()).exists());
     }
 }
