@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test-only in-memory signer; never enabled by release builds or the CLI.
+test-authority = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true

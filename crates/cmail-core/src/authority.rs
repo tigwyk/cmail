@@ -5,15 +5,19 @@
 
 use crate::canonical::canonical_json;
 use crate::error::{CoreError, Result};
-use crate::identity::{fingerprint_of, now_rfc3339};
+use crate::identity::fingerprint_of;
+#[cfg(any(test, feature = "test-authority"))]
+use crate::identity::now_rfc3339;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+#[cfg(any(test, feature = "test-authority"))]
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+#[cfg(any(test, feature = "test-authority"))]
 use std::sync::{Mutex, MutexGuard};
 
 /// Canonical authority-record format version. Records with any other version
@@ -213,6 +217,7 @@ pub trait Authority {
     fn load_effective_policy(&self) -> Result<EffectivePolicy>;
 }
 
+#[cfg(any(test, feature = "test-authority"))]
 struct MemoryState {
     signing: Option<SigningKey>,
     records: Vec<AuthorityRecord>,
@@ -221,10 +226,12 @@ struct MemoryState {
 
 /// Test-only backend: an in-memory key and record log with no presence check
 /// (advisory assurance). Never selected by the CLI.
+#[cfg(any(test, feature = "test-authority"))]
 pub struct InMemoryAuthority {
     state: Mutex<MemoryState>,
 }
 
+#[cfg(any(test, feature = "test-authority"))]
 impl InMemoryAuthority {
     pub fn new() -> Self {
         Self {
@@ -243,12 +250,14 @@ impl InMemoryAuthority {
     }
 }
 
+#[cfg(any(test, feature = "test-authority"))]
 impl Default for InMemoryAuthority {
     fn default() -> Self {
         Self::new()
     }
 }
 
+#[cfg(any(test, feature = "test-authority"))]
 impl Authority for InMemoryAuthority {
     fn status(&self) -> Result<AuthorityStatus> {
         let state = self.state()?;
