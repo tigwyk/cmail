@@ -1040,7 +1040,7 @@ impl Cmail {
         let identity = load_identity(&self.root, &me)?;
         // Load fresh through the seam: relay set/clear may have happened after
         // this handle was opened (long-lived MCP process), mirroring relay_set.
-        let raw_url = self.policy()?.relay_url().ok_or_else(|| {
+        let raw_url = self.policy()?.relay_url()?.ok_or_else(|| {
             CoreError::Config("no relay configured; run: cmail relay set <url>".into())
         })?;
         let base = normalize_base(&raw_url)?;
@@ -1383,7 +1383,7 @@ impl Cmail {
     /// The effective pickup relay url, if any. Signed-only: a hand-edited
     /// `[relay] url` in config never becomes the fetch target.
     pub fn relay_url(&self) -> Result<Option<String>> {
-        Ok(self.policy()?.relay_url())
+        self.policy()?.relay_url()
     }
 
     /// Sign a relay decision (spec §3.3). Root-wide: every identity on this
@@ -1416,7 +1416,7 @@ impl Cmail {
     /// The effective signed outbound mode. No signed record means `gated`;
     /// config never opens the gate.
     pub fn outbound_mode(&self) -> Result<OutboundMode> {
-        Ok(self.policy()?.outbound_mode().unwrap_or_default())
+        Ok(self.policy()?.outbound_mode()?.unwrap_or_default())
     }
 
     /// The effective signed inbound mode. No signed record means `permissive`;
