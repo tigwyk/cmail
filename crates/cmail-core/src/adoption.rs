@@ -221,7 +221,11 @@ mod tests {
         legacy.add("alice", &alice.public_key_b64()).unwrap();
         legacy.save(root.path()).unwrap();
         c.allow_add("zoe").unwrap();
-        c.relay_set(Some("https://relay.example.com")).unwrap();
+        // A pre-enforcement install hand-edited its relay in config; that
+        // legacy value is what adoption blesses.
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.relay.url = Some("https://relay.example.com".into());
+        cfg.save(root.path()).unwrap();
         (root, c)
     }
 

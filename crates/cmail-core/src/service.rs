@@ -1,7 +1,7 @@
 use crate::adoption::{self, AdoptionOutcome, AdoptionPlan, LegacyApproval};
 use crate::audit::{append, AuditEvent, AuditRecord};
 use crate::authority::{Authority, AuthorityAction, AuthorityStatus};
-use crate::config::{Config, InboundMode};
+use crate::config::{Config, InboundMode, OutboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
 use crate::error::{CoreError, Result};
@@ -709,10 +709,9 @@ impl Cmail {
         let me = self.resolve_identity(as_name)?;
         self.store.ensure_mailbox(&me)?;
         let policy = self.policy()?;
-        // Policy is read fresh through the seam: a human may have flipped the
-        // inbound mode since this handle was opened (long-lived MCP process),
-        // mirroring send()'s gate.
-        let inbound = policy.inbound();
+        // Policy is read fresh through the seam: the signed inbound mode is
+        // the only gate switch (config edits never move it), mirroring send().
+        let inbound = policy.inbound_mode();
         let inbox = self.store.inbox_dir(&me);
         let quarantine = self.store.quarantine_dir(&me);
         let mut items = Vec::new();
@@ -1296,19 +1295,27 @@ impl Cmail {
         Ok(())
     }
 
-    /// The configured pickup relay url, if any (config-only read).
+    /// The effective pickup relay url, if any. Signed-only: a hand-edited
+    /// `[relay] url` in config never becomes the fetch target.
     pub fn relay_url(&self) -> Result<Option<String>> {
         Ok(self.policy()?.relay_url())
     }
 
-    /// Set (`Some`) or clear (`None`) the pickup relay url (spec §3.3).
-    /// Human-only config decision: audited as `relay_set`.
+    /// Sign a relay decision (spec §3.3). Root-wide: every identity on this
+    /// root shares the pickup relay. `None` signs a clear; an unavailable or
+    /// denied authority writes no record and returns the typed refusal.
     pub fn relay_set(&self, url: Option<&str>) -> Result<()> {
-        // Load fresh: other config edits may have landed after this handle was
-        // opened (long-lived MCP process), mirroring allow_add.
-        let mut cfg = Config::load_or_init(&self.root)?;
-        cfg.relay.url = url.map(str::to_string);
-        cfg.save(&self.root)?;
+        let url = url.filter(|url| !url.is_empty());
+        let (action, payload) = match url {
+            Some(url) => (AuthorityAction::RelaySet, serde_json::json!({ "url": url })),
+            None => (AuthorityAction::RelayClear, serde_json::json!({})),
+        };
+        self.authority.sign_action(
+            &self.root,
+            action,
+            crate::authority::subject::RELAY,
+            &payload,
+        )?;
         let mut rec = AuditRecord::now(AuditEvent::RelaySet, "human").outcome(if url.is_some() {
             "set"
         } else {
@@ -1318,6 +1325,61 @@ impl Cmail {
             rec = rec.detail(u);
         }
         append(&self.root, &rec)?;
+        Ok(())
+    }
+
+    /// The effective signed outbound mode. No signed record means `gated`;
+    /// config never opens the gate.
+    pub fn outbound_mode(&self) -> Result<OutboundMode> {
+        Ok(self.policy()?.outbound_mode().unwrap_or_default())
+    }
+
+    /// The effective signed inbound mode. No signed record means `permissive`;
+    /// a tampered log or an unparseable signed payload fails closed to
+    /// `known-only`. Config never moves the gate.
+    pub fn inbound_mode(&self) -> Result<InboundMode> {
+        Ok(self.policy()?.inbound_mode())
+    }
+
+    /// Sign an outbound-mode decision. Root-wide: every identity on this root
+    /// shares the gate mode.
+    pub fn set_outbound_mode(&self, mode: OutboundMode) -> Result<()> {
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::OutboundMode,
+            crate::authority::subject::OUTBOUND_MODE,
+            &serde_json::json!({ "mode": mode }),
+        )?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::ModeSet, "human")
+                .counterpart("outbound")
+                .outcome(match mode {
+                    OutboundMode::Open => "open",
+                    OutboundMode::Gated => "gated",
+                }),
+        )?;
+        Ok(())
+    }
+
+    /// Sign an inbound-mode decision. Root-wide: every identity on this root
+    /// shares the gate mode.
+    pub fn set_inbound_mode(&self, mode: InboundMode) -> Result<()> {
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::InboundMode,
+            crate::authority::subject::INBOUND_MODE,
+            &serde_json::json!({ "mode": mode }),
+        )?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::ModeSet, "human")
+                .counterpart("inbound")
+                .outcome(match mode {
+                    InboundMode::Permissive => "permissive",
+                    InboundMode::KnownOnly => "known-only",
+                }),
+        )?;
         Ok(())
     }
 
@@ -1361,7 +1423,7 @@ fn fs_ensure_root(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OutboundMode;
+    use crate::config::{InboundMode, OutboundMode};
     use crate::envelope::{build_and_sign, NewEnvelope};
     use crate::error::CoreError;
     use tempfile::TempDir;
@@ -1584,10 +1646,7 @@ mod tests {
         let c2 = open(root2.path()).unwrap();
         c2.init("a", false).unwrap();
         c2.init("b", false).unwrap();
-        let mut cfg = c2.config.clone();
-        cfg.outbound = OutboundMode::Open;
-        cfg.save(&c2.root).unwrap();
-        let c2 = open(root2.path()).unwrap();
+        c2.set_outbound_mode(OutboundMode::Open).unwrap();
         assert!(matches!(
             c2.send(Some("a"), "b", "note", "s", "b", &[], None)
                 .unwrap(),
@@ -2065,7 +2124,7 @@ mod tests {
 
     #[test]
     fn strict_mode_quarantines_unknown_senders() {
-        let (root, c) = svc();
+        let (_root, c) = svc();
         // deliver one untrusted message (alice -> zoe, allowlisted for the test)
         c.allow_add("zoe").unwrap();
         let id = match c
@@ -2075,23 +2134,20 @@ mod tests {
             SendOutcome::Sent { id } => id,
             _ => panic!(),
         };
-        // flip to strict mode on disk; inbox() must quarantine the untrusted mail
-        let mut cfg = c.config.clone();
-        cfg.inbound = crate::config::InboundMode::KnownOnly;
-        cfg.save(root.path()).unwrap();
+        // sign strict mode; inbox() must quarantine the untrusted mail
+        c.set_inbound_mode(crate::config::InboundMode::KnownOnly)
+            .unwrap();
         assert!(c.inbox(Some("zoe")).unwrap().is_empty());
         assert_eq!(
             c.store.list_ids(&c.store.quarantine_dir("zoe")),
             vec![id.clone()]
         );
-        // back to permissive on a fresh handle: released-by-config, but still untrusted
-        let mut cfg = c.config.clone();
-        cfg.inbound = crate::config::InboundMode::Permissive;
-        cfg.save(root.path()).unwrap();
-        let c2 = open(root.path()).unwrap();
-        assert_eq!(c2.inbox(Some("zoe")).unwrap().len(), 0); // still in quarantine, not re-listed
-        c2.quarantine_release(&id).unwrap();
-        let msg = c2.read_message(Some("zoe"), &id).unwrap();
+        // signed permissive on a fresh process: still untrusted, still quarantined
+        c.set_inbound_mode(crate::config::InboundMode::Permissive)
+            .unwrap();
+        assert_eq!(c.inbox(Some("zoe")).unwrap().len(), 0); // still in quarantine, not re-listed
+        c.quarantine_release(&id).unwrap();
+        let msg = c.read_message(Some("zoe"), &id).unwrap();
         assert_eq!(msg.trust, "untrusted");
         assert!(msg.body.contains("UNTRUSTED MAIL BODY"));
     }
@@ -2416,17 +2472,18 @@ mod tests {
     #[test]
     fn relay_set_persists_and_audits() {
         let (_root, c) = svc();
-        assert_eq!(Config::load_or_init(&c.root).unwrap().relay_url(), None);
+        assert_eq!(c.relay_url().unwrap(), None);
         c.relay_set(Some("https://pickup.example.com")).unwrap();
         assert_eq!(
-            Config::load_or_init(&c.root)
-                .unwrap()
-                .relay_url()
-                .as_deref(),
+            c.relay_url().unwrap().as_deref(),
             Some("https://pickup.example.com")
         );
+        assert!(
+            Config::load_or_init(&c.root).unwrap().relay_url().is_none(),
+            "signed relay must not leak into config"
+        );
         c.relay_set(None).unwrap();
-        assert_eq!(Config::load_or_init(&c.root).unwrap().relay_url(), None);
+        assert_eq!(c.relay_url().unwrap(), None);
         let recs = c.audit_tail(10).unwrap();
         assert!(recs
             .iter()
@@ -2887,5 +2944,146 @@ mod tests {
         let inbox = fix.recipient.inbox(Some("zoe")).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].trust, "untrusted");
+    }
+
+    #[test]
+    fn signed_relay_latest_wins_and_clear_disables() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        assert_eq!(c.relay_url().unwrap(), None);
+
+        c.relay_set(Some("https://one.example.com")).unwrap();
+        assert_eq!(
+            c.relay_url().unwrap().as_deref(),
+            Some("https://one.example.com")
+        );
+        // A fresh "process" observes only the persisted signed record.
+        let c2 = open_with(root.path(), restarted_authority(&authority)).unwrap();
+        assert_eq!(
+            c2.relay_url().unwrap().as_deref(),
+            Some("https://one.example.com")
+        );
+
+        c2.relay_set(Some("https://two.example.com")).unwrap();
+        assert_eq!(
+            open_with(root.path(), restarted_authority(&authority))
+                .unwrap()
+                .relay_url()
+                .unwrap()
+                .as_deref(),
+            Some("https://two.example.com")
+        );
+
+        c2.relay_set(None).unwrap();
+        assert_eq!(
+            open_with(root.path(), restarted_authority(&authority))
+                .unwrap()
+                .relay_url()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn hand_edited_config_relay_is_ignored() {
+        let root = TempDir::new().unwrap();
+        let c = open(root.path()).unwrap();
+        c.relay_set(Some("https://signed.example.com")).unwrap();
+
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.relay.url = Some("https://evil.example.com".into());
+        cfg.save(root.path()).unwrap();
+        assert_eq!(
+            c.relay_url().unwrap().as_deref(),
+            Some("https://signed.example.com")
+        );
+
+        c.relay_set(None).unwrap();
+        cfg.save(root.path()).unwrap();
+        // A hand-edited URL after clear never becomes the pickup target.
+        assert_eq!(c.relay_url().unwrap(), None);
+    }
+
+    #[test]
+    fn signed_modes_latest_wins_and_gate_and_inbox_follow() {
+        let (_root, c) = svc();
+        c.init("mallory", false).unwrap();
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+        assert!(matches!(
+            c.send(Some("alice"), "mallory", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        c.set_outbound_mode(OutboundMode::Open).unwrap();
+        assert!(matches!(
+            c.send(Some("alice"), "mallory", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Sent { .. }
+        ));
+        c.set_outbound_mode(OutboundMode::Gated).unwrap();
+        assert!(matches!(
+            c.send(Some("alice"), "mallory", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        c.set_inbound_mode(InboundMode::KnownOnly).unwrap();
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+        c.set_inbound_mode(InboundMode::Permissive).unwrap();
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+    }
+
+    #[test]
+    fn hand_edited_config_modes_are_ignored() {
+        let root = TempDir::new().unwrap();
+        let c = open(root.path()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("bob", false).unwrap();
+
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.outbound = OutboundMode::Open;
+        cfg.inbound = InboundMode::KnownOnly;
+        cfg.save(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+        assert!(matches!(
+            c.send(Some("alice"), "bob", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        // A signed record is the only thing that moves either mode.
+        c.set_outbound_mode(OutboundMode::Open).unwrap();
+        c.set_inbound_mode(InboundMode::KnownOnly).unwrap();
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Open);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+    }
+
+    #[test]
+    fn unavailable_authority_fails_closed_for_relay_and_modes() {
+        let root = TempDir::new().unwrap();
+        let c = open_with(
+            root.path(),
+            std::sync::Arc::new(crate::authority::UnavailableAuthority),
+        )
+        .unwrap();
+
+        let err = c.relay_set(Some("https://evil.example.com")).unwrap_err();
+        assert!(
+            matches!(err, CoreError::AuthorityUnavailable(_)),
+            "relay set must fail closed, got {err:?}"
+        );
+        assert!(c.set_outbound_mode(OutboundMode::Open).is_err());
+        assert!(c.set_inbound_mode(InboundMode::Permissive).is_err());
+        assert!(!root.path().join("authority.log").exists());
+
+        // Gated reads default closed: no signed open mode, no signed allowlist.
+        assert_eq!(c.relay_url().unwrap(), None);
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
     }
 }

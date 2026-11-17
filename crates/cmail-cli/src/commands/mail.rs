@@ -59,7 +59,7 @@ pub fn send(
         }
         (None, None) => bail!("provide --body or --body-file"),
     };
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let out = c.send(
         cli.as_name.as_deref(),
         to,
@@ -74,7 +74,7 @@ pub fn send(
 }
 
 pub fn inbox(cli: &Cli) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let items = c.inbox(cli.as_name.as_deref())?;
     if cli.json {
         output::print_json(&items);
@@ -87,7 +87,7 @@ pub fn inbox(cli: &Cli) -> Result<()> {
 }
 
 pub fn read(cli: &Cli, id: &str) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let msg = c.read_message(cli.as_name.as_deref(), id)?;
     if cli.json {
         output::print_json(&msg);
@@ -98,7 +98,7 @@ pub fn read(cli: &Cli, id: &str) -> Result<()> {
 }
 
 pub fn reply(cli: &Cli, id: &str, body: Option<String>, subject: Option<String>) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let out = c.reply(
         cli.as_name.as_deref(),
         id,
@@ -110,7 +110,7 @@ pub fn reply(cli: &Cli, id: &str, body: Option<String>, subject: Option<String>)
 }
 
 pub fn wait(cli: &Cli, timeout_secs: u64) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let items = c.wait(cli.as_name.as_deref(), Duration::from_secs(timeout_secs))?;
     if cli.json {
         output::print_json(&items);
@@ -126,7 +126,7 @@ pub fn wait(cli: &Cli, timeout_secs: u64) -> Result<()> {
 /// shows up in `inbox` like any other — remote senders still go through the
 /// normal trust rules.
 pub fn fetch(cli: &Cli, wait: bool, timeout_secs: u64) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let report = c.fetch(
         cli.as_name.as_deref(),
         wait,
@@ -144,7 +144,7 @@ pub fn fetch(cli: &Cli, wait: bool, timeout_secs: u64) -> Result<()> {
 }
 
 pub fn list(cli: &Cli, all: bool) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = crate::commands::open(cli)?;
     let items = c.list(cli.as_name.as_deref(), all)?;
     if cli.json {
         output::print_json(&items);
