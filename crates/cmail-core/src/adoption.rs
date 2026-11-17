@@ -4,7 +4,7 @@
 //! here. Enforcement tickets consume the resulting signed records; this module
 //! does not change live policy reads.
 
-use crate::authority::{Authority, AuthorityAction, AuthorityRecord};
+use crate::authority::{subject, Authority, AuthorityAction, AuthorityRecord};
 use crate::config::Config;
 use crate::error::Result;
 use crate::identity::fingerprint_of;
@@ -13,11 +13,11 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::Path;
 
-/// Subject for a keyring grant. Records store only a payload digest, so the
-/// public key is carried in the subject; consumers recover the effective
-/// keyring from `name:public_key` pairs.
+/// Subject for a keyring grant: `key:<name>:<public-key>`. The public key is
+/// carried in the subject so consumers recover the effective keyring without
+/// trusting an unsigned cache.
 pub fn key_subject(name: &str, public_key: &str) -> String {
-    format!("{name}:{public_key}")
+    subject::key(name, public_key)
 }
 
 /// One legacy keyring entry, as shown to the human before signing.
@@ -165,7 +165,7 @@ fn proposals(legacy: &LegacySnapshot) -> Vec<AdoptionEntry> {
     for name in &legacy.allow {
         entries.push(AdoptionEntry {
             action: AuthorityAction::AllowAdd,
-            subject: name.clone(),
+            subject: subject::allow(name),
             payload: json!({ "name": name }),
             summary: format!("allow add {name}"),
         });
@@ -173,7 +173,7 @@ fn proposals(legacy: &LegacySnapshot) -> Vec<AdoptionEntry> {
     if let Some(url) = &legacy.relay_url {
         entries.push(AdoptionEntry {
             action: AuthorityAction::RelaySet,
-            subject: url.clone(),
+            subject: subject::RELAY.to_string(),
             payload: json!({ "url": url }),
             summary: format!("relay set {url}"),
         });
@@ -181,7 +181,7 @@ fn proposals(legacy: &LegacySnapshot) -> Vec<AdoptionEntry> {
     for approval in &legacy.approvals {
         entries.push(AdoptionEntry {
             action: AuthorityAction::Approve,
-            subject: approval.id.clone(),
+            subject: subject::approval(&approval.id),
             payload: json!({ "id": approval.id }),
             summary: format!(
                 "approve {} ({} -> {}: {})",
@@ -255,18 +255,18 @@ mod tests {
         assert!(plan
             .pending
             .iter()
-            .any(|e| e.action == AuthorityAction::AllowAdd && e.subject == "zoe"));
+            .any(|e| e.action == AuthorityAction::AllowAdd && e.subject == subject::allow("zoe")));
         assert!(plan.pending.iter().any(|e| {
             e.action == AuthorityAction::RelaySet
-                && e.subject == "https://relay.example.com"
+                && e.subject == subject::RELAY
+                && e.payload["url"] == "https://relay.example.com"
                 && e.summary.contains("https://relay.example.com")
         }));
         let held = c.approvals(None).unwrap();
         assert_eq!(held.len(), 1);
-        assert!(plan
-            .pending
-            .iter()
-            .any(|e| { e.action == AuthorityAction::Approve && e.subject == held[0].id }));
+        assert!(plan.pending.iter().any(|e| {
+            e.action == AuthorityAction::Approve && e.subject == subject::approval(&held[0].id)
+        }));
     }
 
     #[test]
@@ -310,14 +310,21 @@ mod tests {
             policy.decisions[&key_subject("alice", &key)].action,
             AuthorityAction::KeyAdd
         );
-        assert_eq!(policy.decisions["zoe"].action, AuthorityAction::AllowAdd);
         assert_eq!(
-            policy.decisions["https://relay.example.com"].action,
+            policy.decisions[&subject::allow("zoe")].action,
+            AuthorityAction::AllowAdd
+        );
+        assert_eq!(
+            policy.decisions[subject::RELAY].action,
             AuthorityAction::RelaySet
+        );
+        assert_eq!(
+            policy.decisions[subject::RELAY].payload.as_ref().unwrap()["url"],
+            "https://relay.example.com"
         );
         let held = c.approvals(None).unwrap();
         assert_eq!(
-            policy.decisions[&held[0].id].action,
+            policy.decisions[&subject::approval(&held[0].id)].action,
             AuthorityAction::Approve
         );
         assert!(authority.status().unwrap().last_grant.is_some());
@@ -362,7 +369,10 @@ mod tests {
 
         let policy = second.load_effective_policy(root.path()).unwrap();
         assert_eq!(policy.decisions.len(), outcome.signed.len());
-        assert_eq!(policy.decisions["zoe"].action, AuthorityAction::AllowAdd);
+        assert_eq!(
+            policy.decisions[&subject::allow("zoe")].action,
+            AuthorityAction::AllowAdd
+        );
     }
 
     #[test]
