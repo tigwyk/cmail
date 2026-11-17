@@ -3,14 +3,14 @@
 //! [`Authority`]; this module ships the record format, the fold rules, the
 //! in-memory test backend, and the process-wide backend selection.
 
+mod log;
+
 #[cfg(target_os = "windows")]
 mod windows;
 
 use crate::canonical::canonical_json;
 use crate::error::{CoreError, Result};
 use crate::identity::fingerprint_of;
-#[cfg(any(test, feature = "test-authority"))]
-use crate::identity::now_rfc3339;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
@@ -20,6 +20,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
+use std::path::Path;
 #[cfg(any(test, feature = "test-authority"))]
 use std::sync::{Mutex, MutexGuard};
 
@@ -60,38 +61,64 @@ pub struct AuthorityRecord {
     pub subject: String,
     pub payload_digest: String,
     pub signer_fingerprint: String,
+    /// Hash of the previous record (genesis hash for sequence 1). Signed, so
+    /// dropping or replacing an earlier record breaks the chain.
+    pub prev: String,
     pub signature: String,
 }
 
 impl AuthorityRecord {
-    /// Build and sign a record. `payload` is hashed, never stored: consumers
-    /// act on `action` + `subject`, so a message id cannot be replayed for
-    /// another message.
+    /// Build and sign a record with a local signing key. Production paths sign
+    /// through [`Authority::sign_bytes`] so the key never leaves the backend;
+    /// this constructor exists for tests and for backends that hold the key
+    /// in process.
     pub fn sign(
         sequence: u64,
+        prev: impl Into<String>,
         timestamp: String,
         action: AuthorityAction,
         subject: impl Into<String>,
         payload: &Value,
         signing_key: &SigningKey,
     ) -> Self {
-        let subject = subject.into();
-        let signer_fingerprint =
-            fingerprint_of(&B64.encode(signing_key.verifying_key().as_bytes()));
-        let payload_digest = payload_digest(payload);
-        let mut record = Self {
+        let mut record = Self::unsigned(
+            sequence,
+            prev,
+            timestamp,
+            action,
+            subject,
+            payload,
+            fingerprint_of(&B64.encode(signing_key.verifying_key().as_bytes())),
+        );
+        record.signature = B64.encode(
+            signing_key
+                .sign(record.signing_bytes().as_bytes())
+                .to_bytes(),
+        );
+        record
+    }
+
+    /// An unsigned record: every field the signature will cover is final.
+    pub fn unsigned(
+        sequence: u64,
+        prev: impl Into<String>,
+        timestamp: String,
+        action: AuthorityAction,
+        subject: impl Into<String>,
+        payload: &Value,
+        signer_fingerprint: String,
+    ) -> Self {
+        Self {
             version: RECORD_VERSION,
             sequence,
             timestamp,
             action,
-            subject,
-            payload_digest,
+            subject: subject.into(),
+            payload_digest: payload_digest(payload),
             signer_fingerprint,
+            prev: prev.into(),
             signature: String::new(),
-        };
-        let bytes = record.signing_bytes();
-        record.signature = B64.encode(signing_key.sign(bytes.as_bytes()).to_bytes());
-        record
+        }
     }
 
     /// Canonical bytes covered by the signature: every field except
@@ -105,6 +132,7 @@ impl AuthorityRecord {
             "subject": self.subject,
             "payload_digest": self.payload_digest,
             "signer_fingerprint": self.signer_fingerprint,
+            "prev": self.prev,
         }))
     }
 }
@@ -209,33 +237,70 @@ pub struct AuthorityStatus {
     pub explanation: Option<String>,
 }
 
-/// The single authority seam. Platform credential-store backends implement
-/// this in later tickets; the CLI is a thin caller.
+/// Latest verified position of the authority-record chain, pinned beside the
+/// key in the credential store (never under the mailbox root).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LogHead {
+    pub sequence: u64,
+    pub hash: String,
+}
+
+/// The single authority seam. Platform credential-store backends own key
+/// material, presence, and the pinned chain head; the root-scoped record log
+/// and its fold are shared by every backend in [`log`]. The CLI is a thin
+/// caller.
 pub trait Authority {
     /// Report availability and assurance without changing state.
     fn status(&self) -> Result<AuthorityStatus>;
     /// Provision the authority key if absent. Idempotent.
     fn init(&self) -> Result<AuthorityStatus>;
-    /// Sign one decision, advancing the append-only sequence.
+    /// Public half of the authority key. Readable without a presence prompt
+    /// so status and record verification never interrupt the human.
+    fn verifying_key(&self) -> Result<VerifyingKey>;
+    /// Presence-gated Ed25519 signature over canonical record bytes, base64.
+    /// This is the only place the private key is used.
+    fn sign_bytes(&self, action: AuthorityAction, subject: &str, bytes: &str) -> Result<String>;
+    /// The chain head pinned beside the key, if one exists.
+    fn pinned_head(&self) -> Result<Option<LogHead>>;
+    /// Pin a newer chain head. Called only after a signed record is durable,
+    /// so it never needs a second presence prompt.
+    fn pin_head(&self, head: &LogHead) -> Result<()>;
+    /// Timestamp of the last signature, for `authority status`.
+    fn last_grant(&self) -> Option<String> {
+        None
+    }
+    /// Note a successful grant for `authority status`.
+    fn record_grant(&self, _timestamp: &str) {}
+
+    /// Sign one decision and append it to the root-scoped log.
     fn sign_action(
         &self,
+        root: &Path,
         action: AuthorityAction,
         subject: &str,
         payload: &Value,
-    ) -> Result<AuthorityRecord>;
-    /// Verify the retained records and fold them into effective policy.
-    fn load_effective_policy(&self) -> Result<EffectivePolicy>;
+    ) -> Result<AuthorityRecord> {
+        log::sign_and_append(self, root, action, subject, payload)
+    }
+
+    /// Verify the root-scoped records and fold them into effective policy.
+    fn load_effective_policy(&self, root: &Path) -> Result<EffectivePolicy> {
+        log::load_policy(self, root)
+    }
 }
 
 #[cfg(any(test, feature = "test-authority"))]
 struct MemoryState {
     signing: Option<SigningKey>,
-    records: Vec<AuthorityRecord>,
+    /// Stands in for the credential-store slot a platform backend uses.
+    pinned: Option<LogHead>,
     last_grant: Option<String>,
 }
 
-/// Test-only backend: an in-memory key and record log with no presence check
-/// (advisory assurance). Never selected by the CLI.
+/// Test-only backend: an in-memory key and pinned head with no presence check
+/// (advisory assurance). Records go to the shared root-scoped log, so tests
+/// exercise the same persistence path as a platform backend. Never selected by
+/// the CLI.
 #[cfg(any(test, feature = "test-authority"))]
 pub struct InMemoryAuthority {
     state: Mutex<MemoryState>,
@@ -247,10 +312,27 @@ impl InMemoryAuthority {
         Self {
             state: Mutex::new(MemoryState {
                 signing: None,
-                records: Vec::new(),
+                pinned: None,
                 last_grant: None,
             }),
         }
+    }
+
+    /// An instance sharing an existing key, so a second "process" verifies
+    /// records written by the first.
+    pub fn with_signing_key(signing: SigningKey) -> Self {
+        Self {
+            state: Mutex::new(MemoryState {
+                signing: Some(signing),
+                pinned: None,
+                last_grant: None,
+            }),
+        }
+    }
+
+    /// The in-memory key, for restart tests that hand it to a new instance.
+    pub fn signing_key(&self) -> Option<SigningKey> {
+        self.state.lock().ok()?.signing.clone()
     }
 
     fn state(&self) -> Result<MutexGuard<'_, MemoryState>> {
@@ -301,41 +383,43 @@ impl Authority for InMemoryAuthority {
         self.status()
     }
 
-    fn sign_action(
-        &self,
-        action: AuthorityAction,
-        subject: &str,
-        payload: &Value,
-    ) -> Result<AuthorityRecord> {
-        if subject.is_empty() {
-            return Err(CoreError::AuthorityInvalid(
-                "authority record subject is empty".into(),
-            ));
-        }
-        if action == AuthorityAction::Unknown {
-            return Err(CoreError::AuthorityInvalid(
-                "unknown authority action".into(),
-            ));
-        }
-        let mut state = self.state()?;
-        let key = state
+    fn verifying_key(&self) -> Result<VerifyingKey> {
+        let state = self.state()?;
+        Ok(state
             .signing
             .as_ref()
             .ok_or_else(|| CoreError::AuthorityUnavailable("authority is not initialized".into()))?
-            .clone();
-        let sequence = state.records.last().map_or(1, |r| r.sequence + 1);
-        let record = AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &key);
-        state.last_grant = Some(record.timestamp.clone());
-        state.records.push(record.clone());
-        Ok(record)
+            .verifying_key())
     }
 
-    fn load_effective_policy(&self) -> Result<EffectivePolicy> {
+    fn sign_bytes(&self, _action: AuthorityAction, _subject: &str, bytes: &str) -> Result<String> {
         let state = self.state()?;
         let key = state.signing.as_ref().ok_or_else(|| {
             CoreError::AuthorityUnavailable("authority is not initialized".into())
         })?;
-        Ok(fold_records(&state.records, &key.verifying_key()))
+        Ok(B64.encode(key.sign(bytes.as_bytes()).to_bytes()))
+    }
+
+    fn pinned_head(&self) -> Result<Option<LogHead>> {
+        Ok(self.state()?.pinned.clone())
+    }
+
+    fn pin_head(&self, head: &LogHead) -> Result<()> {
+        self.state()?.pinned = Some(head.clone());
+        Ok(())
+    }
+
+    fn last_grant(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.last_grant.clone())
+    }
+
+    fn record_grant(&self, timestamp: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_grant = Some(timestamp.to_string());
+        }
     }
 }
 
@@ -361,18 +445,25 @@ impl Authority for UnavailableAuthority {
         ))
     }
 
-    fn sign_action(
-        &self,
-        _action: AuthorityAction,
-        _subject: &str,
-        _payload: &Value,
-    ) -> Result<AuthorityRecord> {
+    fn verifying_key(&self) -> Result<VerifyingKey> {
         Err(CoreError::AuthorityUnavailable(
             "no authority backend is available; ask your human to configure authority".into(),
         ))
     }
 
-    fn load_effective_policy(&self) -> Result<EffectivePolicy> {
+    fn sign_bytes(&self, _action: AuthorityAction, _subject: &str, _bytes: &str) -> Result<String> {
+        Err(CoreError::AuthorityUnavailable(
+            "no authority backend is available; ask your human to configure authority".into(),
+        ))
+    }
+
+    fn pinned_head(&self) -> Result<Option<LogHead>> {
+        Err(CoreError::AuthorityUnavailable(
+            "no authority backend is available".into(),
+        ))
+    }
+
+    fn pin_head(&self, _head: &LogHead) -> Result<()> {
         Err(CoreError::AuthorityUnavailable(
             "no authority backend is available".into(),
         ))
@@ -419,6 +510,7 @@ mod tests {
     fn rec(seq: u64, action: AuthorityAction, subject: &str, key: &SigningKey) -> AuthorityRecord {
         AuthorityRecord::sign(
             seq,
+            if seq == 1 { "genesis" } else { "previous" },
             format!("2026-11-16T00:00:{seq:02}Z"),
             action,
             subject,
@@ -501,6 +593,7 @@ mod tests {
 
     #[test]
     fn in_memory_backend_creates_signs_and_reports_status() {
+        let root = tempfile::TempDir::new().unwrap();
         let authority = InMemoryAuthority::new();
         let before = authority.status().unwrap();
         assert!(!before.available);
@@ -514,6 +607,7 @@ mod tests {
 
         let record = authority
             .sign_action(
+                root.path(),
                 AuthorityAction::AllowAdd,
                 "alice",
                 &json!({"name": "alice"}),
@@ -525,7 +619,7 @@ mod tests {
             created.fingerprint.clone().unwrap()
         );
 
-        let policy = authority.load_effective_policy().unwrap();
+        let policy = authority.load_effective_policy(root.path()).unwrap();
         assert_eq!(policy.decisions["alice"].action, AuthorityAction::AllowAdd);
 
         assert!(authority.status().unwrap().last_grant.is_some());
@@ -533,10 +627,11 @@ mod tests {
 
     #[test]
     fn in_memory_backend_rejects_empty_subject() {
+        let root = tempfile::TempDir::new().unwrap();
         let authority = InMemoryAuthority::new();
         authority.init().unwrap();
         let err = authority
-            .sign_action(AuthorityAction::AllowAdd, "", &json!(null))
+            .sign_action(root.path(), AuthorityAction::AllowAdd, "", &json!(null))
             .unwrap_err();
         assert!(matches!(err, CoreError::AuthorityInvalid(_)));
     }
@@ -554,12 +649,18 @@ mod tests {
             authority.init(),
             Err(CoreError::AuthorityUnavailable(_))
         ));
+        let root = tempfile::TempDir::new().unwrap();
         assert!(matches!(
-            authority.sign_action(AuthorityAction::AllowAdd, "alice", &json!(null)),
+            authority.sign_action(
+                root.path(),
+                AuthorityAction::AllowAdd,
+                "alice",
+                &json!(null)
+            ),
             Err(CoreError::AuthorityUnavailable(_))
         ));
         assert!(matches!(
-            authority.load_effective_policy(),
+            authority.load_effective_policy(root.path()),
             Err(CoreError::AuthorityUnavailable(_))
         ));
     }

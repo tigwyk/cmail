@@ -119,7 +119,7 @@ pub fn plan(
         relay_url: config.relay.url.clone().filter(|url| !url.is_empty()),
         approvals,
     };
-    let policy = authority.load_effective_policy()?;
+    let policy = authority.load_effective_policy(root)?;
     let (pending, already_adopted) = proposals(&legacy)
         .into_iter()
         .partition(|entry| !policy.decisions.contains_key(&entry.subject));
@@ -133,6 +133,7 @@ pub fn plan(
 /// Sign every pending entry when confirmed. Declining never asks for a
 /// signature and never writes a record.
 pub fn apply(
+    root: &Path,
     authority: &dyn Authority,
     plan: AdoptionPlan,
     confirmed: bool,
@@ -140,7 +141,12 @@ pub fn apply(
     let mut signed = Vec::new();
     if confirmed {
         for entry in &plan.pending {
-            signed.push(authority.sign_action(entry.action, &entry.subject, &entry.payload)?);
+            signed.push(authority.sign_action(
+                root,
+                entry.action,
+                &entry.subject,
+                &entry.payload,
+            )?);
         }
     }
     Ok(AdoptionOutcome { plan, signed })
@@ -269,7 +275,7 @@ mod tests {
         assert!(outcome.signed.is_empty());
         assert_eq!(outcome.plan.pending.len(), 4);
         assert!(authority
-            .load_effective_policy()
+            .load_effective_policy(root.path())
             .unwrap()
             .decisions
             .is_empty());
@@ -286,14 +292,14 @@ mod tests {
 
     #[test]
     fn confirming_signs_one_batch_visible_in_status() {
-        let (_root, c) = legacy_service();
+        let (root, c) = legacy_service();
         let authority = authority();
         let key = alice_key(&c);
         let outcome = c.adopt_legacy(&authority, true).unwrap();
 
         assert_eq!(outcome.signed.len(), 4);
         assert_eq!(outcome.signed[0].version, RECORD_VERSION);
-        let policy = authority.load_effective_policy().unwrap();
+        let policy = authority.load_effective_policy(root.path()).unwrap();
         assert_eq!(policy.decisions.len(), 4);
         assert_eq!(
             policy.decisions[&key_subject("alice", &key)].action,
@@ -314,11 +320,11 @@ mod tests {
 
     #[test]
     fn second_adoption_is_idempotent() {
-        let (_root, c) = legacy_service();
+        let (root, c) = legacy_service();
         let authority = authority();
         let first = c.adopt_legacy(&authority, true).unwrap();
         let records = first.signed.len();
-        let policy = authority.load_effective_policy().unwrap();
+        let policy = authority.load_effective_policy(root.path()).unwrap();
 
         let second = c.adopt_legacy(&authority, true).unwrap();
         assert!(second.signed.is_empty());
@@ -326,9 +332,32 @@ mod tests {
         assert_eq!(second.plan.already_adopted.len(), records);
         assert!(!second.plan.first_adoption());
         assert_eq!(
-            authority.load_effective_policy().unwrap().decisions.len(),
+            authority
+                .load_effective_policy(root.path())
+                .unwrap()
+                .decisions
+                .len(),
             policy.decisions.len()
         );
+    }
+
+    #[test]
+    fn adopted_state_survives_a_new_authority_instance() {
+        let (root, c) = legacy_service();
+        let first = authority();
+        let outcome = c.adopt_legacy(&first, true).unwrap();
+        assert_eq!(outcome.signed.len(), 4);
+
+        // A new process: same key, fresh in-memory state, records only on disk.
+        let second = InMemoryAuthority::with_signing_key(first.signing_key().unwrap());
+        let plan = c.adoption_plan(&second).unwrap();
+        assert!(plan.pending.is_empty());
+        assert_eq!(plan.already_adopted.len(), outcome.signed.len());
+        assert!(!plan.first_adoption());
+
+        let policy = second.load_effective_policy(root.path()).unwrap();
+        assert_eq!(policy.decisions.len(), outcome.signed.len());
+        assert_eq!(policy.decisions["zoe"].action, AuthorityAction::AllowAdd);
     }
 
     #[test]

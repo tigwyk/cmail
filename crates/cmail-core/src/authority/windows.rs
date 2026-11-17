@@ -2,26 +2,22 @@
 //! Manager (DPAPI-protected) and every signature is gated by a Windows Hello
 //! user-presence prompt.
 //!
-//! The backend only creates and uses the key and returns signed records. The
-//! durable append-only authority log is deliberately not implemented here;
-//! ticket #19 moves it under the mailbox root behind a shared store.
+//! The backend owns the key, presence, and the pinned log head. Signed
+//! records go to the shared root-scoped log in [`super::log`], so adopted
+//! state survives a new process on every platform.
 //!
 //! There is no file or environment fallback: when the credential is missing,
 //! Windows Hello is unavailable, or presence is denied, signing fails closed
 //! with a typed error.
 
-use super::{
-    Assurance, Authority, AuthorityAction, AuthorityRecord, AuthorityStatus, EffectivePolicy,
-};
+use super::{Assurance, Authority, AuthorityAction, AuthorityStatus, LogHead};
 use crate::error::{CoreError, Result};
-use crate::identity::{fingerprint_of, now_rfc3339};
+use crate::identity::fingerprint_of;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ed25519_dalek::SigningKey;
+use ed25519_dalek::{Signer, SigningKey};
 use rand::rngs::OsRng;
-use serde_json::Value;
 use std::future::IntoFuture;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Security::Credentials::UI::{
@@ -35,21 +31,20 @@ use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
 /// Credential Manager target name for the authority seed.
 const CREDENTIAL_TARGET: &str = "cmail.authority.v1";
+/// Credential Manager target name for the pinned log head. Beside the key,
+/// never under the mailbox root.
+const CHAIN_HEAD_TARGET: &str = "cmail.authority.log-head.v1";
 const SEED_LEN: usize = 32;
 const ASSURANCE_EXPLANATION: &str = "Windows Hello proves human presence, but the DPAPI-protected credential blob is not cryptographically bound to that check: a same-user process that locates the blob can decrypt it after login.";
 
 /// Windows backend: Credential Manager key plus Windows Hello presence.
 pub struct WindowsAuthority {
-    /// Per-process record sequence. Durable sequence ownership arrives with
-    /// the shared store in ticket #19.
-    sequence: AtomicU64,
     last_grant: Mutex<Option<String>>,
 }
 
 impl WindowsAuthority {
     pub(crate) const fn new() -> Self {
         Self {
-            sequence: AtomicU64::new(0),
             last_grant: Mutex::new(None),
         }
     }
@@ -64,13 +59,7 @@ impl Authority for WindowsAuthority {
                 fingerprint: Some(fingerprint_of(&B64.encode(key.verifying_key().as_bytes()))),
                 backend: "windows-credential-manager".into(),
                 assurance: Assurance::Moderate,
-                last_grant: self
-                    .last_grant
-                    .lock()
-                    .map_err(|_| {
-                        CoreError::AuthorityUnavailable("authority status lock poisoned".into())
-                    })?
-                    .clone(),
+                last_grant: self.last_grant(),
                 explanation: Some(ASSURANCE_EXPLANATION.into()),
             },
             None => AuthorityStatus {
@@ -94,44 +83,52 @@ impl Authority for WindowsAuthority {
         self.status()
     }
 
-    fn sign_action(
-        &self,
-        action: AuthorityAction,
-        subject: &str,
-        payload: &Value,
-    ) -> Result<AuthorityRecord> {
-        if subject.is_empty() {
-            return Err(CoreError::AuthorityInvalid(
-                "authority record subject is empty".into(),
-            ));
-        }
-        if action == AuthorityAction::Unknown {
-            return Err(CoreError::AuthorityInvalid(
-                "unknown authority action".into(),
-            ));
-        }
+    fn verifying_key(&self) -> Result<ed25519_dalek::VerifyingKey> {
+        Ok(signing_key()?
+            .ok_or_else(|| {
+                CoreError::AuthorityUnavailable(
+                    "authority is not initialized; ask your human to run: cmail authority init"
+                        .into(),
+                )
+            })?
+            .verifying_key())
+    }
 
+    fn sign_bytes(&self, action: AuthorityAction, subject: &str, bytes: &str) -> Result<String> {
+        // Presence is required before any signature exists.
         let key = signing_key()?.ok_or_else(|| {
             CoreError::AuthorityUnavailable(
                 "authority is not initialized; ask your human to run: cmail authority init".into(),
             )
         })?;
-
-        // Presence is required before any signature exists.
         require_presence(action, subject)?;
-
-        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
-        let record = AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &key);
-        if let Ok(mut last_grant) = self.last_grant.lock() {
-            *last_grant = Some(record.timestamp.clone());
-        }
-        Ok(record)
+        Ok(B64.encode(key.sign(bytes.as_bytes()).to_bytes()))
     }
 
-    fn load_effective_policy(&self) -> Result<EffectivePolicy> {
-        Err(CoreError::AuthorityUnavailable(
-            "authority record storage is not implemented until ticket #19".into(),
-        ))
+    fn pinned_head(&self) -> Result<Option<LogHead>> {
+        let Some(blob) = read_credential(CHAIN_HEAD_TARGET)? else {
+            return Ok(None);
+        };
+        serde_json::from_slice(&blob).map(Some).map_err(|_| {
+            CoreError::AuthorityInvalid("Credential Manager authority log head is malformed".into())
+        })
+    }
+
+    fn pin_head(&self, head: &LogHead) -> Result<()> {
+        let blob = serde_json::to_vec(head).map_err(|_| {
+            CoreError::AuthorityInvalid("authority log head is not serializable".into())
+        })?;
+        write_credential(CHAIN_HEAD_TARGET, &blob)
+    }
+
+    fn last_grant(&self) -> Option<String> {
+        self.last_grant.lock().ok().and_then(|grant| grant.clone())
+    }
+
+    fn record_grant(&self, timestamp: &str) {
+        if let Ok(mut grant) = self.last_grant.lock() {
+            *grant = Some(timestamp.to_string());
+        }
     }
 }
 
@@ -140,11 +137,27 @@ fn signing_key() -> Result<Option<SigningKey>> {
 }
 
 fn read_seed() -> Result<Option<[u8; SEED_LEN]>> {
-    let target = wide(CREDENTIAL_TARGET);
+    let Some(blob) = read_credential(CREDENTIAL_TARGET)? else {
+        return Ok(None);
+    };
+    let seed: [u8; SEED_LEN] = blob.as_slice().try_into().map_err(|_| {
+        CoreError::AuthorityInvalid(
+            "Windows Credential Manager authority credential is malformed".into(),
+        )
+    })?;
+    Ok(Some(seed))
+}
+
+fn write_seed(seed: &[u8; SEED_LEN]) -> Result<()> {
+    write_credential(CREDENTIAL_TARGET, seed)
+}
+
+/// Read one generic credential. Absent or unreadable credentials are `None`:
+/// there is never a file fallback.
+fn read_credential(target: &str) -> Result<Option<Vec<u8>>> {
+    let target = wide(target);
     let mut raw: *mut CREDENTIALW = std::ptr::null_mut();
     if unsafe { CredReadW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None, &mut raw) }.is_err() {
-        // Absent or unreadable credential: report it as unavailable, never
-        // fall back to a file.
         return Ok(None);
     }
     if raw.is_null() {
@@ -153,23 +166,23 @@ fn read_seed() -> Result<Option<[u8; SEED_LEN]>> {
     let credential = unsafe { &*raw };
     let size = credential.CredentialBlobSize as usize;
     let blob = credential.CredentialBlob;
-    let result = if size != SEED_LEN || blob.is_null() {
+    let result = if blob.is_null() {
         Err(CoreError::AuthorityInvalid(
-            "Windows Credential Manager authority credential is malformed".into(),
+            "Windows Credential Manager credential is malformed".into(),
         ))
     } else {
-        let mut seed = [0u8; SEED_LEN];
-        seed.copy_from_slice(unsafe { std::slice::from_raw_parts(blob, SEED_LEN) });
-        Ok(Some(seed))
+        Ok(Some(
+            unsafe { std::slice::from_raw_parts(blob, size) }.to_vec(),
+        ))
     };
     unsafe { CredFree(raw.cast()) };
     result
 }
 
-fn write_seed(seed: &[u8; SEED_LEN]) -> Result<()> {
-    let mut target = wide(CREDENTIAL_TARGET);
+fn write_credential(target: &str, secret: &[u8]) -> Result<()> {
+    let mut target = wide(target);
     let mut user = wide("cmail authority");
-    let mut blob = seed.to_vec();
+    let mut blob = secret.to_vec();
     let credential = CREDENTIALW {
         Flags: CRED_FLAGS(0),
         Type: CRED_TYPE_GENERIC,
