@@ -10,12 +10,16 @@ use crate::envelope::Envelope;
 use crate::error::Result;
 use crate::keyring::KeyRing;
 use crate::trust::{self, TrustResult};
-use std::path::Path;
+use std::cell::OnceCell;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug)]
 pub struct Policy {
+    root: PathBuf,
     config: Config,
-    keyring: KeyRing,
+    /// Parsed on first use: relay/config-only reads must not fail on a corrupt
+    /// keyring (fetch, relay show, allow list never needed one before).
+    keyring: OnceCell<KeyRing>,
 }
 
 impl Policy {
@@ -23,19 +27,25 @@ impl Policy {
     /// handle observes human edits made since it opened.
     pub fn load(root: &Path) -> Result<Self> {
         Ok(Self {
+            root: root.to_path_buf(),
             config: Config::load_or_init(root)?,
-            keyring: KeyRing::load(root)?,
+            keyring: OnceCell::new(),
         })
     }
 
-    /// The keyring that trust decisions and recipient lookups resolve against.
-    pub fn keyring(&self) -> &KeyRing {
-        &self.keyring
+    /// The keyring that trust decisions and recipient lookups resolve against,
+    /// parsed on demand. A corrupt keyring fails every such read (fail closed).
+    pub fn keyring(&self) -> Result<&KeyRing> {
+        if self.keyring.get().is_none() {
+            // Cache success only: a corrupt file cannot become valid mid-process.
+            let _ = self.keyring.set(KeyRing::load(&self.root)?);
+        }
+        Ok(self.keyring.get().expect("keyring was just set"))
     }
 
     /// Trust level for `env` under this policy's keyring.
-    pub fn trust(&self, env: &Envelope) -> TrustResult {
-        trust::evaluate(env, &self.keyring)
+    pub fn trust(&self, env: &Envelope) -> Result<TrustResult> {
+        Ok(trust::evaluate(env, self.keyring()?))
     }
 
     pub fn outbound(&self) -> OutboundMode {
@@ -62,8 +72,8 @@ impl Policy {
     }
 
     /// The per-recipient relay route, if known (never affects trust).
-    pub fn route(&self, name: &str) -> Option<String> {
-        self.keyring.get_route(name)
+    pub fn route(&self, name: &str) -> Result<Option<String>> {
+        Ok(self.keyring()?.get_route(name))
     }
 }
 
@@ -138,11 +148,11 @@ mod tests {
             Some("https://relay.example.com")
         );
         assert_eq!(
-            policy.route("alice").as_deref(),
+            policy.route("alice").unwrap().as_deref(),
             Some("https://alice.example.com")
         );
-        assert_eq!(policy.route("ghost"), None);
-        assert!(policy.keyring().get("alice").is_some());
+        assert_eq!(policy.route("ghost").unwrap(), None);
+        assert!(policy.keyring().unwrap().get("alice").is_some());
 
         // outbound gate: allowlisted passes, unknown holds, open mode passes all
         assert!(policy.may_send("zoe"));
@@ -154,7 +164,32 @@ mod tests {
 
         // trust through the seam is exactly the trust module on that keyring
         let env = signed_alice(&alice);
-        assert_eq!(policy.trust(&env), trust::evaluate(&env, policy.keyring()));
-        assert_eq!(policy.trust(&env).level, TrustLevel::Verified);
+        assert_eq!(
+            policy.trust(&env).unwrap(),
+            trust::evaluate(&env, policy.keyring().unwrap())
+        );
+        assert_eq!(policy.trust(&env).unwrap().level, TrustLevel::Verified);
+    }
+
+    /// A corrupt keyring must not break relay/config-only reads: `fetch`,
+    /// `relay show` and the allow list never parsed it before the seam.
+    #[test]
+    fn corrupt_keyring_leaves_config_only_reads_working() {
+        let (root, _alice) = legacy_root();
+        std::fs::write(root.path().join("keyring.json"), "not json").unwrap();
+
+        let policy = Policy::load(root.path()).unwrap();
+        assert_eq!(policy.inbound(), InboundMode::KnownOnly);
+        assert_eq!(policy.allow_list(), ["zoe".to_string()]);
+        assert_eq!(
+            policy.relay_url().as_deref(),
+            Some("https://relay.example.com")
+        );
+        assert!(policy.may_send("zoe"));
+        assert!(!policy.may_send("mallory"));
+
+        // reads that need the keyring still fail closed
+        assert!(policy.keyring().is_err());
+        assert!(policy.route("alice").is_err());
     }
 }

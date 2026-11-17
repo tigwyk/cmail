@@ -198,7 +198,7 @@ impl Cmail {
         // identities/<to>/; locally the keyring entry carries the encrypt-to
         // key, resolved by recipient_x25519 below).
         let policy = Policy::load(&self.root)?;
-        if !identity_exists(&self.root, to) && policy.keyring().get(to).is_none() {
+        if !identity_exists(&self.root, to) && policy.keyring()?.get(to).is_none() {
             return Err(CoreError::UnknownRecipient(to.to_string()));
         }
         if let Some(parent) = reply_to {
@@ -222,7 +222,7 @@ impl Cmail {
         let remote_route = if identity_exists(&self.root, to) {
             None
         } else {
-            policy.route(to)
+            policy.route(to)?
         };
         let outcome = match remote_route {
             Some(route) => self.send_remote(
@@ -266,7 +266,7 @@ impl Cmail {
             load_identity(&self.root, to)?.public_key_b64()
         } else {
             Policy::load(&self.root)?
-                .keyring()
+                .keyring()?
                 .get(to)
                 .map(|e| e.public_key.clone())
                 .ok_or_else(|| CoreError::UnknownRecipient(to.to_string()))?
@@ -415,7 +415,7 @@ impl Cmail {
     /// appended by each caller after its own bookkeeping).
     fn deposit_remote(&self, env: &Envelope, route: &str) -> Result<()> {
         let entry = Policy::load(&self.root)?
-            .keyring()
+            .keyring()?
             .get(&env.to)
             .cloned()
             .ok_or_else(|| CoreError::UnknownRecipient(env.to.clone()))?;
@@ -503,7 +503,7 @@ impl Cmail {
         // root the keyring entry alone still carries the encrypt-to key
         // (review hardening + whole-branch fix: held mail to keyring-only
         // recipients must be approvable, not just sendable).
-        if !identity_exists(&self.root, &env.to) && policy.keyring().get(&env.to).is_none() {
+        if !identity_exists(&self.root, &env.to) && policy.keyring()?.get(&env.to).is_none() {
             return Err(CoreError::UnknownRecipient(env.to));
         }
         // Routed held mail (spec §3.2): the recipient has no local identity
@@ -513,7 +513,7 @@ impl Cmail {
         // recipient WITHOUT a route keeps the synced-root local move below
         // (v1.1 rule).
         if !identity_exists(&self.root, &env.to) {
-            if let Some(route) = policy.route(&env.to) {
+            if let Some(route) = policy.route(&env.to)? {
                 self.deposit_remote(&env, &route)?;
                 self.store
                     .delete_message(&self.store.pending_dir(&owner), id)?;
@@ -663,7 +663,7 @@ impl Cmail {
                 self.audit_corrupt(&id, "signature fails against from_key")?;
                 continue;
             }
-            let tr = policy.trust(&env);
+            let tr = policy.trust(&env)?;
             match tr.level {
                 TrustLevel::SpoofSuspect => {
                     self.store.move_message(&inbox, &quarantine, &id)?;
@@ -752,7 +752,7 @@ impl Cmail {
         }
         let src = if in_inbox { &inbox } else { &archive };
         let env = self.load_envelope_from(std::slice::from_ref(src), id)?;
-        let tr = Policy::load(&self.root)?.trust(&env);
+        let tr = Policy::load(&self.root)?.trust(&env)?;
         // Spec 4.2: signature and trust come from the visible header (above);
         // content is recovered here — a sealed envelope is opened with the
         // reader's X25519 identity key, a plain envelope passes through. A
@@ -862,7 +862,7 @@ impl Cmail {
             for id in self.store.list_ids(&archive) {
                 let raw = self.store.read_raw(&archive, &id)?;
                 if let Ok(env) = Envelope::parse(&raw) {
-                    let tr = policy.trust(&env);
+                    let tr = policy.trust(&env)?;
                     let kind = env.kind_label().to_string();
                     let subject = env.subject_label().to_string();
                     items.push(InboxItem {
@@ -1058,7 +1058,7 @@ impl Cmail {
     pub fn quarantine_show(&self, owner: Option<&str>, id: &str) -> Result<ReadMessage> {
         let me = self.resolve_identity(owner)?;
         let env = Envelope::parse(&self.store.read_raw(&self.store.quarantine_dir(&me), id)?)?;
-        let tr = Policy::load(&self.root)?.trust(&env);
+        let tr = Policy::load(&self.root)?.trust(&env)?;
         let my = load_identity(&self.root, &me)?;
         let (kind, subject, body, attachments, in_reply_to) =
             match open_envelope(&env, &x25519_secret(&my.signing)) {
@@ -1125,7 +1125,7 @@ impl Cmail {
     }
 
     pub fn keyring_list(&self) -> Result<Vec<(String, crate::keyring::KeyEntry)>> {
-        Ok(Policy::load(&self.root)?.keyring().list())
+        Ok(Policy::load(&self.root)?.keyring()?.list())
     }
 
     pub fn keyring_add(&self, name: &str, source: KeySource) -> Result<()> {
