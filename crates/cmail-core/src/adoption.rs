@@ -39,6 +39,15 @@ pub struct LegacyApproval {
     pub created: String,
 }
 
+/// One legacy quarantine release, shown with the sender and subject so the
+/// human signs what was actually quarantined rather than an audit-line id.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LegacyQuarantine {
+    pub id: String,
+    pub from: String,
+    pub subject: String,
+}
+
 /// Everything adoption will bless, before any signature is requested.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LegacySnapshot {
@@ -48,11 +57,12 @@ pub struct LegacySnapshot {
     pub outbound_mode: OutboundMode,
     pub inbound_mode: InboundMode,
     pub approvals: Vec<LegacyApproval>,
-    /// Message ids a pre-enforcement build recorded as released from
-    /// quarantine. The audit log is unsigned and non-authoritative; these ids
-    /// become signed decisions only when the human confirms adoption.
+    /// Quarantined messages a pre-enforcement build recorded as released.
+    /// The audit log is unsigned and non-authoritative; these ids become
+    /// signed decisions only when the human confirms adoption, and only when
+    /// a quarantined or archived copy still exists.
     #[serde(default)]
-    pub quarantine_releases: Vec<String>,
+    pub quarantine_releases: Vec<LegacyQuarantine>,
 }
 
 impl LegacySnapshot {
@@ -228,34 +238,68 @@ fn proposals(legacy: &LegacySnapshot) -> Vec<AdoptionEntry> {
             ),
         });
     }
-    for id in &legacy.quarantine_releases {
+    for release in &legacy.quarantine_releases {
         entries.push(AdoptionEntry {
             action: AuthorityAction::QuarantineRelease,
-            subject: subject::quarantine(id),
-            payload: json!({ "message_id": id }),
-            summary: format!("release quarantine {id} (legacy audit event)"),
+            subject: subject::quarantine(&release.id),
+            payload: json!({ "message_id": release.id }),
+            summary: format!(
+                "release quarantine {} (from {}: {})",
+                release.id, release.from, release.subject
+            ),
         });
     }
     entries
 }
 
-/// Message ids with a legacy `quarantine_release` audit event, in log order
-/// and deduplicated. Lossy: a malformed line is skipped rather than failing
-/// adoption, and a skipped release stays locked (fail closed).
-fn legacy_quarantine_releases(root: &Path) -> Result<Vec<String>> {
+/// Quarantined messages with a legacy `quarantine_release` audit event, in
+/// log order and deduplicated. Only an id whose quarantined or archived copy
+/// still exists is proposed: the audit log alone cannot name mail to release.
+/// Lossy: a malformed line is skipped rather than failing adoption, and a
+/// skipped release stays locked (fail closed). An unparseable copy is still
+/// proposed, with its sender and subject marked unknown.
+fn legacy_quarantine_releases(root: &Path) -> Result<Vec<LegacyQuarantine>> {
+    let store = crate::store::MailStore::new(root);
+    let identities = crate::identity::list_identities(root);
     let mut seen = std::collections::HashSet::new();
-    let mut ids = Vec::new();
+    let mut releases = Vec::new();
     for record in crate::audit::tail_lossy(root, usize::MAX)? {
         if record.event != crate::audit::AuditEvent::QuarantineRelease {
             continue;
         }
-        if let Some(id) = record.msg_id {
-            if seen.insert(id.clone()) {
-                ids.push(id);
-            }
+        let Some(id) = record.msg_id else {
+            continue;
+        };
+        if seen.contains(&id) {
+            continue;
+        }
+        let Some((from, subject)) = quarantined_metadata(&store, &identities, &id) else {
+            continue;
+        };
+        seen.insert(id.clone());
+        releases.push(LegacyQuarantine { id, from, subject });
+    }
+    Ok(releases)
+}
+
+/// Sender and display subject of an existing quarantined or archived copy.
+fn quarantined_metadata(
+    store: &crate::store::MailStore,
+    identities: &[String],
+    id: &str,
+) -> Option<(String, String)> {
+    for owner in identities {
+        for dir in [store.quarantine_dir(owner), store.archive_dir(owner)] {
+            let Ok(raw) = store.read_raw(&dir, id) else {
+                continue;
+            };
+            return Some(match crate::envelope::Envelope::parse(&raw) {
+                Ok(env) => (env.from.clone(), env.subject_label().to_string()),
+                Err(_) => ("<unparseable>".into(), "<unparseable>".into()),
+            });
         }
     }
-    Ok(ids)
+    None
 }
 
 #[cfg(test)]
@@ -439,7 +483,7 @@ mod tests {
         ));
         let policy = crate::policy::Policy::load(root.path(), restart).unwrap();
         assert_eq!(policy.inbound_mode(), InboundMode::KnownOnly);
-        assert_eq!(policy.outbound_mode(), Some(OutboundMode::Gated));
+        assert_eq!(policy.outbound_mode().unwrap(), Some(OutboundMode::Gated));
 
         // Re-adoption is idempotent: every mode record is already settled.
         let second = c.adoption_plan(&authority).unwrap();
@@ -491,48 +535,89 @@ mod tests {
         );
     }
 
+    /// Put a readable alice -> zoe message in zoe's quarantine, so a legacy
+    /// release has a real file and visible metadata behind it.
+    fn quarantined_message(c: &Cmail) -> String {
+        let alice = crate::identity::load_identity(&c.root, "alice").unwrap();
+        let id = "cafebabecafebabecafebabecafebabe";
+        let env = crate::envelope::build_and_sign(
+            id,
+            &crate::envelope::NewEnvelope {
+                from: "alice".into(),
+                from_key: alice.public_key_b64(),
+                to: "zoe".into(),
+                kind: "note".into(),
+                subject: "legacy quarantine".into(),
+                body: "b".into(),
+                attachments: vec![],
+                in_reply_to: None,
+                created: "2026-11-01T12:00:00Z".into(),
+            },
+            &alice.signing,
+        )
+        .unwrap();
+        c.store
+            .write_envelope(&c.store.quarantine_dir("zoe"), &env)
+            .unwrap();
+        id.to_string()
+    }
+
+    fn legacy_release(root: &Path, id: &str) {
+        crate::audit::append(
+            root,
+            &crate::audit::AuditRecord::now(crate::audit::AuditEvent::QuarantineRelease, "human")
+                .msg(id),
+        )
+        .unwrap();
+    }
+
     #[test]
     fn legacy_quarantine_releases_are_adopted_once() {
         let (root, c) = legacy_service();
-        let id = "deadbeefdeadbeefdeadbeefdeadbeef";
+        let id = quarantined_message(&c);
         // A pre-enforcement build wrote only unsigned audit events (twice).
-        for _ in 0..2 {
-            crate::audit::append(
-                root.path(),
-                &crate::audit::AuditRecord::now(
-                    crate::audit::AuditEvent::QuarantineRelease,
-                    "human",
-                )
-                .msg(id),
-            )
-            .unwrap();
-        }
+        legacy_release(root.path(), &id);
+        legacy_release(root.path(), &id);
         let authority = authority();
         let plan = c.adoption_plan(&authority).unwrap();
-        assert_eq!(plan.legacy.quarantine_releases, vec![id.to_string()]);
+        assert_eq!(
+            plan.legacy.quarantine_releases,
+            vec![LegacyQuarantine {
+                id: id.clone(),
+                from: "alice".into(),
+                subject: "legacy quarantine".into(),
+            }]
+        );
         let releases: Vec<_> = plan
             .pending
             .iter()
             .filter(|entry| entry.action == AuthorityAction::QuarantineRelease)
             .collect();
         assert_eq!(releases.len(), 1, "duplicate audit events collapse");
-        assert_eq!(releases[0].subject, subject::quarantine(id));
+        assert_eq!(releases[0].subject, subject::quarantine(&id));
+        assert!(
+            releases[0]
+                .summary
+                .contains("from alice: legacy quarantine"),
+            "summary names the quarantined mail: {}",
+            releases[0].summary
+        );
 
         // Declining leaves the legacy release unsigned (still locked).
         let declined = c.adopt_legacy(&authority, false).unwrap();
         assert!(declined.signed.is_empty());
         let policy = authority.load_effective_policy(root.path()).unwrap();
-        assert!(!policy.decisions.contains_key(&subject::quarantine(id)));
+        assert!(!policy.decisions.contains_key(&subject::quarantine(&id)));
 
         // Confirming signs the release in the same batch.
         let adopted = c.adopt_legacy(&authority, true).unwrap();
         assert!(adopted.signed.iter().any(|record| {
             record.action == AuthorityAction::QuarantineRelease
-                && record.subject == subject::quarantine(id)
+                && record.subject == subject::quarantine(&id)
         }));
         let policy = authority.load_effective_policy(root.path()).unwrap();
         assert_eq!(
-            policy.decisions[&subject::quarantine(id)].action,
+            policy.decisions[&subject::quarantine(&id)].action,
             AuthorityAction::QuarantineRelease
         );
 
@@ -545,10 +630,33 @@ mod tests {
                 .plan
                 .already_adopted
                 .iter()
-                .filter(|entry| entry.subject == subject::quarantine(id))
+                .filter(|entry| entry.subject == subject::quarantine(&id))
                 .count(),
             1
         );
+    }
+
+    /// An appended audit line alone must not become a human-signed release:
+    /// with no quarantined or archived copy, nothing is proposed.
+    #[test]
+    fn audit_release_without_a_quarantined_file_is_not_proposed() {
+        let (root, c) = legacy_service();
+        let bogus = "deadbeefdeadbeefdeadbeefdeadbeef";
+        legacy_release(root.path(), bogus);
+
+        let authority = authority();
+        let plan = c.adoption_plan(&authority).unwrap();
+        assert!(plan.legacy.quarantine_releases.is_empty());
+        assert!(!plan
+            .pending
+            .iter()
+            .any(|entry| entry.action == AuthorityAction::QuarantineRelease));
+
+        let adopted = c.adopt_legacy(&authority, true).unwrap();
+        assert!(!adopted
+            .signed
+            .iter()
+            .any(|record| { record.action == AuthorityAction::QuarantineRelease }));
     }
 
     #[test]

@@ -98,33 +98,35 @@ impl Policy {
 
     /// The signed outbound mode, if the human signed one. `None` means the
     /// gate is allowlist-only: config `[outbound]` never opens it, and an
-    /// unavailable authority folds to no decision.
-    pub fn outbound_mode(&self) -> Option<OutboundMode> {
-        let decision = self
-            .effective()
-            .ok()?
-            .decisions
-            .get(subject::OUTBOUND_MODE)?;
-        serde_json::from_value(decision.payload.as_ref()?.get("mode")?.clone()).ok()
+    /// unavailable authority folds to no decision. A tampered or rolled-back
+    /// log is an integrity error, never a silent `None`.
+    pub fn outbound_mode(&self) -> Result<Option<OutboundMode>> {
+        let Some(decision) = self.effective()?.decisions.get(subject::OUTBOUND_MODE) else {
+            return Ok(None);
+        };
+        Ok(decision
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("mode"))
+            .and_then(|mode| serde_json::from_value(mode.clone()).ok()))
     }
 
     /// The effective inbound mode.
     ///
-    /// A signed `mode:inbound` record wins. With no signed record, an
-    /// available authority falls back to `config.inbound` only to TIGHTEN:
+    /// A signed `mode:inbound` record wins. With no signed record, a
+    /// reachable public key falls back to `config.inbound` only to TIGHTEN:
     /// legacy `known-only` is honored, while legacy `permissive` cannot
-    /// loosen anything. An unavailable authority, a tampered log, or an
+    /// loosen anything. An unavailable or locked key, a tampered log, or an
     /// unparseable signed payload fails closed to `known-only`.
     pub fn inbound_mode(&self) -> InboundMode {
         let Ok(policy) = self.effective() else {
             return InboundMode::KnownOnly;
         };
         let Some(decision) = policy.decisions.get(subject::INBOUND_MODE) else {
-            let available = self
-                .authority
-                .status()
-                .map(|status| status.available)
-                .unwrap_or(false);
+            // A reachable public key, not a status flag: Linux can report an
+            // available Secret Service while the item is locked, and a locked
+            // key must not fall back to legacy config.
+            let available = self.authority.verifying_key().is_ok();
             return if available {
                 self.config.inbound
             } else {
@@ -142,7 +144,8 @@ impl Policy {
     /// True when the signed outbound mode is `open`. The only place a config
     /// mode could leak is [`Policy::outbound`], which this gate never reads.
     fn mode_allows(&self) -> bool {
-        self.outbound_mode() == Some(OutboundMode::Open)
+        self.outbound_mode()
+            .is_ok_and(|mode| mode == Some(OutboundMode::Open))
     }
 
     /// The outbound gate: a signed open-mode record, or a signed allow entry.
@@ -178,19 +181,22 @@ impl Policy {
     }
 
     /// The effective signed pickup relay url, if any. Clear means no relay;
-    /// the legacy `[relay] url` config never becomes the fetch target.
-    pub fn relay_url(&self) -> Option<String> {
-        let decision = self.effective().ok()?.decisions.get(subject::RELAY)?;
+    /// the legacy `[relay] url` config never becomes the fetch target. A
+    /// tampered or rolled-back log is an integrity error, never `None`.
+    pub fn relay_url(&self) -> Result<Option<String>> {
+        let Some(decision) = self.effective()?.decisions.get(subject::RELAY) else {
+            return Ok(None);
+        };
         if decision.action != crate::authority::AuthorityAction::RelaySet {
-            return None;
+            return Ok(None);
         }
-        decision
+        Ok(decision
             .payload
-            .as_ref()?
-            .get("url")?
-            .as_str()
+            .as_ref()
+            .and_then(|payload| payload.get("url"))
+            .and_then(|url| url.as_str())
             .filter(|url| !url.is_empty())
-            .map(str::to_string)
+            .map(str::to_string))
     }
 
     /// The per-recipient relay route, if known (never affects trust).
@@ -202,13 +208,16 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::{Authority, AuthorityAction, InMemoryAuthority};
+    use crate::authority::{
+        Authority, AuthorityAction, AuthorityStatus, InMemoryAuthority, LogHead,
+        UnavailableAuthority,
+    };
     use crate::config::{AllowSection, Config, InboundMode, OutboundMode, RelaySection};
     use crate::envelope::{build_and_sign, NewEnvelope};
     use crate::keyring::KeyRing;
     use crate::trust::{self, TrustLevel};
     use base64::{engine::general_purpose::STANDARD as B64, Engine};
-    use ed25519_dalek::SigningKey;
+    use ed25519_dalek::{SigningKey, VerifyingKey};
     use rand::rngs::OsRng;
     use tempfile::TempDir;
 
@@ -291,7 +300,7 @@ mod tests {
         assert_eq!(policy.outbound(), OutboundMode::Gated);
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
         assert_eq!(policy.allow_list().unwrap(), ["zoe".to_string()]);
-        assert_eq!(policy.relay_url(), None);
+        assert_eq!(policy.relay_url().unwrap(), None);
         assert_eq!(
             policy.route("alice").unwrap().as_deref(),
             Some("https://alice.example.com")
@@ -328,10 +337,10 @@ mod tests {
             )
             .unwrap();
         let signed = Policy::load(root.path(), authority.clone()).unwrap();
-        assert_eq!(signed.outbound_mode(), Some(OutboundMode::Open));
+        assert_eq!(signed.outbound_mode().unwrap(), Some(OutboundMode::Open));
         assert!(signed.may_send("mallory"));
         assert_eq!(
-            signed.relay_url().as_deref(),
+            signed.relay_url().unwrap().as_deref(),
             Some("https://signed.example.com")
         );
 
@@ -347,7 +356,8 @@ mod tests {
         assert_eq!(
             Policy::load(root.path(), authority.clone())
                 .unwrap()
-                .relay_url(),
+                .relay_url()
+                .unwrap(),
             None
         );
 
@@ -412,7 +422,7 @@ mod tests {
         let policy = Policy::load(root.path(), authority.clone()).unwrap();
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
         assert_eq!(policy.allow_list().unwrap(), ["zoe".to_string()]);
-        assert_eq!(policy.relay_url(), None);
+        assert_eq!(policy.relay_url().unwrap(), None);
         assert!(policy.may_send("zoe"));
         assert!(!policy.may_send("mallory"));
 
@@ -422,5 +432,123 @@ mod tests {
             TrustLevel::Verified
         );
         assert_eq!(policy.route("alice").unwrap(), None);
+    }
+
+    /// A backend whose status says available while the public key is
+    /// unreachable, as Linux reports a locked Secret Service item.
+    struct LockedAuthority(InMemoryAuthority);
+
+    impl Authority for LockedAuthority {
+        fn status(&self) -> Result<AuthorityStatus> {
+            self.0.status()
+        }
+        fn init(&self) -> Result<AuthorityStatus> {
+            self.0.init()
+        }
+        fn verifying_key(&self) -> Result<VerifyingKey> {
+            Err(CoreError::AuthorityUnavailable("locked".into()))
+        }
+        fn sign_bytes(
+            &self,
+            action: AuthorityAction,
+            subject: &str,
+            bytes: &str,
+        ) -> Result<String> {
+            self.0.sign_bytes(action, subject, bytes)
+        }
+        fn pinned_head(&self) -> Result<Option<LogHead>> {
+            self.0.pinned_head()
+        }
+        fn pin_head(&self, head: &LogHead) -> Result<()> {
+            self.0.pin_head(head)
+        }
+        fn reset_credentials(&self) -> Result<()> {
+            self.0.reset_credentials()
+        }
+    }
+
+    fn config_inbound(root: &Path, mode: InboundMode) {
+        let mut cfg = Config::load_or_init(root).unwrap();
+        cfg.inbound = mode;
+        cfg.save(root).unwrap();
+    }
+
+    /// Availability is the reachable public key, not the status flag: a
+    /// locked backend must not fall back to legacy `permissive` config.
+    #[test]
+    fn locked_authority_without_a_record_stays_known_only() {
+        let root = TempDir::new().unwrap();
+        config_inbound(root.path(), InboundMode::Permissive);
+        let inner = InMemoryAuthority::new();
+        inner.init().unwrap();
+        let authority = std::sync::Arc::new(LockedAuthority(inner));
+        assert!(authority.status().unwrap().available);
+
+        let policy = Policy::load(root.path(), authority).unwrap();
+        assert_eq!(policy.inbound_mode(), InboundMode::KnownOnly);
+    }
+
+    /// A reachable key with no signed record still honors a tightening
+    /// legacy config.
+    #[test]
+    fn available_authority_without_a_record_honors_legacy_permissive() {
+        let root = TempDir::new().unwrap();
+        config_inbound(root.path(), InboundMode::Permissive);
+        let policy = Policy::load(root.path(), test_authority()).unwrap();
+        assert_eq!(policy.inbound_mode(), InboundMode::Permissive);
+    }
+
+    /// An unavailable backend with no signed record fails closed.
+    #[test]
+    fn unavailable_authority_without_a_record_stays_known_only() {
+        let root = TempDir::new().unwrap();
+        config_inbound(root.path(), InboundMode::Permissive);
+        let authority: std::sync::Arc<dyn Authority> = std::sync::Arc::new(UnavailableAuthority);
+        let policy = Policy::load(root.path(), authority).unwrap();
+        assert_eq!(policy.inbound_mode(), InboundMode::KnownOnly);
+    }
+
+    /// A tampered record log is an integrity error, never a silent `None`
+    /// that makes `relay show`/`mode show` print empty values and lets the
+    /// outbound gate fall back to gated.
+    #[test]
+    fn tampered_log_errors_on_relay_and_mode_reads_and_denies_send() {
+        let authority = test_authority();
+        let (root, _alice) = legacy_root(&authority);
+        authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::RelaySet,
+                subject::RELAY,
+                &serde_json::json!({ "url": "https://signed.example.com" }),
+            )
+            .unwrap();
+        authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::OutboundMode,
+                subject::OUTBOUND_MODE,
+                &serde_json::json!({ "mode": "open" }),
+            )
+            .unwrap();
+
+        let path = root.path().join("authority.log");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        let mut value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        value["subject"] = "tampered".into();
+        lines[0] = value.to_string();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+
+        let policy = Policy::load(root.path(), authority.clone()).unwrap();
+        assert!(matches!(
+            policy.relay_url(),
+            Err(CoreError::AuthorityInvalid(_))
+        ));
+        assert!(matches!(
+            policy.outbound_mode(),
+            Err(CoreError::AuthorityInvalid(_))
+        ));
+        assert!(!policy.may_send("zoe"));
     }
 }

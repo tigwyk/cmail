@@ -676,6 +676,62 @@ fn relay_show_survives_corrupt_keyring() {
     assert_eq!(listed, serde_json::json!([]));
 }
 
+/// A tampered authority log is an integrity error on every signed policy read:
+/// `relay show` and `mode show` fail instead of printing empty values, and
+/// `fetch` fails with the integrity error, not "no relay configured".
+#[test]
+fn tampered_authority_log_surfaces_integrity_errors() {
+    fn tamper_log(root: &TempDir) {
+        let path = root.path().join("authority.log");
+        let raw = std::fs::read_to_string(&path).unwrap();
+        let mut lines: Vec<String> = raw.lines().map(str::to_string).collect();
+        let mut value: serde_json::Value = serde_json::from_str(&lines[0]).unwrap();
+        value["subject"] = "tampered".into();
+        lines[0] = value.to_string();
+        std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+    }
+
+    fn error_json(cmd: &mut Command) -> String {
+        let out = cmd.assert().failure().get_output().clone();
+        let value: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+        value["error"].as_str().unwrap().to_string()
+    }
+
+    let root = TempDir::new().unwrap();
+    cmail(&root)
+        .arg("--json")
+        .arg("init")
+        .arg("--name")
+        .arg("zoe")
+        .assert()
+        .success();
+    cmail(&root)
+        .arg("--json")
+        .arg("relay")
+        .arg("set")
+        .arg("https://pickup.example.com")
+        .assert()
+        .success();
+    tamper_log(&root);
+
+    let message = error_json(cmail(&root).arg("--json").arg("relay").arg("show"));
+    assert!(message.contains("does not verify"), "{message}");
+    assert!(!message.contains("<none>"), "{message}");
+
+    let message = error_json(cmail(&root).arg("--json").arg("mode").arg("show"));
+    assert!(message.contains("does not verify"), "{message}");
+
+    let message = error_json(
+        cmail(&root)
+            .arg("--as")
+            .arg("zoe")
+            .arg("--json")
+            .arg("fetch"),
+    );
+    assert!(message.contains("does not verify"), "{message}");
+    assert!(!message.contains("no relay configured"), "{message}");
+}
+
 /// Keyring routes and the pickup-relay config round-trip through the CLI.
 /// Routes are non-trust routing, so they live in the cache file; signed
 /// `keyring add` is tested through the fail-closed CLI path elsewhere.
