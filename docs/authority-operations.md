@@ -32,7 +32,7 @@ grant. The documentation claim must match that report.
 | Platform | Backend | Presence check | Reported assurance | Runtime verification | Honest limitation |
 | --- | --- | --- | --- | --- | --- |
 | macOS | Login Keychain generic password + LocalAuthentication | Touch ID / passcode prompt | `advisory` | Manual, not in CI | Presence is in-process. The Keychain item is not cryptographically bound to the check, and a same-user process can bypass it (for example with `DYLD_INSERT_LIBRARIES`). Ed25519 is not a Secure Enclave algorithm, so the key is not hardware-bound. A developer can be tricked into approving a prompt. |
-| Linux | Secret Service (GNOME Keyring / KWallet), optionally polkit | Collection unlock / polkit prompt | `advisory` | Not covered in CI | A login keyring is typically unlocked for the whole session and readable by any same-user process; Secret Service gives no per-use presence guarantee. Where no backend is usable, human-only commands fail closed. |
+| Linux | Secret Service (GNOME Keyring / KWallet) | Collection unlock | `advisory` | Not covered in CI | A login keyring is typically unlocked for the whole session and readable by any same-user process; Secret Service gives no per-use presence guarantee, and `authority_linux.rs` always reports Advisory with no polkit. Where no backend is usable, human-only commands fail closed. |
 | Windows | Credential Manager (DPAPI) + Windows Hello | Windows Hello via `UserConsentVerifier` | Backend reports `moderate` when it answers; **unverified at runtime** | Not covered in CI | Windows Hello is called through the OS API, but this project has not verified the end-to-end prompt, denial, or credential lifecycle on Windows at runtime. The DPAPI-protected blob is not cryptographically bound to the Hello check. Do not claim enforcement on Windows until that verification exists. |
 
 No platform reports `strong`, so no platform gets an "enforced OS boundary"
@@ -163,6 +163,8 @@ decision is refused.
   signed allowlist entries, keyring grants, relay and mode records, approvals,
   and quarantine releases are gone. Held mail stays held; released quarantine
   mail stays archived. `adopt` then re-signs whatever legacy state is present.
+  Running plain `cmail authority adopt` against the old-key log without
+  `reset` fails with `authority invalid`: the new key cannot verify it.
   If `reset` cannot prompt (no usable backend, locked session), there is no
   file or environment fallback: fix the credential-store session first.
 
@@ -187,9 +189,13 @@ The authority log is not a downgrade-compatible format.
 - Pre-authority (0.3.x) binaries ignore authority records and read legacy
   `keyring.json`, `config.toml`, and pending files. They can appear to change
   policy that new binaries do not honor.
-- New binaries ignore unsigned legacy state except during adoption. Upgrading
-  without adoption leaves protected state empty: mail is untrusted, sends are
-  held, and no relay is configured.
+- New binaries grant nothing from unsigned legacy state. Unsigned grants,
+  relay selection, and outbound mode are ignored; legacy keyring routes are
+  used only for routing and display, never trust; and the legacy `inbound`
+  mode applies only when no signed mode exists and the key is reachable, so a
+  legacy `known-only` can still tighten. Upgrading without adoption leaves
+  protected state empty: mail is untrusted, sends are held, and no relay is
+  configured.
 - All binaries sharing a mailbox root must be upgraded together. There is no
   supported mixed-version mode.
 - Records with a version a binary does not understand are ignored; unknown

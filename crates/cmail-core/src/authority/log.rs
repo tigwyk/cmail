@@ -117,28 +117,39 @@ fn verify_chain(records: &[AuthorityRecord], authority_key: &VerifyingKey) -> Re
     Ok(())
 }
 
-/// Compare the log's head with the head pinned beside the key. A log behind
-/// the pin was truncated; a different hash at the same sequence was replaced;
-/// a missing log with a pinned head was deleted. All fail closed.
-fn check_head(pinned: Option<&LogHead>, head: Option<&LogHead>) -> Result<()> {
-    match (pinned, head) {
-        (Some(pinned), Some(head)) if head.sequence < pinned.sequence => Err(invalid(format!(
-            "authority log ends at sequence {} but the pinned head is {}: the log was truncated",
-            head.sequence, pinned.sequence
-        ))),
-        (Some(pinned), Some(head))
-            if head.sequence == pinned.sequence && head.hash != pinned.hash =>
-        {
-            Err(invalid(
-                "authority log head differs from the pinned head: the log was replaced",
-            ))
-        }
-        (Some(pinned), None) => Err(invalid(format!(
+/// Compare the log with the head pinned beside the key. A log behind the pin
+/// was truncated; a log whose record at the pinned sequence no longer hashes
+/// to the pinned hash was replaced or rewritten, even when it has grown past
+/// the pin; a missing log with a pinned head was deleted. All fail closed.
+fn check_head(pinned: Option<&LogHead>, records: &[AuthorityRecord]) -> Result<()> {
+    let Some(pinned) = pinned else {
+        return Ok(());
+    };
+    let Some(head) = records.last().map(head_of) else {
+        return Err(invalid(format!(
             "authority log is missing but a head at sequence {} is pinned",
             pinned.sequence
-        ))),
-        _ => Ok(()),
+        )));
+    };
+    if head.sequence < pinned.sequence {
+        return Err(invalid(format!(
+            "authority log ends at sequence {} but the pinned head is {}: the log was truncated",
+            head.sequence, pinned.sequence
+        )));
     }
+    // The chain is verified contiguous from sequence 1, so a log that reaches
+    // the pinned sequence must still carry the pinned record byte for byte.
+    let anchored = usize::try_from(pinned.sequence)
+        .ok()
+        .and_then(|sequence| sequence.checked_sub(1))
+        .and_then(|index| records.get(index))
+        .is_some_and(|record| record_hash(record) == pinned.hash);
+    if !anchored {
+        return Err(invalid(
+            "authority log head differs from the pinned head: the log was replaced",
+        ));
+    }
+    Ok(())
 }
 
 /// Load, verify, and fold the log. Refreshes the pinned head when the log is
@@ -153,7 +164,7 @@ pub(super) fn load_policy(
     verify_chain(&records, &key)?;
     let head = records.last().map(head_of);
     let pinned = authority.pinned_head()?;
-    check_head(pinned.as_ref(), head.as_ref())?;
+    check_head(pinned.as_ref(), &records)?;
     if let Some(head) = &head {
         if pinned.as_ref() != Some(head) {
             authority.pin_head(head)?;
@@ -211,7 +222,7 @@ pub(super) fn sign_and_append(
     let records = read_records(&log_path(root))?;
     verify_chain(&records, &key)?;
     let head = records.last().map(head_of);
-    check_head(authority.pinned_head()?.as_ref(), head.as_ref())?;
+    check_head(authority.pinned_head()?.as_ref(), &records)?;
 
     let sequence = head.as_ref().map_or(1, |head| head.sequence + 1);
     let prev = head
@@ -505,6 +516,47 @@ mod tests {
         let err = authority.load_effective_policy(root.path()).unwrap_err();
         assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err}");
         assert!(err.to_string().contains("truncated"), "{err}");
+    }
+
+    #[test]
+    fn a_longer_log_with_a_divergent_prefix_fails_closed() {
+        let root = tempfile::TempDir::new().unwrap();
+        let authority = authority();
+        sign(&authority, root.path(), "alice");
+        let pinned = authority.pinned_head().unwrap();
+
+        // A self-consistent replacement chain under the same key that has
+        // grown past the pin: comparing heads alone would re-pin it.
+        let other_root = tempfile::TempDir::new().unwrap();
+        let other = InMemoryAuthority::with_signing_key(authority.signing_key().unwrap());
+        sign(&other, other_root.path(), "mallory");
+        sign(&other, other_root.path(), "eve");
+        let replacement = lines(&log_path(other_root.path()));
+        assert_eq!(replacement.len(), 2);
+        rewrite(&log_path(root.path()), &replacement);
+
+        let err = authority.load_effective_policy(root.path()).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err}");
+        assert!(err.to_string().contains("replaced"), "{err}");
+        assert_eq!(authority.pinned_head().unwrap(), pinned);
+    }
+
+    #[test]
+    fn a_normal_append_advances_the_pinned_head() {
+        let root = tempfile::TempDir::new().unwrap();
+        let authority = authority();
+        let first = sign(&authority, root.path(), "alice");
+        let first_head = authority.pinned_head().unwrap().unwrap();
+        assert_eq!(first_head.sequence, first.sequence);
+
+        authority.load_effective_policy(root.path()).unwrap();
+        let second = sign(&authority, root.path(), "bob");
+        assert_eq!(second.sequence, first.sequence + 1);
+        authority.load_effective_policy(root.path()).unwrap();
+
+        let head = authority.pinned_head().unwrap().unwrap();
+        assert_eq!(head.sequence, second.sequence);
+        assert_ne!(head.hash, first_head.hash);
     }
 
     #[test]
