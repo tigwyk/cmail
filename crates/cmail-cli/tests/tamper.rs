@@ -380,17 +380,19 @@ fn tampered_authority_log_fails_closed_for_every_signed_read() {
 
     tamper_first_record(&root);
 
-    // Every signed-policy read fails closed or falls back to the empty policy.
-    let message = error_out(cmail(&root).arg("--json").arg("allow").arg("list"));
-    assert!(
-        message.contains("authority invalid"),
-        "tampered log must not fold, got {message}"
-    );
-    assert!(json_out(cmail(&root).arg("--json").arg("relay").arg("show"))["url"].is_null());
-    assert_eq!(
-        json_out(cmail(&root).arg("--json").arg("mode").arg("show"))["outbound"],
-        "gated"
-    );
+    // Every signed-policy read surfaces the integrity error: a tampered log is
+    // never folded into an empty-but-plausible policy.
+    for args in [
+        vec!["--json", "allow", "list"],
+        vec!["--json", "relay", "show"],
+        vec!["--json", "mode", "show"],
+    ] {
+        let message = error_out(cmail(&root).args(&args));
+        assert!(
+            message.contains("authority invalid"),
+            "tampered log must not fold for {args:?}, got {message}"
+        );
+    }
     // The outbound gate is closed again: the former allow is not trusted.
     send_held(&root, "zoe", "after tamper");
     // Inbound trust cannot be derived, so the scan errors rather than showing

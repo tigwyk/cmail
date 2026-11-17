@@ -145,7 +145,10 @@ commands are reserved for the human owner:
 - `cmail quarantine list|show|release` — quarantine review (`release` moves to
   archive: reviewed, retained, never re-shown to the agent)
 - `cmail audit [--tail N]` — append-only log of every security-relevant event
-- `config.toml` — `outbound = "gated"|"open"`, `inbound = "permissive"|"known-only"`
+- `cmail mode outbound|inbound` — signed policy modes (`gated|open`,
+  `permissive|known-only`). Signed records are authoritative; the legacy
+  `config.toml` keys never open the outbound gate, never select a relay, and
+  only affect inbound when no signed mode exists and the key is reachable
 
 **These decisions are signed authority records, not file permissions.** A
 hand-edited `keyring.json`, `config.toml`, pending-mail file, or forged

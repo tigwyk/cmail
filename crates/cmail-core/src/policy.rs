@@ -90,8 +90,9 @@ impl Policy {
         self.config.outbound
     }
 
-    /// Legacy config inbound mode. Display only: the inbox gate reads the
-    /// signed `mode:inbound` record, never this value.
+    /// Legacy config inbound mode. Not authoritative: the inbox gate reads
+    /// the signed `mode:inbound` record first, and only uses this value as a
+    /// fallback when the authority key is reachable.
     pub fn inbound(&self) -> InboundMode {
         self.config.inbound
     }
@@ -113,11 +114,12 @@ impl Policy {
 
     /// The effective inbound mode.
     ///
-    /// A signed `mode:inbound` record wins. With no signed record, a
-    /// reachable public key falls back to `config.inbound` only to TIGHTEN:
-    /// legacy `known-only` is honored, while legacy `permissive` cannot
-    /// loosen anything. An unavailable or locked key, a tampered log, or an
-    /// unparseable signed payload fails closed to `known-only`.
+    /// A signed `mode:inbound` record wins, in either direction. With no
+    /// signed record, a reachable public key falls back to legacy
+    /// `config.inbound`; a tightening `known-only` is honored and a legacy
+    /// `permissive` is honored too, but it never overrides a signed record.
+    /// An unavailable or locked key, a tampered log, or an unparseable signed
+    /// payload fails closed to `known-only`.
     pub fn inbound_mode(&self) -> InboundMode {
         let Ok(policy) = self.effective() else {
             return InboundMode::KnownOnly;

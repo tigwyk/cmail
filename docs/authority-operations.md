@@ -70,10 +70,13 @@ future assurance upgrade. It is future work, **not shipped**.
 
    The command prints a diff and asks for confirmation. One signed batch
    migrates the legacy keyring, outbound allowlist, relay URL, outbound and
-   inbound policy modes, pending approvals, and message ids a pre-enforcement
-   build had released from quarantine. Declining writes nothing and leaves
-   legacy files inert. Adoption is idempotent: re-running it proposes only what
-   is not already covered by a valid record.
+   inbound policy modes, pending approvals, and quarantine releases a
+   pre-enforcement build had audited. Each proposed release shows the message
+   id, sender, and subject, and is offered only while a quarantined or archived
+   copy still exists; an audited id with no surviving copy stays locked.
+   Declining writes nothing and leaves legacy files inert. Adoption is
+   idempotent: re-running it proposes only what is not already covered by a
+   valid record.
 
 5. **Verify:**
 
@@ -85,8 +88,9 @@ future assurance upgrade. It is future work, **not shipped**.
    ```
 
    `authority status` must report the backend, fingerprint, and an assurance
-   level you accept. `allow list` and the mode/relay output now come from
-   signed records, not from `config.toml`.
+   level you accept. `allow list`, relay selection, and both modes come from
+   signed records, not from `config.toml` (the legacy `inbound` key only
+   applies when no signed mode exists and the key is reachable).
 
 6. **Enforce.** Restart agents and MCP servers. From here, hand-edited
    `keyring.json`, `config.toml`, pending files, and forged `authority.log`

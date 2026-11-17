@@ -1419,9 +1419,10 @@ impl Cmail {
         Ok(self.policy()?.outbound_mode()?.unwrap_or_default())
     }
 
-    /// The effective signed inbound mode. No signed record means `permissive`;
-    /// a tampered log or an unparseable signed payload fails closed to
-    /// `known-only`. Config never moves the gate.
+    /// The effective inbound mode. A signed record wins in either direction.
+    /// With no signed record, a reachable key honors legacy `config.inbound`;
+    /// an unavailable or locked key, a tampered log, or an unparseable signed
+    /// payload falls closed to `known-only`.
     pub fn inbound_mode(&self) -> Result<InboundMode> {
         Ok(self.policy()?.inbound_mode())
     }
