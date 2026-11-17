@@ -1,6 +1,6 @@
 use crate::adoption::{self, AdoptionOutcome, AdoptionPlan, LegacyApproval};
 use crate::audit::{append, AuditEvent, AuditRecord};
-use crate::authority::{Authority, AuthorityAction, AuthorityStatus};
+use crate::authority::{subject, Authority, AuthorityAction, AuthorityStatus};
 use crate::config::{Config, InboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
@@ -562,9 +562,43 @@ impl Cmail {
         authority.reset(&self.root)
     }
 
-    pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
-        let (owner, env) = self.store.find_pending(id)?;
+    /// Sign a per-message approval, then release it. The signature is the
+    /// permission: a pending file with no valid `approval:<id>` record in the
+    /// effective policy is never delivered, even if config or the queue was
+    /// hand-edited.
+    pub fn approve(&self, id: &str, remember: bool) -> Result<String> {
+        // Locate before prompting: a stale or caller-supplied id must not
+        // consume a presence check or append a record for nothing.
+        let (_owner, env) = self.store.find_pending(id)?;
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::Approve,
+            &subject::approval(id),
+            &serde_json::json!({ "id": id }),
+        )?;
+        self.release_approved(id, remember)?;
+        Ok(env.to)
+    }
+
+    /// Release one pending message only when the effective policy carries a
+    /// valid signed approve for that exact id. Split from [`approve`] so tests
+    /// can prove absent, unsigned, or foreign-key records release nothing.
+    fn release_approved(&self, id: &str, remember: bool) -> Result<()> {
         let policy = self.policy()?;
+        let authorizing = match policy.effective()?.decisions.get(&subject::approval(id)) {
+            Some(decision) if decision.action == AuthorityAction::Approve => decision.sequence,
+            Some(_) => {
+                return Err(CoreError::AuthorityRequired(format!(
+                    "message {id} has a signed reject; it cannot be released"
+                )))
+            }
+            None => {
+                return Err(CoreError::AuthorityRequired(format!(
+                    "message {id} has no signed approval; ask your human to run: cmail approve {id}"
+                )))
+            }
+        };
+        let (owner, env) = self.store.find_pending(id)?;
         // Re-verify the recipient is still releasable: the same disjunction
         // send() accepts (local identity OR keyring-known). A local identity
         // may have been removed after the mail was held — but on a synced
@@ -597,7 +631,8 @@ impl Cmail {
                     &self.root,
                     &AuditRecord::now(AuditEvent::Approve, "human")
                         .msg(id)
-                        .counterpart(&env.to),
+                        .counterpart(&env.to)
+                        .detail(&format!("authority sequence {authorizing}")),
                 )?;
                 append(
                     &self.root,
@@ -618,11 +653,14 @@ impl Cmail {
             &self.root,
             &AuditRecord::now(AuditEvent::Approve, "human")
                 .msg(id)
-                .counterpart(&env.to),
+                .counterpart(&env.to)
+                .detail(&format!("authority sequence {authorizing}")),
         )?;
         Ok(())
     }
 
+    /// Sign a per-message reject, then delete only that pending message. A
+    /// signed reject never releases mail and supersedes an earlier approval.
     pub fn reject(&self, id: &str) -> Result<()> {
         // Locate WITHOUT parsing: a corrupt pending file (visible in approvals
         // since H5) must be clearable by the human, not just well-formed held
@@ -630,6 +668,12 @@ impl Cmail {
         let Some((owner, path)) = self.store.find_pending_file(id) else {
             return Err(CoreError::MessageNotFound(id.to_string()));
         };
+        let record = self.authority.sign_action(
+            &self.root,
+            AuthorityAction::Reject,
+            &subject::approval(id),
+            &serde_json::json!({ "id": id }),
+        )?;
         let env = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| Envelope::parse(&raw).ok());
@@ -655,7 +699,8 @@ impl Cmail {
             &AuditRecord::now(AuditEvent::Reject, "human")
                 .msg(id)
                 .counterpart(&counterpart)
-                .outcome(outcome),
+                .outcome(outcome)
+                .detail(&format!("authority sequence {}", record.sequence)),
         )?;
         Ok(())
     }
@@ -1577,6 +1622,224 @@ mod tests {
         c.reject(&id).unwrap();
         assert!(c.approvals(None).unwrap().is_empty());
         assert!(c.store.find_pending(&id).is_err());
+    }
+
+    /// One held message from alice. The gate defaults to gated, so a send to a
+    /// local recipient that is not allowlisted lands in alice's pending dir.
+    fn held(c: &Cmail) -> String {
+        match c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        {
+            SendOutcome::Held { id, .. } => id,
+            other => panic!("expected Held, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_approve_releases_and_audits_the_authorizing_record() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        c.approve(&id, false).unwrap();
+        assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.store.find_pending(&id).is_err());
+        assert!(c.approvals(None).unwrap().is_empty());
+        let rec = c
+            .audit_tail(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event == AuditEvent::Approve && r.msg_id.as_deref() == Some(&id))
+            .expect("approve audit");
+        assert!(
+            rec.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("authority sequence ")),
+            "{rec:?}"
+        );
+    }
+
+    #[test]
+    fn approval_record_releases_only_its_own_message() {
+        let (_root, c) = svc();
+        let approved = held(&c);
+        let other = held(&c);
+        c.authority
+            .sign_action(
+                &c.root,
+                AuthorityAction::Approve,
+                &subject::approval(&approved),
+                &serde_json::json!({ "id": approved }),
+            )
+            .unwrap();
+        c.release_approved(&approved, false).unwrap();
+        assert!(c
+            .store
+            .inbox_dir("zoe")
+            .join(format!("{approved}.mail"))
+            .exists());
+
+        let err = c.release_approved(&other, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&other).is_ok());
+
+        // A later signed reject supersedes the approval and still releases nothing.
+        c.authority
+            .sign_action(
+                &c.root,
+                AuthorityAction::Reject,
+                &subject::approval(&approved),
+                &serde_json::json!({ "id": approved }),
+            )
+            .unwrap();
+        let err = c.release_approved(&approved, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+    }
+
+    #[test]
+    fn later_reject_revokes_prior_approval_for_same_id() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        let key = subject::approval(&id);
+        for action in [AuthorityAction::Approve, AuthorityAction::Reject] {
+            c.authority
+                .sign_action(&c.root, action, &key, &serde_json::json!({ "id": id }))
+                .unwrap();
+        }
+        assert!(!key.contains("approve:") && !key.contains("reject:"));
+        let policy = c.policy().unwrap();
+        assert_eq!(
+            policy
+                .effective()
+                .unwrap()
+                .decisions
+                .get(&key)
+                .unwrap()
+                .action,
+            AuthorityAction::Reject
+        );
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+    }
+
+    #[test]
+    fn later_approve_supersedes_prior_reject_for_same_id() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        for action in [AuthorityAction::Reject, AuthorityAction::Approve] {
+            c.authority
+                .sign_action(
+                    &c.root,
+                    action,
+                    &subject::approval(&id),
+                    &serde_json::json!({ "id": id }),
+                )
+                .unwrap();
+        }
+        c.release_approved(&id, false).unwrap();
+        assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.store.find_pending(&id).is_err());
+    }
+
+    #[test]
+    fn unsigned_permission_does_not_release() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        // Hand-editing the unsigned allowlist is permission for future sends,
+        // never for an already-held message.
+        let mut cfg = Config::load_or_init(&c.root).unwrap();
+        cfg.allow.send.push("zoe".into());
+        cfg.save(&c.root).unwrap();
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+
+        // A hand-written approval record has no valid signature: the log fails
+        // closed and the message stays held.
+        let record = crate::authority::AuthorityRecord::unsigned(
+            1,
+            "0".repeat(64),
+            now_rfc3339(),
+            AuthorityAction::Approve,
+            subject::approval(&id),
+            &serde_json::json!({ "id": id }),
+            "deadbeef".into(),
+        );
+        std::fs::write(
+            c.root.join("authority.log"),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+    }
+
+    #[test]
+    fn reject_does_not_release() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        c.reject(&id).unwrap();
+        assert!(c.store.find_pending(&id).is_err());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.approvals(None).unwrap().is_empty());
+        let rec = c
+            .audit_tail(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event == AuditEvent::Reject)
+            .expect("reject audit");
+        assert!(
+            rec.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("authority sequence ")),
+            "{rec:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_authority_fails_closed_for_approve_and_reject() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+        let approved = held(&c);
+        let rejected = held(&c);
+        drop(c);
+
+        let c = open_with(
+            root.path(),
+            std::sync::Arc::new(crate::authority::UnavailableAuthority),
+        )
+        .unwrap();
+        // Listing stays read-only and does not need authority material.
+        assert_eq!(c.approvals(None).unwrap().len(), 2);
+        let err = c.approve(&approved, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        let err = c.reject(&rejected).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        assert!(c.store.find_pending(&approved).is_ok());
+        assert!(c.store.find_pending(&rejected).is_ok());
+        assert!(!c
+            .store
+            .inbox_dir("zoe")
+            .join(format!("{approved}.mail"))
+            .exists());
+    }
+
+    #[test]
+    fn second_approve_of_released_mail_is_idempotent() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        c.approve(&id, false).unwrap();
+        let err = c.approve(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::MessageNotFound(_)), "{err}");
+        let delivered = std::fs::read_dir(c.store.inbox_dir("zoe")).unwrap().count();
+        assert_eq!(delivered, 1);
+        assert!(c.approvals(None).unwrap().is_empty());
     }
 
     #[test]

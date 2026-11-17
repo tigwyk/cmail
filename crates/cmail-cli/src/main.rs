@@ -29,6 +29,12 @@ pub struct Cli {
     #[arg(long, global = true, hide = true)]
     pub test_unavailable_authority: bool,
 
+    /// Test-only: use an in-memory authority with this base64 signing key
+    /// (debug builds only; never a real presence check)
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    pub test_authority_key: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }

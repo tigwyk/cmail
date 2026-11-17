@@ -59,18 +59,34 @@ pub fn approvals(cli: &Cli) -> Result<()> {
 }
 
 pub fn approve(cli: &Cli, id: &str, remember: bool) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
-    c.approve(id, remember)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
+    let recipient = c.approve(id, remember)?;
     if cli.json {
-        output::print_json(&serde_json::json!({"status":"approved","id":id}));
+        let mut v = serde_json::json!({"status":"approved","id":id});
+        if remember {
+            v["recipient"] = serde_json::json!(recipient);
+            v["scope"] = serde_json::json!("root-wide");
+        }
+        output::print_json(&v);
     } else {
         println!("approved {id}");
+        if remember {
+            println!(
+                "remembered {recipient} on the root-wide outbound allowlist (every identity on this root)"
+            );
+        }
     }
     Ok(())
 }
 
 pub fn reject(cli: &Cli, id: &str) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     c.reject(id)?;
     if cli.json {
         output::print_json(&serde_json::json!({"status":"rejected","id":id}));

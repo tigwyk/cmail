@@ -14,7 +14,7 @@ use crate::identity::fingerprint_of;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-#[cfg(any(test, feature = "test-authority"))]
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 use rand::rngs::OsRng;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -22,7 +22,7 @@ use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
 use std::sync::Arc;
-#[cfg(any(test, feature = "test-authority"))]
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 use std::sync::{Mutex, MutexGuard};
 
 #[cfg(target_os = "macos")]
@@ -407,7 +407,7 @@ pub trait Authority: Send + Sync {
     }
 }
 
-#[cfg(any(test, feature = "test-authority"))]
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 struct MemoryState {
     signing: Option<SigningKey>,
     /// Stands in for the credential-store slot a platform backend uses.
@@ -419,14 +419,14 @@ struct MemoryState {
 
 /// Test-only backend: an in-memory key and pinned head with no presence check
 /// (advisory assurance). Records go to the shared root-scoped log, so tests
-/// exercise the same persistence path as a platform backend. Never selected by
-/// the CLI.
-#[cfg(any(test, feature = "test-authority"))]
+/// exercise the same persistence path as a platform backend. Debug builds can
+/// select it from an explicit signing key; release builds compile it out.
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 pub struct InMemoryAuthority {
     state: Mutex<MemoryState>,
 }
 
-#[cfg(any(test, feature = "test-authority"))]
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 impl InMemoryAuthority {
     pub fn new() -> Self {
         Self {
@@ -452,6 +452,19 @@ impl InMemoryAuthority {
         }
     }
 
+    /// Build from a base64 Ed25519 signing key. Debug-only CLI test hook: each
+    /// process starts with no pinned head, so the persisted log alone chains
+    /// the decisions.
+    pub fn from_signing_key_b64(encoded: &str) -> Result<Self> {
+        let bytes = B64
+            .decode(encoded.trim())
+            .map_err(|_| CoreError::Config("test authority key is not base64".into()))?;
+        let raw: [u8; 32] = bytes
+            .try_into()
+            .map_err(|_| CoreError::Config("test authority key must be 32 bytes".into()))?;
+        Ok(Self::with_signing_key(SigningKey::from_bytes(&raw)))
+    }
+
     /// The in-memory key, for restart tests that hand it to a new instance.
     pub fn signing_key(&self) -> Option<SigningKey> {
         self.state.lock().ok()?.signing.clone()
@@ -472,14 +485,14 @@ impl InMemoryAuthority {
     }
 }
 
-#[cfg(any(test, feature = "test-authority"))]
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 impl Default for InMemoryAuthority {
     fn default() -> Self {
         Self::new()
     }
 }
 
-#[cfg(any(test, feature = "test-authority"))]
+#[cfg(any(test, feature = "test-authority", debug_assertions))]
 impl Authority for InMemoryAuthority {
     fn status(&self) -> Result<AuthorityStatus> {
         let state = self.state()?;

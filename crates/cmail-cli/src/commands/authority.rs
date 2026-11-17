@@ -2,19 +2,26 @@ use crate::output;
 use crate::Cli;
 use anyhow::Result;
 use cmail_core::adoption::AdoptionPlan;
-#[cfg(debug_assertions)]
-use cmail_core::authority::UnavailableAuthority;
 use cmail_core::authority::{system_authority, Assurance, Authority, AuthorityStatus};
+#[cfg(debug_assertions)]
+use cmail_core::authority::{InMemoryAuthority, UnavailableAuthority};
 use cmail_core::Cmail;
 use std::io::{self, Write};
 
 /// Resolve the authority port for this invocation. Debug builds can force the
-/// fail-closed backend so the CLI failure path is testable without touching a
-/// real credential store; release builds compile the override out.
+/// fail-closed backend or inject a fixed in-memory signing key so CLI tests
+/// never touch a real credential store; release builds compile both out.
 pub(crate) fn authority(cli: &Cli) -> std::sync::Arc<dyn Authority> {
     #[cfg(debug_assertions)]
-    if cli.test_unavailable_authority {
-        return std::sync::Arc::new(UnavailableAuthority);
+    {
+        if cli.test_unavailable_authority {
+            return std::sync::Arc::new(UnavailableAuthority);
+        }
+        if let Some(key) = &cli.test_authority_key {
+            let authority = InMemoryAuthority::from_signing_key_b64(key)
+                .expect("--test-authority-key must be a base64 Ed25519 signing key");
+            return std::sync::Arc::new(authority);
+        }
     }
     #[cfg(not(debug_assertions))]
     let _ = cli;
