@@ -265,6 +265,11 @@ pub trait Authority {
     /// Pin a newer chain head. Called only after a signed record is durable,
     /// so it never needs a second presence prompt.
     fn pin_head(&self, head: &LogHead) -> Result<()>;
+    /// Presence-gated credential reset: delete the pinned head and the
+    /// authority key, then provision a fresh key. Nothing is deleted unless
+    /// presence succeeds, so a denial writes nothing. Recovery only; signed
+    /// decisions are discarded, never migrated.
+    fn reset_credentials(&self) -> Result<()>;
     /// Timestamp of the last signature, for `authority status`.
     fn last_grant(&self) -> Option<String> {
         None
@@ -287,6 +292,14 @@ pub trait Authority {
     fn load_effective_policy(&self, root: &Path) -> Result<EffectivePolicy> {
         log::load_policy(self, root)
     }
+
+    /// Recovery from lost or replaced key material: clear the pinned head and
+    /// the stale root-scoped log, then provision a fresh key. Presence is
+    /// required before anything is deleted; denial writes nothing.
+    fn reset(&self, root: &Path) -> Result<AuthorityStatus> {
+        log::reset(self, root)?;
+        self.status()
+    }
 }
 
 #[cfg(any(test, feature = "test-authority"))]
@@ -295,6 +308,8 @@ struct MemoryState {
     /// Stands in for the credential-store slot a platform backend uses.
     pinned: Option<LogHead>,
     last_grant: Option<String>,
+    /// Test-only stand-in for a denied or absent human-presence prompt.
+    presence_denied: bool,
 }
 
 /// Test-only backend: an in-memory key and pinned head with no presence check
@@ -314,6 +329,7 @@ impl InMemoryAuthority {
                 signing: None,
                 pinned: None,
                 last_grant: None,
+                presence_denied: false,
             }),
         }
     }
@@ -326,6 +342,7 @@ impl InMemoryAuthority {
                 signing: Some(signing),
                 pinned: None,
                 last_grant: None,
+                presence_denied: false,
             }),
         }
     }
@@ -333,6 +350,14 @@ impl InMemoryAuthority {
     /// The in-memory key, for restart tests that hand it to a new instance.
     pub fn signing_key(&self) -> Option<SigningKey> {
         self.state.lock().ok()?.signing.clone()
+    }
+
+    /// Test-only stand-in for a denied presence prompt. Key use fails with a
+    /// typed refusal from then on, and nothing is written.
+    pub fn deny_presence(&self) {
+        if let Ok(mut state) = self.state.lock() {
+            state.presence_denied = true;
+        }
     }
 
     fn state(&self) -> Result<MutexGuard<'_, MemoryState>> {
@@ -394,6 +419,11 @@ impl Authority for InMemoryAuthority {
 
     fn sign_bytes(&self, _action: AuthorityAction, _subject: &str, bytes: &str) -> Result<String> {
         let state = self.state()?;
+        if state.presence_denied {
+            return Err(CoreError::AuthorityRequired(
+                "in-memory authority denied presence".into(),
+            ));
+        }
         let key = state.signing.as_ref().ok_or_else(|| {
             CoreError::AuthorityUnavailable("authority is not initialized".into())
         })?;
@@ -406,6 +436,19 @@ impl Authority for InMemoryAuthority {
 
     fn pin_head(&self, head: &LogHead) -> Result<()> {
         self.state()?.pinned = Some(head.clone());
+        Ok(())
+    }
+
+    fn reset_credentials(&self) -> Result<()> {
+        let mut state = self.state()?;
+        if state.presence_denied {
+            return Err(CoreError::AuthorityRequired(
+                "in-memory authority denied presence".into(),
+            ));
+        }
+        state.signing = Some(SigningKey::generate(&mut OsRng));
+        state.pinned = None;
+        state.last_grant = None;
         Ok(())
     }
 
@@ -466,6 +509,12 @@ impl Authority for UnavailableAuthority {
     fn pin_head(&self, _head: &LogHead) -> Result<()> {
         Err(CoreError::AuthorityUnavailable(
             "no authority backend is available".into(),
+        ))
+    }
+
+    fn reset_credentials(&self) -> Result<()> {
+        Err(CoreError::AuthorityUnavailable(
+            "no authority backend is available; ask your human to configure authority".into(),
         ))
     }
 }

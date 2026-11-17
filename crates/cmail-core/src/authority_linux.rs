@@ -102,6 +102,22 @@ fn unlock(collection: &Collection<'_>) -> Result<()> {
     collection.unlock().map_err(map_error)
 }
 
+/// Generate and store a fresh authority key. Callers gate this behind the
+/// collection unlock, which is the presence prompt on this platform.
+fn create_key(collection: &Collection<'_>) -> Result<()> {
+    let signing = SigningKey::generate(&mut OsRng);
+    collection
+        .create_item(
+            ITEM_LABEL,
+            attributes(),
+            &signing.to_bytes(),
+            false,
+            CONTENT_TYPE,
+        )
+        .map_err(map_error)?;
+    Ok(())
+}
+
 /// Read the signing key after unlocking the default collection. The unlock
 /// is the presence gate; a dismissed prompt is a typed refusal.
 fn signing_key_with_presence(ss: &SecretService<'_>) -> Result<SigningKey> {
@@ -192,16 +208,7 @@ impl Authority for LinuxAuthority {
             Err(err) => return Err(map_error(err)),
         };
         unlock(&collection)?;
-        let signing = SigningKey::generate(&mut OsRng);
-        collection
-            .create_item(
-                ITEM_LABEL,
-                attributes(),
-                &signing.to_bytes(),
-                false,
-                CONTENT_TYPE,
-            )
-            .map_err(map_error)?;
+        create_key(&collection)?;
         self.status()
     }
 
@@ -249,6 +256,24 @@ impl Authority for LinuxAuthority {
         collection
             .create_item(HEAD_LABEL, head_attributes(), &secret, true, CONTENT_TYPE)
             .map_err(map_error)?;
+        Ok(())
+    }
+
+    fn reset_credentials(&self) -> Result<()> {
+        let ss = connect()?;
+        let collection = ss.get_default_collection().map_err(map_error)?;
+        // Presence gate; a dismissed prompt writes nothing.
+        unlock(&collection)?;
+        for attrs in [head_attributes(), attributes()] {
+            let (item, _) = find_item(&ss, attrs)?;
+            if let Some(item) = item {
+                item.delete().map_err(map_error)?;
+            }
+        }
+        create_key(&collection)?;
+        if let Ok(mut grant) = self.last_grant.lock() {
+            *grant = None;
+        }
         Ok(())
     }
 

@@ -172,6 +172,31 @@ impl MacAuthority {
         bytes.fill(0);
         Ok(SigningKey::from_bytes(&raw))
     }
+
+    /// Generate and store a fresh key pair. Callers gate this behind presence;
+    /// it never prompts itself, so a reset prompts only once.
+    fn provision_key(&self) -> Result<()> {
+        let signing = SigningKey::generate(&mut OsRng);
+        self.set(
+            self.ids.public_account.as_ref(),
+            signing.verifying_key().as_bytes(),
+        )?;
+        if let Err(error) = self.set(self.ids.seed_account.as_ref(), &signing.to_bytes()) {
+            // Do not leave a public key that cannot sign. Delete it only when
+            // it is still ours, so a racing init is never damaged.
+            if let Ok(current) = self.get(self.ids.public_account.as_ref()) {
+                if current == signing.verifying_key().as_bytes() {
+                    let _ = self.delete(self.ids.public_account.as_ref());
+                }
+            }
+            return Err(error);
+        }
+        // A newly created key starts a new chain.
+        if let Ok(mut state) = self.state.lock() {
+            state.last_grant = None;
+        }
+        Ok(())
+    }
 }
 
 fn generic_password_for(
@@ -273,25 +298,7 @@ impl Authority for MacAuthority {
         }
 
         require_presence("Create the cmail human authority key")?;
-        let signing = SigningKey::generate(&mut OsRng);
-        self.set(
-            self.ids.public_account.as_ref(),
-            signing.verifying_key().as_bytes(),
-        )?;
-        if let Err(error) = self.set(self.ids.seed_account.as_ref(), &signing.to_bytes()) {
-            // Do not leave a public key that cannot sign. Delete it only when
-            // it is still ours, so a racing init is never damaged.
-            if let Ok(current) = self.get(self.ids.public_account.as_ref()) {
-                if current == signing.verifying_key().as_bytes() {
-                    let _ = self.delete(self.ids.public_account.as_ref());
-                }
-            }
-            return Err(error);
-        }
-        // A newly created key starts a new chain.
-        if let Ok(mut state) = self.state.lock() {
-            state.last_grant = None;
-        }
+        self.provision_key()?;
         self.status()
     }
 
@@ -322,6 +329,14 @@ impl Authority for MacAuthority {
             CoreError::AuthorityInvalid("authority log head is not serializable".into())
         })?;
         self.set(self.ids.head_account.as_ref(), &bytes)
+    }
+
+    fn reset_credentials(&self) -> Result<()> {
+        require_presence("Reset the cmail human authority key and discard its record log")?;
+        self.delete(self.ids.head_account.as_ref())?;
+        self.delete(self.ids.seed_account.as_ref())?;
+        self.delete(self.ids.public_account.as_ref())?;
+        self.provision_key()
     }
 
     fn last_grant(&self) -> Option<String> {

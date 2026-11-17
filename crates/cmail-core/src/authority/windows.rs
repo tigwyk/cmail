@@ -24,8 +24,8 @@ use windows::Security::Credentials::UI::{
     UserConsentVerificationResult, UserConsentVerifier, UserConsentVerifierAvailability,
 };
 use windows::Win32::Security::Credentials::{
-    CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS, CRED_PERSIST_LOCAL_MACHINE,
-    CRED_TYPE_GENERIC,
+    CredDeleteW, CredFree, CredReadW, CredWriteW, CREDENTIALW, CRED_FLAGS,
+    CRED_PERSIST_LOCAL_MACHINE, CRED_TYPE_GENERIC,
 };
 use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 
@@ -101,7 +101,7 @@ impl Authority for WindowsAuthority {
                 "authority is not initialized; ask your human to run: cmail authority init".into(),
             )
         })?;
-        require_presence(action, subject)?;
+        require_presence(&format!("action {} for {subject}", action_name(action)))?;
         Ok(B64.encode(key.sign(bytes.as_bytes()).to_bytes()))
     }
 
@@ -119,6 +119,20 @@ impl Authority for WindowsAuthority {
             CoreError::AuthorityInvalid("authority log head is not serializable".into())
         })?;
         write_credential(CHAIN_HEAD_TARGET, &blob)
+    }
+
+    fn reset_credentials(&self) -> Result<()> {
+        // Presence gates every deletion; a denied or absent Windows Hello
+        // writes nothing.
+        require_presence("reset (delete the old key and every signed authority record)")?;
+        delete_credential(CHAIN_HEAD_TARGET)?;
+        delete_credential(CREDENTIAL_TARGET)?;
+        let key = SigningKey::generate(&mut OsRng);
+        write_seed(&key.to_bytes())?;
+        if let Ok(mut grant) = self.last_grant.lock() {
+            *grant = None;
+        }
+        Ok(())
     }
 
     fn last_grant(&self) -> Option<String> {
@@ -200,6 +214,18 @@ fn write_credential(target: &str, secret: &[u8]) -> Result<()> {
     result
 }
 
+/// Delete one generic credential. An already-absent target is success, so a
+/// retried reset is idempotent.
+fn delete_credential(target: &str) -> Result<()> {
+    const ERROR_NOT_FOUND: i32 = 0x8007_0490u32 as i32;
+    let target = wide(target);
+    match unsafe { CredDeleteW(PCWSTR(target.as_ptr()), CRED_TYPE_GENERIC, None) } {
+        Ok(()) => Ok(()),
+        Err(error) if error.code().0 == ERROR_NOT_FOUND => Ok(()),
+        Err(error) => Err(credential_error("delete", &error)),
+    }
+}
+
 fn credential_error(operation: &str, error: &windows::core::Error) -> CoreError {
     CoreError::AuthorityUnavailable(format!(
         "Windows Credential Manager {operation} failed: {error}"
@@ -221,7 +247,7 @@ fn require_hello_available() -> Result<()> {
     Ok(())
 }
 
-fn require_presence(action: AuthorityAction, subject: &str) -> Result<()> {
+fn require_presence(request: &str) -> Result<()> {
     init_winrt();
     let operation =
         UserConsentVerifier::CheckAvailabilityAsync().map_err(|error| presence_error(&error))?;
@@ -234,10 +260,7 @@ fn require_presence(action: AuthorityAction, subject: &str) -> Result<()> {
         )));
     }
 
-    let prompt = HSTRING::from(format!(
-        "Approve cmail authority action {} for {subject}",
-        action_name(action)
-    ));
+    let prompt = HSTRING::from(format!("Approve cmail authority {request}"));
     let operation = UserConsentVerifier::RequestVerificationAsync(&prompt)
         .map_err(|error| presence_error(&error))?;
     let result =
@@ -246,9 +269,8 @@ fn require_presence(action: AuthorityAction, subject: &str) -> Result<()> {
         Ok(())
     } else {
         Err(CoreError::AuthorityRequired(format!(
-            "{}; ask your human to confirm the Windows Hello prompt for {}",
-            verification_label(result),
-            action_name(action)
+            "{}; ask your human to confirm the Windows Hello prompt for {request}",
+            verification_label(result)
         )))
     }
 }

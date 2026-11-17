@@ -838,6 +838,27 @@ fn authority_adopt_fails_closed_without_backend() {
 }
 
 #[test]
+fn authority_reset_warns_and_fails_closed_without_backend() {
+    let root = TempDir::new().unwrap();
+    let output = cmail(&root)
+        .arg("--json")
+        .arg("--test-unavailable-authority")
+        .arg("authority")
+        .arg("reset")
+        .write_stdin("y\n")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("Back up the mailbox root"), "{stderr}");
+    let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = out["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+    assert!(!root.path().join("authority.log").exists());
+}
+
+#[test]
 fn authority_init_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();
     let stdout = cmail(&root)
