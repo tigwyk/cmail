@@ -2,13 +2,16 @@
 //! Manager (DPAPI-protected) and every signature is gated by a Windows Hello
 //! user-presence prompt.
 //!
+//! The backend only creates and uses the key and returns signed records. The
+//! durable append-only authority log is deliberately not implemented here;
+//! ticket #19 moves it under the mailbox root behind a shared store.
+//!
 //! There is no file or environment fallback: when the credential is missing,
 //! Windows Hello is unavailable, or presence is denied, signing fails closed
 //! with a typed error.
 
 use super::{
-    fold_records, verify_record, Assurance, Authority, AuthorityAction, AuthorityRecord,
-    AuthorityStatus, EffectivePolicy,
+    Assurance, Authority, AuthorityAction, AuthorityRecord, AuthorityStatus, EffectivePolicy,
 };
 use crate::error::{CoreError, Result};
 use crate::identity::{fingerprint_of, now_rfc3339};
@@ -17,10 +20,8 @@ use base64::Engine;
 use ed25519_dalek::SigningKey;
 use rand::rngs::OsRng;
 use serde_json::Value;
-use std::fs::{self, OpenOptions};
 use std::future::IntoFuture;
-use std::io::{ErrorKind, Write};
-use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
 use windows::core::{HSTRING, PCWSTR, PWSTR};
 use windows::Security::Credentials::UI::{
@@ -35,14 +36,23 @@ use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 /// Credential Manager target name for the authority seed.
 const CREDENTIAL_TARGET: &str = "cmail.authority.v1";
 const SEED_LEN: usize = 32;
-const RECORD_FILE: &str = "authority.log";
-
-/// One signing operation and its record append are serialized in-process so
-/// concurrent callers cannot reuse a sequence number.
-static SIGN_LOCK: Mutex<()> = Mutex::new(());
 
 /// Windows backend: Credential Manager key plus Windows Hello presence.
-pub struct WindowsAuthority;
+pub struct WindowsAuthority {
+    /// Per-process record sequence. Durable sequence ownership arrives with
+    /// the shared store in ticket #19.
+    sequence: AtomicU64,
+    last_grant: Mutex<Option<String>>,
+}
+
+impl WindowsAuthority {
+    pub(crate) const fn new() -> Self {
+        Self {
+            sequence: AtomicU64::new(0),
+            last_grant: Mutex::new(None),
+        }
+    }
+}
 
 impl Authority for WindowsAuthority {
     fn status(&self) -> Result<AuthorityStatus> {
@@ -53,7 +63,13 @@ impl Authority for WindowsAuthority {
                 fingerprint: Some(fingerprint_of(&B64.encode(key.verifying_key().as_bytes()))),
                 backend: "windows-credential-manager".into(),
                 assurance: Assurance::Moderate,
-                last_grant: last_grant(&key),
+                last_grant: self
+                    .last_grant
+                    .lock()
+                    .map_err(|_| {
+                        CoreError::AuthorityUnavailable("authority status lock poisoned".into())
+                    })?
+                    .clone(),
             },
             None => AuthorityStatus {
                 available: false,
@@ -66,7 +82,6 @@ impl Authority for WindowsAuthority {
     }
 
     fn init(&self) -> Result<AuthorityStatus> {
-        let _guard = lock()?;
         if signing_key()?.is_some() {
             return self.status();
         }
@@ -93,35 +108,28 @@ impl Authority for WindowsAuthority {
             ));
         }
 
-        let _guard = lock()?;
         let key = signing_key()?.ok_or_else(|| {
             CoreError::AuthorityUnavailable(
                 "authority is not initialized; ask your human to run: cmail authority init".into(),
             )
         })?;
-        let records = read_records()?;
-        let sequence = records.last().map_or(1, |record| record.sequence + 1);
 
         // Presence is required before any signature exists.
         require_presence(action, subject)?;
 
+        let sequence = self.sequence.fetch_add(1, Ordering::SeqCst) + 1;
         let record = AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &key);
-        append_record(&record)?;
+        if let Ok(mut last_grant) = self.last_grant.lock() {
+            *last_grant = Some(record.timestamp.clone());
+        }
         Ok(record)
     }
 
     fn load_effective_policy(&self) -> Result<EffectivePolicy> {
-        let key = signing_key()?.ok_or_else(|| {
-            CoreError::AuthorityUnavailable("authority is not initialized".into())
-        })?;
-        Ok(fold_records(&read_records()?, &key.verifying_key()))
+        Err(CoreError::AuthorityUnavailable(
+            "authority record storage is not implemented until ticket #19".into(),
+        ))
     }
-}
-
-fn lock() -> Result<std::sync::MutexGuard<'static, ()>> {
-    SIGN_LOCK
-        .lock()
-        .map_err(|_| CoreError::AuthorityUnavailable("authority lock poisoned".into()))
 }
 
 fn signing_key() -> Result<Option<SigningKey>> {
@@ -286,68 +294,6 @@ fn action_name(action: AuthorityAction) -> &'static str {
         AuthorityAction::InboundMode => "inbound_mode",
         AuthorityAction::Unknown => "unknown",
     }
-}
-
-/// Record log lives in per-user application data, never under the mailbox
-/// root and never beside the key material.
-fn record_path() -> Result<PathBuf> {
-    let base = std::env::var_os("LOCALAPPDATA").ok_or_else(|| {
-        CoreError::AuthorityUnavailable(
-            "LOCALAPPDATA is not set; cannot locate the authority log".into(),
-        )
-    })?;
-    Ok(PathBuf::from(base).join("cmail").join(RECORD_FILE))
-}
-
-fn read_records() -> Result<Vec<AuthorityRecord>> {
-    let path = record_path()?;
-    let text = match fs::read_to_string(&path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => {
-            return Err(CoreError::AuthorityUnavailable(format!(
-                "cannot read the authority log: {error}"
-            )))
-        }
-    };
-    // Malformed lines are ignored; their sequence gap blocks later records
-    // during the fold, so corruption fails closed instead of granting policy.
-    Ok(text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect())
-}
-
-fn append_record(record: &AuthorityRecord) -> Result<()> {
-    let path = record_path()?;
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).map_err(|error| {
-            CoreError::AuthorityUnavailable(format!("cannot create the authority log: {error}"))
-        })?;
-    }
-    let mut line = serde_json::to_string(record)?;
-    line.push('\n');
-    let mut file = OpenOptions::new()
-        .create(true)
-        .append(true)
-        .open(&path)
-        .map_err(|error| {
-            CoreError::AuthorityUnavailable(format!("cannot open the authority log: {error}"))
-        })?;
-    file.write_all(line.as_bytes()).map_err(|error| {
-        CoreError::AuthorityUnavailable(format!("cannot append to the authority log: {error}"))
-    })?;
-    file.sync_all().map_err(|error| {
-        CoreError::AuthorityUnavailable(format!("cannot sync the authority log: {error}"))
-    })
-}
-
-fn last_grant(key: &SigningKey) -> Option<String> {
-    read_records()
-        .ok()?
-        .into_iter()
-        .rfind(|record| verify_record(record, &key.verifying_key()))
-        .map(|record| record.timestamp)
 }
 
 fn wide(value: &str) -> Vec<u16> {

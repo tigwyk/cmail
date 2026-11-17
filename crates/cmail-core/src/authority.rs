@@ -374,7 +374,7 @@ impl Authority for UnavailableAuthority {
 pub fn system_authority() -> &'static dyn Authority {
     #[cfg(target_os = "windows")]
     {
-        static WINDOWS: windows::WindowsAuthority = windows::WindowsAuthority;
+        static WINDOWS: windows::WindowsAuthority = windows::WindowsAuthority::new();
         &WINDOWS
     }
     #[cfg(not(target_os = "windows"))]
