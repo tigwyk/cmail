@@ -30,6 +30,12 @@ mod macos;
 
 /// Canonical authority-record format version. Records with any other version
 /// are ignored by [`fold_records`].
+///
+/// Subject namespaces, not this number, are the compatibility marker for the
+/// namespacing change: version-1 records written before [subject] existed are
+/// still signature-verified and advance the chain, but their unnamespaced
+/// subjects never enter [`EffectivePolicy`]. Adoption must be re-run so the
+/// same decisions exist under their documented names.
 pub const RECORD_VERSION: u32 = 1;
 
 /// One human decision kind. `Unknown` is deserialized from future/unknown
@@ -52,6 +58,75 @@ pub enum AuthorityAction {
     Unknown,
 }
 
+impl AuthorityAction {
+    /// True when `subject` names this action's documented namespace. A record
+    /// carrying a mismatch is refused at append and ignored by the fold, so a
+    /// decision can never be reinterpreted as another family.
+    pub fn accepts_subject(self, subject: &str) -> bool {
+        use AuthorityAction::*;
+        match self {
+            KeyAdd | KeyRemove => subject::split_key(subject).is_some(),
+            AllowAdd | AllowRemove => subject::name_in(subject, subject::ALLOW).is_some(),
+            Approve | Reject => subject::name_in(subject, subject::APPROVAL).is_some(),
+            QuarantineRelease => subject::name_in(subject, subject::QUARANTINE).is_some(),
+            RelaySet | RelayClear => subject == subject::RELAY,
+            OutboundMode => subject == subject::OUTBOUND_MODE,
+            InboundMode => subject == subject::INBOUND_MODE,
+            Unknown => false,
+        }
+    }
+}
+
+/// The one documented authority-subject scheme. Prefixes keep families apart:
+/// an allow entry cannot supersede an approval id even when the suffix text is
+/// identical, and singleton settings (`relay`, modes) share a subject so the
+/// latest record wins instead of leaving an older one live.
+///
+/// Version-1 records written before this scheme existed carry unnamespaced
+/// subjects; they stay in the record chain but are inert. Adoption must be
+/// re-run to write the namespaced forms.
+pub mod subject {
+    pub const KEY: &str = "key:";
+    pub const ALLOW: &str = "allow:";
+    pub const APPROVAL: &str = "approval:";
+    pub const RELAY: &str = "relay";
+    pub const OUTBOUND_MODE: &str = "mode:outbound";
+    pub const INBOUND_MODE: &str = "mode:inbound";
+    pub const QUARANTINE: &str = "quarantine:";
+
+    /// `key:<name>:<public-key>` for a keyring grant or revocation.
+    pub fn key(name: &str, public_key: &str) -> String {
+        format!("{KEY}{name}:{public_key}")
+    }
+
+    /// `allow:<name>` for an outbound allowlist entry.
+    pub fn allow(name: &str) -> String {
+        format!("{ALLOW}{name}")
+    }
+
+    /// `approval:<message-id>` for an approve or reject decision.
+    pub fn approval(message_id: &str) -> String {
+        format!("{APPROVAL}{message_id}")
+    }
+
+    /// `quarantine:<message-id>` for a quarantine release.
+    pub fn quarantine(message_id: &str) -> String {
+        format!("{QUARANTINE}{message_id}")
+    }
+
+    /// Split a `key:<name>:<public-key>` subject. Names and keys are non-empty;
+    /// the public key is standard base64, so it never contains a colon.
+    pub fn split_key(subject: &str) -> Option<(&str, &str)> {
+        let (name, public_key) = subject.strip_prefix(KEY)?.split_once(':')?;
+        (!name.is_empty() && !public_key.is_empty()).then_some((name, public_key))
+    }
+
+    /// The non-empty suffix of a prefixed family, if `subject` is in it.
+    pub fn name_in<'a>(subject: &'a str, prefix: &str) -> Option<&'a str> {
+        subject.strip_prefix(prefix).filter(|rest| !rest.is_empty())
+    }
+}
+
 /// One canonically encoded, signed, append-only authority decision.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct AuthorityRecord {
@@ -60,6 +135,12 @@ pub struct AuthorityRecord {
     pub timestamp: String,
     pub action: AuthorityAction,
     pub subject: String,
+    /// The decision value, retained so non-boolean settings resolve
+    /// latest-wins (`relay`, modes). Absent in version-1 records written
+    /// before payload retention; such records remain chain-valid but inert
+    /// because they also carry unnamespaced subjects.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
     pub payload_digest: String,
     pub signer_fingerprint: String,
     /// Hash of the previous record (genesis hash for sequence 1). Signed, so
@@ -115,6 +196,7 @@ impl AuthorityRecord {
             timestamp,
             action,
             subject: subject.into(),
+            payload: Some(payload.clone()),
             payload_digest: payload_digest(payload),
             signer_fingerprint,
             prev: prev.into(),
@@ -125,7 +207,7 @@ impl AuthorityRecord {
     /// Canonical bytes covered by the signature: every field except
     /// `signature`, serialized with the shared envelope canonicalizer.
     fn signing_bytes(&self) -> String {
-        canonical_json(&json!({
+        let mut fields = json!({
             "version": self.version,
             "sequence": self.sequence,
             "timestamp": self.timestamp,
@@ -134,7 +216,15 @@ impl AuthorityRecord {
             "payload_digest": self.payload_digest,
             "signer_fingerprint": self.signer_fingerprint,
             "prev": self.prev,
-        }))
+        });
+        // Omitted, not null, when absent: signatures made before payload
+        // retention cover exactly the same bytes and still verify.
+        if let Some(payload) = &self.payload {
+            if let Value::Object(map) = &mut fields {
+                map.insert("payload".into(), payload.clone());
+            }
+        }
+        canonical_json(&fields)
     }
 }
 
@@ -174,6 +264,10 @@ pub struct PolicyDecision {
     pub action: AuthorityAction,
     pub sequence: u64,
     pub timestamp: String,
+    /// The signed decision value, when the record retained one. Singleton
+    /// settings (`relay`, modes) resolve latest-wins through this field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub payload: Option<Value>,
 }
 
 /// Policy derived only from valid records. A subject's latest valid record
@@ -190,6 +284,12 @@ pub struct EffectivePolicy {
 /// deterministically. An ignored record does not advance the chain, so a
 /// tampered record at the expected position blocks everything after it
 /// (fail closed).
+///
+/// Every verified record advances the chain, but only a subject in the
+/// action's documented namespace enters effective policy. Version-1 records
+/// with unnamespaced (pre-scheme) subjects therefore stay chain-valid and
+/// inert: re-adoption can append namespaced records after them, and no old
+/// subject is silently trusted under a new meaning.
 pub fn fold_records(records: &[AuthorityRecord], authority_key: &VerifyingKey) -> EffectivePolicy {
     let mut policy = EffectivePolicy::default();
     let mut expected = 1u64;
@@ -201,12 +301,16 @@ pub fn fold_records(records: &[AuthorityRecord], authority_key: &VerifyingKey) -
             continue;
         }
         expected += 1;
+        if !record.action.accepts_subject(&record.subject) {
+            continue;
+        }
         policy.decisions.insert(
             record.subject.clone(),
             PolicyDecision {
                 action: record.action,
                 sequence: record.sequence,
                 timestamp: record.timestamp.clone(),
+                payload: record.payload.clone(),
             },
         );
     }
@@ -574,10 +678,10 @@ mod tests {
     #[test]
     fn signed_record_verifies_and_tamper_fails() {
         let k = key();
-        let r = rec(1, AuthorityAction::AllowAdd, "alice", &k);
+        let r = rec(1, AuthorityAction::AllowAdd, &subject::allow("alice"), &k);
         assert!(verify_record(&r, &k.verifying_key()));
         let mut tampered = r.clone();
-        tampered.subject = "mallory".into();
+        tampered.subject = subject::allow("mallory");
         assert!(!verify_record(&tampered, &k.verifying_key()));
         let other = key();
         assert!(!verify_record(&r, &other.verifying_key()));
@@ -586,7 +690,7 @@ mod tests {
     #[test]
     fn unknown_version_is_rejected() {
         let k = key();
-        let mut r = rec(1, AuthorityAction::AllowAdd, "alice", &k);
+        let mut r = rec(1, AuthorityAction::AllowAdd, &subject::allow("alice"), &k);
         r.version = RECORD_VERSION + 1;
         assert!(!verify_record(&r, &k.verifying_key()));
     }
@@ -594,34 +698,38 @@ mod tests {
     #[test]
     fn fold_ignores_gaps_duplicates_and_reordering() {
         let k = key();
-        let r1 = rec(1, AuthorityAction::AllowAdd, "alice", &k);
-        let r2 = rec(2, AuthorityAction::AllowRemove, "bob", &k);
-        let r3 = rec(3, AuthorityAction::AllowAdd, "carol", &k);
+        let r1 = rec(1, AuthorityAction::AllowAdd, &subject::allow("alice"), &k);
+        let r2 = rec(2, AuthorityAction::AllowRemove, &subject::allow("bob"), &k);
+        let r3 = rec(3, AuthorityAction::AllowAdd, &subject::allow("carol"), &k);
 
         // Gap: sequence 3 without 2; records after the gap cannot apply.
         let policy = fold_records(&[r1.clone(), r3.clone()], &k.verifying_key());
         assert_eq!(policy.decisions.len(), 1);
-        assert_eq!(policy.decisions["alice"].action, AuthorityAction::AllowAdd);
+        assert_eq!(
+            policy.decisions[&subject::allow("alice")].action,
+            AuthorityAction::AllowAdd
+        );
 
         // Duplicate sequence is applied at most once.
         let policy = fold_records(&[r1.clone(), r1.clone(), r2.clone()], &k.verifying_key());
         assert_eq!(policy.decisions.len(), 2);
-        assert_eq!(policy.decisions["bob"].sequence, 2);
+        assert_eq!(policy.decisions[&subject::allow("bob")].sequence, 2);
 
         // Reordered records: 2 arrives before 1, so only 1 applies.
         let policy = fold_records(&[r2.clone(), r1.clone()], &k.verifying_key());
         assert_eq!(policy.decisions.len(), 1);
-        assert_eq!(policy.decisions["alice"].sequence, 1);
-        assert!(!policy.decisions.contains_key("bob"));
+        assert_eq!(policy.decisions[&subject::allow("alice")].sequence, 1);
+        assert!(!policy.decisions.contains_key(&subject::allow("bob")));
     }
 
     #[test]
     fn fold_keeps_latest_valid_record_per_subject() {
         let k = key();
-        let add = rec(1, AuthorityAction::KeyAdd, "alice", &k);
-        let remove = rec(2, AuthorityAction::KeyRemove, "alice", &k);
+        let grant = subject::key("alice", "a2V5");
+        let add = rec(1, AuthorityAction::KeyAdd, &grant, &k);
+        let remove = rec(2, AuthorityAction::KeyRemove, &grant, &k);
         let policy = fold_records(&[add, remove], &k.verifying_key());
-        let decision = &policy.decisions["alice"];
+        let decision = &policy.decisions[&grant];
         assert_eq!(decision.action, AuthorityAction::KeyRemove);
         assert_eq!(decision.sequence, 2);
     }
@@ -630,15 +738,20 @@ mod tests {
     fn fold_fails_closed_on_wrong_key_and_tampering() {
         let k = key();
         let attacker = key();
-        let forged = rec(1, AuthorityAction::AllowAdd, "mallory", &attacker);
+        let forged = rec(
+            1,
+            AuthorityAction::AllowAdd,
+            &subject::allow("mallory"),
+            &attacker,
+        );
         // Signature does not verify with the authority key.
         let policy = fold_records(&[forged], &k.verifying_key());
         assert!(policy.decisions.is_empty());
 
         // A tampered record at the expected position blocks the chain.
-        let mut r1 = rec(1, AuthorityAction::AllowAdd, "alice", &k);
-        r1.subject = "mallory".into();
-        let r2 = rec(2, AuthorityAction::AllowAdd, "bob", &k);
+        let mut r1 = rec(1, AuthorityAction::AllowAdd, &subject::allow("alice"), &k);
+        r1.subject = subject::allow("mallory");
+        let r2 = rec(2, AuthorityAction::AllowAdd, &subject::allow("bob"), &k);
         let policy = fold_records(&[r1, r2], &k.verifying_key());
         assert!(policy.decisions.is_empty());
     }
@@ -657,11 +770,12 @@ mod tests {
         assert_eq!(created.backend, "memory");
         assert_eq!(created.assurance, Assurance::Advisory);
 
+        let allow_alice = subject::allow("alice");
         let record = authority
             .sign_action(
                 root.path(),
                 AuthorityAction::AllowAdd,
-                "alice",
+                &allow_alice,
                 &json!({"name": "alice"}),
             )
             .unwrap();
@@ -672,7 +786,14 @@ mod tests {
         );
 
         let policy = authority.load_effective_policy(root.path()).unwrap();
-        assert_eq!(policy.decisions["alice"].action, AuthorityAction::AllowAdd);
+        assert_eq!(
+            policy.decisions[&allow_alice].action,
+            AuthorityAction::AllowAdd
+        );
+        assert_eq!(
+            policy.decisions[&allow_alice].payload,
+            Some(json!({"name": "alice"}))
+        );
 
         assert!(authority.status().unwrap().last_grant.is_some());
     }
@@ -706,7 +827,7 @@ mod tests {
             authority.sign_action(
                 root.path(),
                 AuthorityAction::AllowAdd,
-                "alice",
+                &subject::allow("alice"),
                 &json!(null)
             ),
             Err(CoreError::AuthorityUnavailable(_))
@@ -715,5 +836,152 @@ mod tests {
             authority.load_effective_policy(root.path()),
             Err(CoreError::AuthorityUnavailable(_))
         ));
+    }
+
+    fn value_record(
+        seq: u64,
+        action: AuthorityAction,
+        subject: &str,
+        payload: Value,
+        key: &SigningKey,
+    ) -> AuthorityRecord {
+        AuthorityRecord::sign(
+            seq,
+            if seq == 1 { "genesis" } else { "previous" },
+            format!("2026-11-16T00:00:{seq:02}Z"),
+            action,
+            subject,
+            &payload,
+            key,
+        )
+    }
+
+    #[test]
+    fn allow_and_approval_subjects_never_supersede_each_other() {
+        let k = key();
+        let allow = value_record(
+            1,
+            AuthorityAction::AllowAdd,
+            &subject::allow("shared-name"),
+            json!({ "name": "shared-name" }),
+            &k,
+        );
+        let approve = value_record(
+            2,
+            AuthorityAction::Approve,
+            &subject::approval("shared-name"),
+            json!({ "id": "shared-name" }),
+            &k,
+        );
+        let policy = fold_records(&[allow, approve], &k.verifying_key());
+
+        assert_eq!(policy.decisions.len(), 2);
+        assert_eq!(
+            policy.decisions[&subject::allow("shared-name")].action,
+            AuthorityAction::AllowAdd
+        );
+        assert_eq!(
+            policy.decisions[&subject::approval("shared-name")].action,
+            AuthorityAction::Approve
+        );
+    }
+
+    #[test]
+    fn relay_setting_supersedes_the_previous_value() {
+        let k = key();
+        let first = value_record(
+            1,
+            AuthorityAction::RelaySet,
+            subject::RELAY,
+            json!({ "url": "https://url1.example.com" }),
+            &k,
+        );
+        let second = value_record(
+            2,
+            AuthorityAction::RelaySet,
+            subject::RELAY,
+            json!({ "url": "https://url2.example.com" }),
+            &k,
+        );
+        let policy = fold_records(&[first, second], &k.verifying_key());
+
+        assert_eq!(policy.decisions.len(), 1);
+        let decision = &policy.decisions[subject::RELAY];
+        assert_eq!(decision.sequence, 2);
+        assert_eq!(
+            decision.payload.as_ref().unwrap()["url"],
+            "https://url2.example.com"
+        );
+    }
+
+    #[test]
+    fn mode_setting_resolves_to_the_latest_value() {
+        let k = key();
+        let first = value_record(
+            1,
+            AuthorityAction::OutboundMode,
+            subject::OUTBOUND_MODE,
+            json!({ "mode": "gated" }),
+            &k,
+        );
+        let second = value_record(
+            2,
+            AuthorityAction::OutboundMode,
+            subject::OUTBOUND_MODE,
+            json!({ "mode": "open" }),
+            &k,
+        );
+        let policy = fold_records(&[first, second], &k.verifying_key());
+
+        assert_eq!(policy.decisions.len(), 1);
+        let decision = &policy.decisions[subject::OUTBOUND_MODE];
+        assert_eq!(decision.sequence, 2);
+        assert_eq!(decision.payload.as_ref().unwrap()["mode"], "open");
+    }
+
+    #[test]
+    fn legacy_unnamespaced_record_is_inert_but_advances_the_chain() {
+        let k = key();
+        let legacy = rec(1, AuthorityAction::AllowAdd, "alice", &k);
+        let namespaced = rec(2, AuthorityAction::AllowAdd, &subject::allow("alice"), &k);
+        let policy = fold_records(&[legacy, namespaced], &k.verifying_key());
+
+        assert!(!policy.decisions.contains_key("alice"));
+        assert_eq!(policy.decisions.len(), 1);
+        let decision = &policy.decisions[&subject::allow("alice")];
+        assert_eq!(decision.action, AuthorityAction::AllowAdd);
+        assert_eq!(decision.sequence, 2);
+    }
+
+    #[test]
+    fn tampered_legacy_record_blocks_later_namespaced_records() {
+        let k = key();
+        let mut legacy = rec(1, AuthorityAction::AllowAdd, "alice", &k);
+        legacy.subject = "mallory".into();
+        let namespaced = rec(2, AuthorityAction::AllowAdd, &subject::allow("alice"), &k);
+        let policy = fold_records(&[legacy, namespaced], &k.verifying_key());
+
+        assert!(policy.decisions.is_empty());
+    }
+
+    #[test]
+    fn append_refuses_a_subject_outside_the_action_namespace() {
+        let root = tempfile::TempDir::new().unwrap();
+        let authority = InMemoryAuthority::new();
+        authority.init().unwrap();
+        let err = authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::AllowAdd,
+                &subject::approval("42"),
+                &json!(null),
+            )
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)));
+        assert!(authority
+            .load_effective_policy(root.path())
+            .unwrap()
+            .decisions
+            .is_empty());
     }
 }

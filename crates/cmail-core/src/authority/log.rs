@@ -195,6 +195,11 @@ pub(super) fn sign_and_append(
     if action == AuthorityAction::Unknown {
         return Err(invalid("unknown authority action"));
     }
+    if !action.accepts_subject(subject) {
+        return Err(invalid(format!(
+            "authority record subject '{subject}' is not in the {action:?} namespace"
+        )));
+    }
     // Fail before prompting when no authority key exists.
     let key = authority.verifying_key()?;
     std::fs::create_dir_all(root)?;
@@ -282,7 +287,7 @@ impl Drop for LockFile {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::authority::InMemoryAuthority;
+    use crate::authority::{subject, InMemoryAuthority};
     use serde_json::json;
     use std::io::Write;
 
@@ -292,12 +297,13 @@ mod tests {
         authority
     }
 
-    fn sign(authority: &InMemoryAuthority, root: &Path, subject: &str) -> AuthorityRecord {
+    fn sign(authority: &InMemoryAuthority, root: &Path, name: &str) -> AuthorityRecord {
+        let subject = subject::allow(name);
         authority
             .sign_action(
                 root,
                 AuthorityAction::AllowAdd,
-                subject,
+                &subject,
                 &json!({ "subject": subject }),
             )
             .unwrap()
@@ -328,9 +334,13 @@ mod tests {
 
         // A second instance with the same key stands in for a new process.
         let second = InMemoryAuthority::with_signing_key(first.signing_key().unwrap());
+        let allow_alice = subject::allow("alice");
         let policy = second.load_effective_policy(root.path()).unwrap();
-        assert_eq!(policy.decisions["alice"].action, AuthorityAction::AllowAdd);
-        assert_eq!(policy.decisions["alice"].sequence, 1);
+        assert_eq!(
+            policy.decisions[&allow_alice].action,
+            AuthorityAction::AllowAdd
+        );
+        assert_eq!(policy.decisions[&allow_alice].sequence, 1);
 
         // Loading is stable, and the next record continues the sequence.
         assert_eq!(second.load_effective_policy(root.path()).unwrap(), policy);
@@ -338,13 +348,13 @@ mod tests {
             .sign_action(
                 root.path(),
                 AuthorityAction::AllowRemove,
-                "alice",
+                &allow_alice,
                 &json!({ "name": "alice" }),
             )
             .unwrap();
         assert_eq!(next.sequence, 2);
         assert_eq!(
-            second.load_effective_policy(root.path()).unwrap().decisions["alice"].action,
+            second.load_effective_policy(root.path()).unwrap().decisions[&allow_alice].action,
             AuthorityAction::AllowRemove
         );
         assert_eq!(lines(&log_path(root.path())).len(), 2);
@@ -380,6 +390,42 @@ mod tests {
                 .len(),
             3
         );
+    }
+
+    #[test]
+    fn legacy_unnamespaced_record_is_inert_and_re_adoption_applies() {
+        let root = tempfile::TempDir::new().unwrap();
+        let authority = authority();
+        let key = authority.signing_key().unwrap();
+        // A version-1 record from before the subject scheme: valid signature,
+        // unnamespaced subject.
+        let legacy = AuthorityRecord::sign(
+            1,
+            GENESIS,
+            "2026-11-16T00:00:01Z".to_string(),
+            AuthorityAction::AllowAdd,
+            "alice",
+            &json!({ "name": "alice" }),
+            &key,
+        );
+        let line = canonical_json(&serde_json::to_value(&legacy).unwrap());
+        std::fs::write(log_path(root.path()), format!("{line}\n")).unwrap();
+
+        let policy = authority.load_effective_policy(root.path()).unwrap();
+        assert!(
+            policy.decisions.is_empty(),
+            "an unnamespaced subject must be inert"
+        );
+
+        // Re-adoption appends the namespaced form after the legacy record; the
+        // chain advances because the legacy record verified.
+        let record = sign(&authority, root.path(), "alice");
+        assert_eq!(record.sequence, 2);
+        let allow_alice = subject::allow("alice");
+        let policy = authority.load_effective_policy(root.path()).unwrap();
+        assert_eq!(policy.decisions.len(), 1);
+        assert_eq!(policy.decisions[&allow_alice].sequence, 2);
+        assert!(!policy.decisions.contains_key("alice"));
     }
 
     #[test]
@@ -447,7 +493,7 @@ mod tests {
             .sign_action(
                 root.path(),
                 AuthorityAction::AllowRemove,
-                "alice",
+                &subject::allow("alice"),
                 &json!({ "name": "alice" }),
             )
             .unwrap();
@@ -507,7 +553,7 @@ mod tests {
                         .sign_action(
                             &path,
                             AuthorityAction::AllowAdd,
-                            &format!("subject-{index}"),
+                            &subject::allow(&format!("subject-{index}")),
                             &json!({ "index": index }),
                         )
                         .unwrap()

@@ -93,10 +93,9 @@ impl KeyRing {
             .collect()
     }
 
-    /// Split a signed key subject (`name:public_key`) into its parts.
+    /// Split a signed key subject (`key:<name>:<public-key>`) into its parts.
     pub fn split_key_subject(subject: &str) -> Option<(&str, &str)> {
-        let (name, public_key) = subject.split_once(':')?;
-        (!name.is_empty() && !public_key.is_empty()).then_some((name, public_key))
+        crate::authority::subject::split_key(subject)
     }
 
     /// Public keys currently granted to `name` by the latest signed decision
@@ -176,6 +175,7 @@ mod tests {
             action,
             sequence,
             timestamp: format!("2026-11-01T00:00:0{sequence}Z"),
+            payload: None,
         }
     }
 
@@ -183,7 +183,7 @@ mod tests {
     fn effective_keyring_takes_latest_grant_and_revocation_wins() {
         let mut decisions = BTreeMap::new();
         decisions.insert(
-            "alice:a2V5".to_string(),
+            crate::authority::subject::key("alice", "a2V5"),
             decision(AuthorityAction::KeyAdd, 1),
         );
         let policy = EffectivePolicy { decisions };
@@ -197,7 +197,7 @@ mod tests {
         // A later KeyRemove at the same subject supersedes the grant.
         let mut decisions = BTreeMap::new();
         decisions.insert(
-            "alice:a2V5".to_string(),
+            crate::authority::subject::key("alice", "a2V5"),
             decision(AuthorityAction::KeyRemove, 2),
         );
         let policy = EffectivePolicy { decisions };
@@ -209,11 +209,11 @@ mod tests {
     fn ambiguous_live_keys_drop_the_name_instead_of_dual_trust() {
         let mut decisions = BTreeMap::new();
         decisions.insert(
-            "alice:a2V5".to_string(),
+            crate::authority::subject::key("alice", "a2V5"),
             decision(AuthorityAction::KeyAdd, 1),
         );
         decisions.insert(
-            "alice:b2V5".to_string(),
+            crate::authority::subject::key("alice", "b2V5"),
             decision(AuthorityAction::KeyAdd, 2),
         );
         let effective = KeyRing::from_decisions(&EffectivePolicy { decisions });

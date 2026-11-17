@@ -386,18 +386,19 @@ mod tests {
         assert!(status.available);
         assert_eq!(status.backend, "macos-keychain");
 
+        let subject = crate::authority::subject::allow("manual-test");
         let record = authority
             .sign_action(
                 root.path(),
                 AuthorityAction::AllowAdd,
-                "manual-test",
+                &subject,
                 &json!({ "probe": true }),
             )
             .expect("presence-gated signature");
         let policy = authority
             .load_effective_policy(root.path())
             .expect("policy");
-        assert_eq!(policy.decisions["manual-test"].sequence, record.sequence);
+        assert_eq!(policy.decisions[&subject].sequence, record.sequence);
 
         authority
             .delete(authority.ids.seed_account.as_ref())
