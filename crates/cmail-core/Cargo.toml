@@ -25,6 +25,13 @@ time.workspace = true
 ureq.workspace = true
 url.workspace = true
 
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "block2"] }
+block2 = "0.6"
+
 [dev-dependencies]
 tempfile.workspace = true
 # Dev-only (legal Cargo cycle): in-process relay fixtures for the routed-send

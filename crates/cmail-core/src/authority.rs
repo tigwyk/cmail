@@ -20,6 +20,9 @@ use std::collections::BTreeMap;
 #[cfg(any(test, feature = "test-authority"))]
 use std::sync::{Mutex, MutexGuard};
 
+#[cfg(target_os = "macos")]
+mod macos;
+
 /// Canonical authority-record format version. Records with any other version
 /// are ignored by [`fold_records`].
 pub const RECORD_VERSION: u32 = 1;
@@ -368,6 +371,12 @@ impl Authority for UnavailableAuthority {
 
 /// The process-wide authority backend. Resolved here so the CLI cannot choose
 /// one from the environment; platform backends replace this in later tickets.
+#[cfg(target_os = "macos")]
+pub fn system_authority() -> &'static dyn Authority {
+    macos::authority()
+}
+
+#[cfg(not(target_os = "macos"))]
 pub fn system_authority() -> &'static dyn Authority {
     static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
     &UNAVAILABLE
