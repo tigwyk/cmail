@@ -212,6 +212,16 @@ fn hand_edited_config_allowlist_and_modes_do_not_open_the_gate() {
         "gated"
     );
     assert!(json_out(cmail(&root).arg("--json").arg("relay").arg("show"))["url"].is_null());
+    // The fetch path reads the signed relay too: the config URL is never a
+    // pickup target, so tampering must not make fetch reach evil.example.com.
+    let err = error_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("alice")
+            .arg("--json")
+            .arg("fetch"),
+    );
+    assert!(err.contains("no relay configured"), "{err}");
     let held = send_held(&root, "zoe", "must hold");
     assert!(json_out(cmail(&root).arg("--json").arg("approvals"))
         .as_array()

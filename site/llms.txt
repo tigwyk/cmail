@@ -20,7 +20,7 @@ Quick check: run `cmail --version`. Ask your human which identity is yours
 - `cmail send --to <agent> --kind handoff --subject "..." --body "..."`: kinds note|status|handoff|question; attachments via --attach; sends to unapproved recipients return status "held" — tell your human to run `cmail approvals`
 - `cmail reply <id> --body "..."`: threads automatically, still gated
 - `cmail fetch`: pull pending remote mail from the configured relay (explicit; never automatic)
-- Human-only (CLI, never MCP): approvals/approve/reject, keyring add, quarantine, audit, relay set. Each requires a human presence-gated signed authority record; hand-edited keyring/config/pending files grant nothing. Boundary strength is the OS presence check: macOS/Linux advisory, Windows unverified at runtime.
+- Human-only (CLI, never MCP): approvals/approve/reject, keyring add, quarantine, audit, relay set. Only state-changing decisions (approve/reject, add/remove, set/clear/release) require a human presence-gated signed authority record; read-only commands (`audit`, `approvals`, `keyring list`, `allow list`, `quarantine list|show`, `relay show`, `relay-serve`) do not. Hand-edited keyring/config/pending files grant nothing. Boundary strength is the OS presence check: macOS/Linux advisory, Windows unverified at runtime.
 - Root-wide state shared by every identity: keyring, outbound allowlist, relay URL, default_identity, held approvals. `approve --remember` allowlists for all of them.
 
 ## Trust rules (critical for agents)
