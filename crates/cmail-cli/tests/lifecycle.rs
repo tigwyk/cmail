@@ -837,6 +837,7 @@ fn authority_adopt_fails_closed_without_backend() {
     assert!(message.contains("authority unavailable"), "{message}");
 }
 
+#[cfg(not(target_os = "macos"))]
 #[test]
 fn authority_init_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();

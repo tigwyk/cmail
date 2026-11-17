@@ -35,9 +35,7 @@ use security_framework::passwords::{
 };
 use serde_json::Value;
 use std::borrow::Cow;
-use std::fs::{self, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::{Path, PathBuf};
+use std::sync::{Mutex, MutexGuard};
 use std::time::Duration;
 
 /// Keychain service shared by the authority items.
@@ -70,36 +68,44 @@ const SYSTEM_IDS: KeychainIds = KeychainIds {
     public_account: Cow::Borrowed(PUBLIC_ACCOUNT),
 };
 
+#[derive(Default)]
+struct MacState {
+    records: Vec<AuthorityRecord>,
+    last_grant: Option<String>,
+}
+
 pub(super) struct MacAuthority {
     ids: KeychainIds,
-    /// Test-only mailbox root. Production resolves `$CMAIL_HOME` or `~/.cmail`.
-    root: Option<PathBuf>,
+    /// Records stay in the backend until the shared log store lands in the
+    /// persistence ticket; only the signing key is stored persistently here.
+    state: Mutex<MacState>,
 }
 
 /// The process-wide macOS backend.
 pub(super) fn authority() -> &'static dyn Authority {
     static MAC: MacAuthority = MacAuthority {
         ids: SYSTEM_IDS,
-        root: None,
+        state: Mutex::new(MacState {
+            records: Vec::new(),
+            last_grant: None,
+        }),
     };
     &MAC
 }
 
 impl MacAuthority {
     #[cfg(test)]
-    fn with_ids(ids: KeychainIds, root: &Path) -> Self {
+    fn with_ids(ids: KeychainIds) -> Self {
         Self {
             ids,
-            root: Some(root.to_path_buf()),
+            state: Mutex::new(MacState::default()),
         }
     }
 
-    fn records_path(&self) -> Result<PathBuf> {
-        let root = match &self.root {
-            Some(root) => root.clone(),
-            None => default_root()?,
-        };
-        Ok(root.join("authority").join("records.jsonl"))
+    fn state(&self) -> Result<MutexGuard<'_, MacState>> {
+        self.state
+            .lock()
+            .map_err(|_| CoreError::AuthorityUnavailable("macOS authority lock poisoned".into()))
     }
 
     fn item_exists(&self, account: &str) -> Result<bool> {
@@ -175,16 +181,6 @@ impl MacAuthority {
         bytes.fill(0);
         Ok(SigningKey::from_bytes(&raw))
     }
-
-    fn last_grant(&self) -> Result<Option<String>> {
-        let records = read_records(&self.records_path()?)?;
-        let key = self.read_public_key()?;
-        Ok(fold_records(&records, &key)
-            .decisions
-            .values()
-            .max_by_key(|decision| decision.sequence)
-            .map(|decision| decision.timestamp.clone()))
-    }
 }
 
 fn generic_password_for(
@@ -196,28 +192,13 @@ fn generic_password_for(
     )
 }
 
-fn default_root() -> Result<PathBuf> {
-    if let Ok(home) = std::env::var("CMAIL_HOME") {
-        if !home.is_empty() {
-            return Ok(PathBuf::from(home));
-        }
-    }
-    let home = std::env::var("HOME").map_err(|_| {
-        CoreError::AuthorityUnavailable(
-            "cannot determine the mailbox root (set CMAIL_HOME or HOME)".into(),
-        )
-    })?;
-    Ok(PathBuf::from(home).join(".cmail"))
-}
-
 /// Require OS-verified human presence before any key use. LocalAuthentication
 /// accepts Touch ID or the login passcode; a process running unattended cannot
 /// answer the system prompt.
 fn require_presence(reason: &str) -> Result<()> {
     let (sender, receiver) = std::sync::mpsc::channel();
     // Safety: LAContext is a normal Objective-C object; the block only sends a
-    // plain message over an mpsc channel and touches no Rust state after the
-    // call returns except that message. The context outlives the evaluation.
+    // plain message over an mpsc channel. The context outlives the evaluation.
     unsafe {
         let context = LAContext::new();
         if let Err(error) = context.canEvaluatePolicy_error(LAPolicy::DeviceOwnerAuthentication) {
@@ -274,7 +255,7 @@ impl Authority for MacAuthority {
             fingerprint: Some(fingerprint_of(&B64.encode(key.as_bytes()))),
             backend: "macos-keychain".into(),
             assurance: Assurance::Moderate,
-            last_grant: self.last_grant()?,
+            last_grant: self.state()?.last_grant.clone(),
         })
     }
 
@@ -309,6 +290,11 @@ impl Authority for MacAuthority {
             }
             return Err(error);
         }
+        // A newly created key starts a new chain in this process.
+        let mut state = self.state()?;
+        state.records.clear();
+        state.last_grant = None;
+        drop(state);
         self.status()
     }
 
@@ -334,151 +320,26 @@ impl Authority for MacAuthority {
         require_presence("Approve a cmail human-authority signing request")?;
         let signing = self.read_seed()?;
 
-        let path = self.records_path()?;
-        if let Some(parent) = path.parent() {
-            fs::create_dir_all(parent)?;
-        }
-        let mut file = OpenOptions::new()
-            .create(true)
-            .read(true)
-            .append(true)
-            .open(&path)?;
-        file.lock().map_err(|error| {
-            CoreError::AuthorityUnavailable(format!(
-                "cannot lock the authority log {}: {error}",
-                path.display()
-            ))
-        })?;
-
-        let result = (|| {
-            let mut text = String::new();
-            file.seek(SeekFrom::Start(0))?;
-            file.read_to_string(&mut text)?;
-            let sequence = next_sequence(&text)?;
-            let record =
-                AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &signing);
-            let line = serde_json::to_string(&record)?;
-            writeln!(file, "{line}")?;
-            file.sync_data()?;
-            Ok(record)
-        })();
-
-        let _ = file.unlock();
-        result
+        let mut state = self.state()?;
+        let sequence = state.records.last().map_or(1, |record| record.sequence + 1);
+        let record =
+            AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &signing);
+        state.last_grant = Some(record.timestamp.clone());
+        state.records.push(record.clone());
+        Ok(record)
     }
 
     fn load_effective_policy(&self) -> Result<EffectivePolicy> {
         let key = self.read_public_key()?;
-        let records = read_records(&self.records_path()?)?;
-        Ok(fold_records(&records, &key))
+        let state = self.state()?;
+        Ok(fold_records(&state.records, &key))
     }
-}
-
-/// Highest sequence already present, plus one. Malformed lines are ignored by
-/// the fold, but they still consume a sequence so a tampered log cannot cause
-/// a rewritten sequence to be accepted.
-fn next_sequence(text: &str) -> Result<u64> {
-    let highest = text
-        .lines()
-        .filter_map(|line| serde_json::from_str::<AuthorityRecord>(line).ok())
-        .map(|record| record.sequence)
-        .max()
-        .unwrap_or(0);
-    highest
-        .checked_add(1)
-        .ok_or_else(|| CoreError::AuthorityInvalid("authority log sequence is exhausted".into()))
-}
-
-fn read_records(path: &Path) -> Result<Vec<AuthorityRecord>> {
-    let text = match fs::read_to_string(path) {
-        Ok(text) => text,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
-        Err(error) => return Err(error.into()),
-    };
-    Ok(text
-        .lines()
-        .filter_map(|line| serde_json::from_str(line).ok())
-        .collect())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use ed25519_dalek::SigningKey;
-    use rand::rngs::OsRng;
     use serde_json::json;
-    use tempfile::TempDir;
-
-    fn signed(
-        sequence: u64,
-        action: AuthorityAction,
-        subject: &str,
-        key: &SigningKey,
-    ) -> AuthorityRecord {
-        AuthorityRecord::sign(
-            sequence,
-            format!("2026-11-16T00:00:{sequence:02}Z"),
-            action,
-            subject,
-            &json!({ "seq": sequence }),
-            key,
-        )
-    }
-
-    fn append(path: &Path, record: &AuthorityRecord) {
-        let line = serde_json::to_string(record).unwrap();
-        crate::fsutil::append_line(path, &format!("{line}\n")).unwrap();
-    }
-
-    #[test]
-    fn log_round_trips_through_the_fold() {
-        let root = TempDir::new().unwrap();
-        std::fs::create_dir_all(root.path().join("authority")).unwrap();
-        let path = root.path().join("authority").join("records.jsonl");
-        let key = SigningKey::generate(&mut OsRng);
-
-        append(&path, &signed(1, AuthorityAction::AllowAdd, "alice", &key));
-        append(
-            &path,
-            &signed(2, AuthorityAction::AllowRemove, "alice", &key),
-        );
-        let records = read_records(&path).unwrap();
-        assert_eq!(
-            next_sequence(&std::fs::read_to_string(&path).unwrap()).unwrap(),
-            3
-        );
-        let policy = fold_records(&records, &key.verifying_key());
-        assert_eq!(policy.decisions["alice"].sequence, 2);
-        assert_eq!(
-            policy.decisions["alice"].action,
-            AuthorityAction::AllowRemove
-        );
-    }
-
-    #[test]
-    fn malformed_lines_are_ignored_without_losing_sequence_progress() {
-        let root = TempDir::new().unwrap();
-        std::fs::create_dir_all(root.path().join("authority")).unwrap();
-        let path = root.path().join("authority").join("records.jsonl");
-        let key = SigningKey::generate(&mut OsRng);
-        append(&path, &signed(1, AuthorityAction::AllowAdd, "alice", &key));
-        crate::fsutil::append_line(&path, "not json\n").unwrap();
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert_eq!(next_sequence(&text).unwrap(), 2);
-        assert_eq!(read_records(&path).unwrap().len(), 1);
-    }
-
-    #[test]
-    fn authority_log_contains_no_private_key_material() {
-        let root = TempDir::new().unwrap();
-        std::fs::create_dir_all(root.path().join("authority")).unwrap();
-        let path = root.path().join("authority").join("records.jsonl");
-        let key = SigningKey::generate(&mut OsRng);
-        append(&path, &signed(1, AuthorityAction::AllowAdd, "alice", &key));
-        let text = std::fs::read_to_string(&path).unwrap();
-        assert!(!text.contains(&B64.encode(key.to_bytes())));
-        assert!(!text.contains(&hex::encode(key.to_bytes())));
-    }
 
     /// Manual proof that macOS presence gating and Keychain storage work. Not
     /// run by CI: it prompts for Touch ID/passcode and writes a temporary
@@ -489,7 +350,6 @@ mod tests {
     #[test]
     #[ignore = "requires a human at a Touch ID/passcode prompt"]
     fn manual_presence_signing() {
-        let root = TempDir::new().unwrap();
         let ids = KeychainIds {
             service: Cow::Owned(format!(
                 "com.tigwyk.cmail.authority.test.{}",
@@ -498,7 +358,7 @@ mod tests {
             seed_account: Cow::Borrowed("seed"),
             public_account: Cow::Borrowed("public"),
         };
-        let authority = MacAuthority::with_ids(ids, root.path());
+        let authority = MacAuthority::with_ids(ids);
 
         let status = authority.init().expect("authority init");
         assert!(status.available);
@@ -514,7 +374,11 @@ mod tests {
         let policy = authority.load_effective_policy().expect("policy");
         assert_eq!(policy.decisions["manual-test"].sequence, record.sequence);
 
-        authority.delete(&authority.ids.seed_account).unwrap();
-        authority.delete(&authority.ids.public_account).unwrap();
+        authority
+            .delete(authority.ids.seed_account.as_ref())
+            .unwrap();
+        authority
+            .delete(authority.ids.public_account.as_ref())
+            .unwrap();
     }
 }
