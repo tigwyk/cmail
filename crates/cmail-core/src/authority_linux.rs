@@ -7,25 +7,23 @@
 //! presence check is a speed bump, not a boundary. [`Assurance::Advisory`]
 //! and an explanation are reported rather than claiming otherwise.
 
-use crate::authority::{
-    fold_records, Assurance, Authority, AuthorityAction, AuthorityRecord, AuthorityStatus,
-    EffectivePolicy,
-};
+use crate::authority::{Assurance, Authority, AuthorityAction, AuthorityStatus, LogHead};
 use crate::error::{CoreError, Result};
 use crate::identity::fingerprint_of;
-use crate::identity::now_rfc3339;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
 use secret_service::blocking::{Collection, Item, SecretService};
 use secret_service::{EncryptionType, Error as SecretServiceError};
-use serde_json::Value;
 use std::collections::HashMap;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 
 const BACKEND: &str = "secret-service";
 const ITEM_LABEL: &str = "cmail human authority";
+/// The pinned log head lives in the keyring beside the key, never under the
+/// mailbox root, so truncating the log cannot roll policy back.
+const HEAD_LABEL: &str = "cmail authority log head";
 const CONTENT_TYPE: &str = "application/octet-stream";
 const ASSURANCE_EXPLANATION: &str = "Secret Service has no per-use presence guarantee: the login keyring is normally unlocked for the whole session, so any process running as this user can read the key. Presence is a speed bump, not a boundary.";
 const NOT_INITIALIZED: &str = "authority is not initialized; run: cmail authority init";
@@ -33,6 +31,10 @@ const LOCKED: &str = "the login keyring is locked; run a human-only command to u
 
 fn attributes() -> HashMap<&'static str, &'static str> {
     HashMap::from([("application", "cmail"), ("purpose", "authority")])
+}
+
+fn head_attributes() -> HashMap<&'static str, &'static str> {
+    HashMap::from([("application", "cmail"), ("purpose", "authority-head")])
 }
 
 fn connect() -> Result<SecretService<'static>> {
@@ -82,8 +84,11 @@ fn verifying_key_from_secret(bytes: &[u8]) -> Result<VerifyingKey> {
 
 /// Find the authority item without prompting. Returns the item and whether
 /// the provider reported it as locked.
-fn find_item<'a>(ss: &'a SecretService<'_>) -> Result<(Option<Item<'a>>, bool)> {
-    let items = ss.search_items(attributes()).map_err(map_error)?;
+fn find_item<'a>(
+    ss: &'a SecretService<'_>,
+    attributes: HashMap<&'static str, &'static str>,
+) -> Result<(Option<Item<'a>>, bool)> {
+    let items = ss.search_items(attributes).map_err(map_error)?;
     if let Some(item) = items.unlocked.into_iter().next() {
         return Ok((Some(item), false));
     }
@@ -97,45 +102,48 @@ fn unlock(collection: &Collection<'_>) -> Result<()> {
     collection.unlock().map_err(map_error)
 }
 
+/// Generate and store a fresh authority key. Callers gate this behind the
+/// collection unlock, which is the presence prompt on this platform.
+fn create_key(collection: &Collection<'_>) -> Result<()> {
+    let signing = SigningKey::generate(&mut OsRng);
+    collection
+        .create_item(
+            ITEM_LABEL,
+            attributes(),
+            &signing.to_bytes(),
+            false,
+            CONTENT_TYPE,
+        )
+        .map_err(map_error)?;
+    Ok(())
+}
+
 /// Read the signing key after unlocking the default collection. The unlock
 /// is the presence gate; a dismissed prompt is a typed refusal.
 fn signing_key_with_presence(ss: &SecretService<'_>) -> Result<SigningKey> {
-    let (item, _) = find_item(ss)?;
+    let (item, _) = find_item(ss, attributes())?;
     if item.is_none() {
         return Err(CoreError::AuthorityUnavailable(NOT_INITIALIZED.into()));
     }
     let collection = ss.get_default_collection().map_err(map_error)?;
     unlock(&collection)?;
-    let (item, _) = find_item(ss)?;
+    let (item, _) = find_item(ss, attributes())?;
     let item = item.ok_or_else(|| CoreError::AuthorityUnavailable(NOT_INITIALIZED.into()))?;
     let secret = item.get_secret().map_err(map_error)?;
     signing_key_from_secret(&secret)
 }
 
-/// Linux presence-gated backend. Keys live only in the Secret Service; the
-/// in-process record log is append-only and holds no key material.
+/// Linux presence-gated backend. Key material and the pinned log head live
+/// only in the Secret Service; records live in the shared root-scoped log.
 pub struct LinuxAuthority {
-    records: Mutex<Vec<AuthorityRecord>>,
+    last_grant: Mutex<Option<String>>,
 }
 
 impl LinuxAuthority {
     pub const fn new() -> Self {
         Self {
-            records: Mutex::new(Vec::new()),
+            last_grant: Mutex::new(None),
         }
-    }
-
-    fn records(&self) -> Result<MutexGuard<'_, Vec<AuthorityRecord>>> {
-        self.records
-            .lock()
-            .map_err(|_| CoreError::AuthorityUnavailable("authority record lock poisoned".into()))
-    }
-
-    fn last_grant(&self) -> Option<String> {
-        self.records
-            .lock()
-            .ok()
-            .and_then(|records| records.last().map(|record| record.timestamp.clone()))
     }
 }
 
@@ -151,7 +159,7 @@ impl Authority for LinuxAuthority {
             Ok(ss) => ss,
             Err(err) => return Ok(unavailable(err.to_string())),
         };
-        let (item, item_locked) = match find_item(&ss) {
+        let (item, item_locked) = match find_item(&ss, attributes()) {
             Ok(found) => found,
             Err(err) => return Ok(unavailable(err.to_string())),
         };
@@ -188,7 +196,7 @@ impl Authority for LinuxAuthority {
 
     fn init(&self) -> Result<AuthorityStatus> {
         let ss = connect()?;
-        let (item, _) = find_item(&ss)?;
+        let (item, _) = find_item(&ss, attributes())?;
         if item.is_some() {
             return self.status();
         }
@@ -200,57 +208,83 @@ impl Authority for LinuxAuthority {
             Err(err) => return Err(map_error(err)),
         };
         unlock(&collection)?;
-        let signing = SigningKey::generate(&mut OsRng);
-        collection
-            .create_item(
-                ITEM_LABEL,
-                attributes(),
-                &signing.to_bytes(),
-                false,
-                CONTENT_TYPE,
-            )
-            .map_err(map_error)?;
+        create_key(&collection)?;
         self.status()
     }
 
-    fn sign_action(
-        &self,
-        action: AuthorityAction,
-        subject: &str,
-        payload: &Value,
-    ) -> Result<AuthorityRecord> {
-        if subject.is_empty() {
-            return Err(CoreError::AuthorityInvalid(
-                "authority record subject is empty".into(),
-            ));
-        }
-        if action == AuthorityAction::Unknown {
-            return Err(CoreError::AuthorityInvalid(
-                "unknown authority action".into(),
-            ));
-        }
+    fn verifying_key(&self) -> Result<VerifyingKey> {
         let ss = connect()?;
-        // Presence first: no record is created unless the key was readable.
-        let signing = signing_key_with_presence(&ss)?;
-        let mut records = self.records()?;
-        let sequence = records.last().map_or(1, |record| record.sequence + 1);
-        let record =
-            AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &signing);
-        records.push(record.clone());
-        Ok(record)
-    }
-
-    fn load_effective_policy(&self) -> Result<EffectivePolicy> {
-        let ss = connect()?;
-        let (item, item_locked) = find_item(&ss)?;
+        let (item, item_locked) = find_item(&ss, attributes())?;
         let item = item.ok_or_else(|| CoreError::AuthorityUnavailable(NOT_INITIALIZED.into()))?;
         if item_locked {
             // Read paths never prompt; a locked keyring fails closed.
             return Err(CoreError::AuthorityUnavailable(LOCKED.into()));
         }
         let secret = item.get_secret().map_err(map_error)?;
-        let key = verifying_key_from_secret(&secret)?;
-        Ok(fold_records(&self.records()?, &key))
+        verifying_key_from_secret(&secret)
+    }
+
+    fn sign_bytes(&self, _action: AuthorityAction, _subject: &str, bytes: &str) -> Result<String> {
+        let ss = connect()?;
+        // Presence first: no signature exists unless the key was readable.
+        let signing = signing_key_with_presence(&ss)?;
+        Ok(B64.encode(signing.sign(bytes.as_bytes()).to_bytes()))
+    }
+
+    fn pinned_head(&self) -> Result<Option<LogHead>> {
+        let ss = connect()?;
+        let (item, item_locked) = find_item(&ss, head_attributes())?;
+        let Some(item) = item else {
+            return Ok(None);
+        };
+        if item_locked {
+            return Err(CoreError::AuthorityUnavailable(LOCKED.into()));
+        }
+        let secret = item.get_secret().map_err(map_error)?;
+        serde_json::from_slice(&secret).map(Some).map_err(|_| {
+            CoreError::AuthorityInvalid("Secret Service authority log head is malformed".into())
+        })
+    }
+
+    fn pin_head(&self, head: &LogHead) -> Result<()> {
+        let ss = connect()?;
+        let collection = ss.get_default_collection().map_err(map_error)?;
+        unlock(&collection)?;
+        let secret = serde_json::to_vec(head).map_err(|_| {
+            CoreError::AuthorityInvalid("authority log head is not serializable".into())
+        })?;
+        collection
+            .create_item(HEAD_LABEL, head_attributes(), &secret, true, CONTENT_TYPE)
+            .map_err(map_error)?;
+        Ok(())
+    }
+
+    fn reset_credentials(&self) -> Result<()> {
+        let ss = connect()?;
+        let collection = ss.get_default_collection().map_err(map_error)?;
+        // Presence gate; a dismissed prompt writes nothing.
+        unlock(&collection)?;
+        for attrs in [head_attributes(), attributes()] {
+            let (item, _) = find_item(&ss, attrs)?;
+            if let Some(item) = item {
+                item.delete().map_err(map_error)?;
+            }
+        }
+        create_key(&collection)?;
+        if let Ok(mut grant) = self.last_grant.lock() {
+            *grant = None;
+        }
+        Ok(())
+    }
+
+    fn last_grant(&self) -> Option<String> {
+        self.last_grant.lock().ok().and_then(|grant| grant.clone())
+    }
+
+    fn record_grant(&self, timestamp: &str) {
+        if let Ok(mut grant) = self.last_grant.lock() {
+            *grant = Some(timestamp.to_string());
+        }
     }
 }
 

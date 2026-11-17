@@ -1,6 +1,6 @@
 use crate::adoption::{self, AdoptionOutcome, AdoptionPlan, LegacyApproval};
 use crate::audit::{append, AuditEvent, AuditRecord};
-use crate::authority::Authority;
+use crate::authority::{Authority, AuthorityStatus};
 use crate::config::{Config, InboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
@@ -520,7 +520,7 @@ impl Cmail {
         plan: AdoptionPlan,
         confirmed: bool,
     ) -> Result<AdoptionOutcome> {
-        adoption::apply(authority, plan, confirmed)
+        adoption::apply(&self.root, authority, plan, confirmed)
     }
 
     /// Plan and (when confirmed) sign legacy state in one call.
@@ -531,6 +531,13 @@ impl Cmail {
     ) -> Result<AdoptionOutcome> {
         let plan = self.adoption_plan(authority)?;
         self.sign_adoption(authority, plan, confirmed)
+    }
+
+    /// Presence-gated recovery: discard the pinned head and this root's signed
+    /// record log, then re-provision the authority key. A denied presence
+    /// prompt leaves everything untouched.
+    pub fn reset_authority(&self, authority: &dyn Authority) -> Result<AuthorityStatus> {
+        authority.reset(&self.root)
     }
 
     pub fn approve(&self, id: &str, remember: bool) -> Result<()> {

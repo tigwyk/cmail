@@ -37,9 +37,14 @@ Every human decision is one record containing:
 - an action and its subject (`key_add`, `key_remove`, `allow_add`, `allow_remove`, `relay_set`, `relay_clear`, `approve`, `reject`, `quarantine_release`, and policy-mode changes);
 - a digest of the action payload;
 - the signer fingerprint;
+- the hash of the previous record (`prev`, genesis for sequence 1);
 - a signature over the canonical record bytes.
 
-Records are written to an append-only log and are never edited or deleted. Canonical encoding reuses `canonical_json`, the same deterministic serializer used for envelope signing, so signatures are stable across platforms. `approve` and `reject` bind one message id; a record cannot be replayed for another message. The latest valid record per subject wins, so revocation is another record rather than a deletion. Records with an invalid signature, a sequence gap, a duplicate, or an unknown version are ignored deterministically.
+Records are written to an append-only log and are never edited or deleted. Canonical encoding reuses `canonical_json`, the same deterministic serializer used for envelope signing, so signatures are stable across platforms. `approve` and `reject` bind one message id; a record cannot be replayed for another message. The latest valid record per subject wins, so revocation is another record rather than a deletion. The fold ignores records with an invalid signature, a sequence gap, a duplicate, or an unknown version, deterministically; the log loader is stricter and fails closed on a corrupt interior record instead of silently dropping it.
+
+### Log storage is root-scoped; the chain head is pinned beside the key
+
+One log per mailbox root (`authority.log`, one canonical JSON record per line) is shared by every backend, so policy survives a process restart on all platforms. Key material stays in the OS credential store; the log holds no secrets. Appends run under an exclusive file lock (`authority.log.lock`), so concurrent processes never interleave a line or reuse a sequence number. An incomplete final line from an interrupted append is ignored and truncated by the next append. Because a log under the mailbox root could be truncated or deleted by an agent, every append also pins `(sequence, chain-head hash)` in the credential store beside the key; a load fails closed when the log is behind that pin, has a different hash at the pinned sequence, or is missing entirely. A replaced log signed by another key fails signature verification.
 
 ### Effective policy is verified on read
 
@@ -74,9 +79,11 @@ The authority log is not a downgrade-compatible format.
 
 **Backup.** Snapshot the mailbox root before `authority init` and before `authority adopt`. Back up the authority *public* key fingerprint and the authority log with that snapshot. The Ed25519 private key is not exportable in this iteration; copying the credential-store item is not a supported backup and must not be documented as one.
 
-**Rollback.** Stop every cmail process on the root, restore the pre-adoption root snapshot, and run the previous binary. The restored snapshot contains the legacy files and no authority log, so the old binary resumes its prior behavior. Rollback discards every signed decision made since the snapshot; held mail stays held, and re-adoption is required after returning to a new binary.
+**Rollback.** Stop every cmail process on the root, restore the pre-adoption root snapshot, and run the previous binary. The restored snapshot contains the legacy files and no authority log, so the old binary resumes its prior behavior. Rollback discards every signed decision made since the snapshot; held mail stays held, and re-adoption is required after returning to a new binary. The previous binary ignores the pinned chain head; a new binary fails closed on the restored root because the log is behind the head pinned in the credential store. That is the intended truncation alarm: clear the pinned head item deliberately (macOS Keychain account `authority-log-head-v1`, Secret Service purpose `authority-head`, or Credential Manager target `cmail.authority.log-head.v1`) before running the new binary.
 
-**Lost key.** If the credential-store item is lost or the backend cannot produce signatures, cmail fails closed: human-only commands return a typed error, trust is empty, sends are held, and relay selection is disabled. Recovery is a deliberate re-initialization under a new authority key followed by re-adoption of the intended state. There is no automatic revocation or rotation: records signed by the lost key stay in the log but no longer verify, and the new key's records start a new chain. Key rotation and recovery of a compromised human session are out of scope for this iteration and require their own design.
+**Reset.** `cmail authority reset` is the recovered-key path: after a presence prompt it deletes the pinned head and the authority log, then provisions a fresh authority key. Every previous signed decision is discarded, and records signed by the old key never verify again. Snapshot the mailbox root first; reset cannot restore deleted records.
+
+**Lost key.** If the credential-store item is lost or the backend cannot produce signatures, cmail fails closed: human-only commands return a typed error, trust is empty, sends are held, and relay selection is disabled. Recovery is a deliberate re-initialization under a new authority key followed by re-adoption of the intended state. There is no automatic revocation or rotation: records signed by the lost key no longer verify, so loading the old log fails closed. Recovery therefore uses `cmail authority reset`, a presence-gated human step, to remove the stale log and pinned head before the new key's first record; key rotation and recovery of a compromised human session are out of scope for this iteration and require their own design.
 
 ## Residual bypasses
 
