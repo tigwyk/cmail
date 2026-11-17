@@ -30,6 +30,9 @@ fn print_status(status: &AuthorityStatus) {
     if let Some(grant) = &status.last_grant {
         println!("last grant: {grant}");
     }
+    if let Some(explanation) = &status.explanation {
+        println!("explanation: {explanation}");
+    }
 }
 
 pub fn init(cli: &Cli) -> Result<()> {
