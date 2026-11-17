@@ -24,6 +24,11 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub root: Option<PathBuf>,
 
+    /// Test-only: force the unavailable authority backend (debug builds only)
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    pub test_unavailable_authority: bool,
+
     #[command(subcommand)]
     pub command: Commands,
 }

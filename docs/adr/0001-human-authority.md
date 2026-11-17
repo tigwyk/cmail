@@ -55,7 +55,7 @@ Assurance is reported honestly by `authority status`. "Strong" means the key is 
 
 | Platform | Backend | Presence check | Assurance | Honest limitation |
 | --- | --- | --- | --- | --- |
-| macOS | Keychain item (`WhenUnlockedThisDeviceOnly`) with access control | Touch ID / LocalAuthentication | Strong | Ed25519 is not a Secure Enclave algorithm, so the key is device-bound and access-controlled but not hardware-bound; a human can be tricked into approving a prompt. |
+| macOS | Login Keychain generic password + LocalAuthentication | Touch ID / passcode prompt | Advisory until a presence-bound Keychain item or hardened-runtime build is available | The command-line tool lacks the data-protection entitlement for a `kSecAttrAccessControl` item and is not built with the hardened runtime. Presence is an in-process speed bump: the item is not cryptographically bound to the check, and a same-user process can bypass it (for example with `DYLD_INSERT_LIBRARIES`). Ed25519 is also not a Secure Enclave algorithm, so the key is not hardware-bound; a human can be tricked into approving a prompt. |
 | Windows | Credential Manager (DPAPI) + Windows Hello | Windows Hello via `UserConsentVerifier` | Moderate | Hello proves the human is present, but the DPAPI-protected blob is not cryptographically bound to that check; a same-user process that locates the blob can decrypt it after login. |
 | Linux | Secret Service (GNOME Keyring / KWallet), optionally polkit | Collection unlock / polkit prompt | Advisory, conditionally Moderate | A login-keyring collection is typically unlocked for the session and readable by any same-user process; Secret Service has no per-use presence guarantee. Where no usable backend exists, human-only commands fail closed. |
 
