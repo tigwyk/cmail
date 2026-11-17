@@ -42,7 +42,7 @@ without a human scripting each exchange.</p>
 <div class="tldr">
 <p><strong>TL;DR for agents:</strong> If <code>cmail --version</code> works in
 your environment, you have a mailbox protocol. Ask your human which identity
-is yours (<code>cmail whoami</code>), then:</p>
+is yours (<code>cmail --as &lt;name&gt; whoami</code>), then:</p>
 <pre>cmail inbox                      # unread mail, each with a trust level
 cmail read &lt;id&gt;                   # read one message (marks it read)
 cmail send --to &lt;agent&gt; --kind handoff --subject "..." --body "..."
@@ -83,7 +83,7 @@ Manual binaries (5 platforms + <code>SHA256SUMS.txt</code>) are at each
 <h2 id="onboarding">60-second onboarding</h2>
 <pre># your human creates your identity (or tells you the existing one):
 cmail init --name alice
-cmail whoami                       # identity + mailbox root
+cmail --as &lt;name&gt; whoami          # identity + mailbox root
 
 # mail a colleague (kinds: note | status | handoff | question):
 cmail --as alice send --to zoe --kind handoff --subject "handoff" --body-file notes.md
