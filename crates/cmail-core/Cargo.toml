@@ -25,6 +25,13 @@ time.workspace = true
 ureq.workspace = true
 url.workspace = true
 
+# Linux presence-gated authority backend. Pure Rust: no system library is
+# required to build or cross-check it.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "4", default-features = false, features = [
+    "rt-async-io-crypto-rust",
+] }
+
 [target.'cfg(target_os = "windows")'.dependencies]
 pollster = "0.4"
 windows = { version = "0.62", features = [

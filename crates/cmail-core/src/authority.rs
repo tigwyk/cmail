@@ -200,6 +200,10 @@ pub struct AuthorityStatus {
     pub backend: String,
     pub assurance: Assurance,
     pub last_grant: Option<String>,
+    /// Honest limitation of the backend, present whenever assurance is
+    /// weaker than a real boundary (or the backend is unavailable).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
 }
 
 /// The single authority seam. Platform credential-store backends implement
@@ -271,6 +275,7 @@ impl Authority for InMemoryAuthority {
                 backend: "memory".into(),
                 assurance: Assurance::Advisory,
                 last_grant: state.last_grant.clone(),
+                explanation: None,
             },
             None => AuthorityStatus {
                 available: false,
@@ -278,6 +283,7 @@ impl Authority for InMemoryAuthority {
                 backend: "memory".into(),
                 assurance: Assurance::None,
                 last_grant: None,
+                explanation: None,
             },
         })
     }
@@ -342,6 +348,7 @@ impl Authority for UnavailableAuthority {
             backend: "none".into(),
             assurance: Assurance::None,
             last_grant: None,
+            explanation: None,
         })
     }
 
@@ -371,17 +378,23 @@ impl Authority for UnavailableAuthority {
 
 /// The process-wide authority backend. Resolved here so the CLI cannot choose
 /// one from the environment; release builds have no injectable backend.
+#[cfg(target_os = "linux")]
 pub fn system_authority() -> &'static dyn Authority {
-    #[cfg(target_os = "windows")]
-    {
-        static WINDOWS: windows::WindowsAuthority = windows::WindowsAuthority::new();
-        &WINDOWS
-    }
-    #[cfg(not(target_os = "windows"))]
-    {
-        static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
-        &UNAVAILABLE
-    }
+    static LINUX: crate::authority_linux::LinuxAuthority =
+        crate::authority_linux::LinuxAuthority::new();
+    &LINUX
+}
+
+#[cfg(target_os = "windows")]
+pub fn system_authority() -> &'static dyn Authority {
+    static WINDOWS: windows::WindowsAuthority = windows::WindowsAuthority::new();
+    &WINDOWS
+}
+
+#[cfg(not(any(target_os = "linux", target_os = "windows")))]
+pub fn system_authority() -> &'static dyn Authority {
+    static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
+    &UNAVAILABLE
 }
 
 #[cfg(test)]

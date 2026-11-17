@@ -1,6 +1,8 @@
 pub mod adoption;
 pub mod audit;
 pub mod authority;
+#[cfg(target_os = "linux")]
+mod authority_linux;
 pub mod canonical;
 pub mod config;
 pub mod crypto;
