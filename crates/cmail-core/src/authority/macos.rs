@@ -15,16 +15,12 @@
 //! process can bypass it, for example by injecting into cmail with
 //! `DYLD_INSERT_LIBRARIES`. Reporting Moderate or Strong would be dishonest.
 
-use super::{
-    fold_records, Assurance, Authority, AuthorityAction, AuthorityRecord, AuthorityStatus,
-    EffectivePolicy,
-};
+use super::{Assurance, Authority, AuthorityAction, AuthorityStatus, LogHead};
 use crate::error::{CoreError, Result};
 use crate::identity::fingerprint_of;
-use crate::identity::now_rfc3339;
 use base64::engine::general_purpose::STANDARD as B64;
 use base64::Engine;
-use ed25519_dalek::{SigningKey, VerifyingKey};
+use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
 use objc2::runtime::Bool;
 use objc2_foundation::{NSError, NSString};
 use objc2_local_authentication::{LAContext, LAPolicy};
@@ -34,9 +30,8 @@ use security_framework::item::{ItemClass, ItemSearchOptions};
 use security_framework::passwords::{
     delete_generic_password, generic_password, set_generic_password,
 };
-use serde_json::Value;
 use std::borrow::Cow;
-use std::sync::{Mutex, MutexGuard};
+use std::sync::Mutex;
 use std::time::Duration;
 
 /// Keychain service shared by the authority items.
@@ -46,6 +41,9 @@ const SEED_ACCOUNT: &str = "ed25519-signing-key-v1";
 /// Account holding the public half, readable without a presence prompt so
 /// status and policy verification do not interrupt the human.
 const PUBLIC_ACCOUNT: &str = "ed25519-public-key-v1";
+/// Account holding the pinned log head. Beside the key, in the credential
+/// store, so truncating the mailbox-root log cannot roll policy back.
+const HEAD_ACCOUNT: &str = "authority-log-head-v1";
 
 /// How long a human has to answer the presence prompt before the request fails
 /// closed. The evaluation is cancelled when the context is dropped.
@@ -61,24 +59,25 @@ struct KeychainIds {
     service: Cow<'static, str>,
     seed_account: Cow<'static, str>,
     public_account: Cow<'static, str>,
+    head_account: Cow<'static, str>,
 }
 
 const SYSTEM_IDS: KeychainIds = KeychainIds {
     service: Cow::Borrowed(SERVICE),
     seed_account: Cow::Borrowed(SEED_ACCOUNT),
     public_account: Cow::Borrowed(PUBLIC_ACCOUNT),
+    head_account: Cow::Borrowed(HEAD_ACCOUNT),
 };
 
 #[derive(Default)]
 struct MacState {
-    records: Vec<AuthorityRecord>,
     last_grant: Option<String>,
 }
 
 pub(super) struct MacAuthority {
     ids: KeychainIds,
-    /// Records stay in the backend until the shared log store lands in the
-    /// persistence ticket; only the signing key is stored persistently here.
+    /// Key material and the pinned log head live in the Keychain; records
+    /// live in the shared root-scoped log.
     state: Mutex<MacState>,
 }
 
@@ -86,10 +85,7 @@ pub(super) struct MacAuthority {
 pub(super) fn authority() -> &'static dyn Authority {
     static MAC: MacAuthority = MacAuthority {
         ids: SYSTEM_IDS,
-        state: Mutex::new(MacState {
-            records: Vec::new(),
-            last_grant: None,
-        }),
+        state: Mutex::new(MacState { last_grant: None }),
     };
     &MAC
 }
@@ -101,12 +97,6 @@ impl MacAuthority {
             ids,
             state: Mutex::new(MacState::default()),
         }
-    }
-
-    fn state(&self) -> Result<MutexGuard<'_, MacState>> {
-        self.state
-            .lock()
-            .map_err(|_| CoreError::AuthorityUnavailable("macOS authority lock poisoned".into()))
     }
 
     fn item_exists(&self, account: &str) -> Result<bool> {
@@ -259,7 +249,7 @@ impl Authority for MacAuthority {
             fingerprint: Some(fingerprint_of(&B64.encode(key.as_bytes()))),
             backend: "macos-keychain".into(),
             assurance: Assurance::Advisory,
-            last_grant: self.state()?.last_grant.clone(),
+            last_grant: self.last_grant(),
             explanation: Some(
                 "presence is an in-process LocalAuthentication speed bump; the Keychain item is not cryptographically bound to that check, and without the hardened runtime a same-user process can bypass it (for example with DYLD_INSERT_LIBRARIES)"
                     .into(),
@@ -298,49 +288,53 @@ impl Authority for MacAuthority {
             }
             return Err(error);
         }
-        // A newly created key starts a new chain in this process.
-        let mut state = self.state()?;
-        state.records.clear();
-        state.last_grant = None;
-        drop(state);
+        // A newly created key starts a new chain.
+        if let Ok(mut state) = self.state.lock() {
+            state.last_grant = None;
+        }
         self.status()
     }
 
-    fn sign_action(
-        &self,
-        action: AuthorityAction,
-        subject: &str,
-        payload: &Value,
-    ) -> Result<AuthorityRecord> {
-        if subject.is_empty() {
-            return Err(CoreError::AuthorityInvalid(
-                "authority record subject is empty".into(),
-            ));
-        }
-        if action == AuthorityAction::Unknown {
-            return Err(CoreError::AuthorityInvalid(
-                "unknown authority action".into(),
-            ));
-        }
+    fn verifying_key(&self) -> Result<VerifyingKey> {
+        self.read_public_key()
+    }
 
+    fn sign_bytes(&self, _action: AuthorityAction, _subject: &str, bytes: &str) -> Result<String> {
         // Fail before prompting if no authority exists.
         let _ = self.read_public_key()?;
         require_presence("Approve a cmail human-authority signing request")?;
         let signing = self.read_seed()?;
-
-        let mut state = self.state()?;
-        let sequence = state.records.last().map_or(1, |record| record.sequence + 1);
-        let record =
-            AuthorityRecord::sign(sequence, now_rfc3339(), action, subject, payload, &signing);
-        state.last_grant = Some(record.timestamp.clone());
-        state.records.push(record.clone());
-        Ok(record)
+        Ok(B64.encode(signing.sign(bytes.as_bytes()).to_bytes()))
     }
 
-    fn load_effective_policy(&self) -> Result<EffectivePolicy> {
-        let key = self.read_public_key()?;
-        let state = self.state()?;
-        Ok(fold_records(&state.records, &key))
+    fn pinned_head(&self) -> Result<Option<LogHead>> {
+        if !self.item_exists(self.ids.head_account.as_ref())? {
+            return Ok(None);
+        }
+        let bytes = self.get(self.ids.head_account.as_ref())?;
+        serde_json::from_slice(&bytes).map(Some).map_err(|_| {
+            CoreError::AuthorityInvalid("macOS authority log head is malformed".into())
+        })
+    }
+
+    fn pin_head(&self, head: &LogHead) -> Result<()> {
+        let bytes = serde_json::to_vec(head).map_err(|_| {
+            CoreError::AuthorityInvalid("authority log head is not serializable".into())
+        })?;
+        self.set(self.ids.head_account.as_ref(), &bytes)
+    }
+
+    fn last_grant(&self) -> Option<String> {
+        self.state
+            .lock()
+            .ok()
+            .and_then(|state| state.last_grant.clone())
+    }
+
+    fn record_grant(&self, timestamp: &str) {
+        if let Ok(mut state) = self.state.lock() {
+            state.last_grant = Some(timestamp.to_string());
+        }
     }
 }
 
@@ -365,8 +359,10 @@ mod tests {
             )),
             seed_account: Cow::Borrowed("seed"),
             public_account: Cow::Borrowed("public"),
+            head_account: Cow::Borrowed("head"),
         };
         let authority = MacAuthority::with_ids(ids);
+        let root = tempfile::TempDir::new().unwrap();
 
         let status = authority.init().expect("authority init");
         assert!(status.available);
@@ -374,12 +370,15 @@ mod tests {
 
         let record = authority
             .sign_action(
+                root.path(),
                 AuthorityAction::AllowAdd,
                 "manual-test",
                 &json!({ "probe": true }),
             )
             .expect("presence-gated signature");
-        let policy = authority.load_effective_policy().expect("policy");
+        let policy = authority
+            .load_effective_policy(root.path())
+            .expect("policy");
         assert_eq!(policy.decisions["manual-test"].sequence, record.sequence);
 
         authority
@@ -387,6 +386,9 @@ mod tests {
             .unwrap();
         authority
             .delete(authority.ids.public_account.as_ref())
+            .unwrap();
+        authority
+            .delete(authority.ids.head_account.as_ref())
             .unwrap();
     }
 }

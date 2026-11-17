@@ -520,7 +520,7 @@ impl Cmail {
         plan: AdoptionPlan,
         confirmed: bool,
     ) -> Result<AdoptionOutcome> {
-        adoption::apply(authority, plan, confirmed)
+        adoption::apply(&self.root, authority, plan, confirmed)
     }
 
     /// Plan and (when confirmed) sign legacy state in one call.
