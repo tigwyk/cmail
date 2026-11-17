@@ -91,14 +91,15 @@ impl Policy {
         self.config.outbound
     }
 
+    /// Legacy config inbound mode. Display only: the inbox gate reads the
+    /// signed `mode:inbound` record, never this value.
     pub fn inbound(&self) -> InboundMode {
         self.config.inbound
     }
 
     /// The signed outbound mode, if the human signed one. `None` means the
     /// gate is allowlist-only: config `[outbound]` never opens it, and an
-    /// unavailable authority folds to no decision. Modes enforcement beyond
-    /// this accessor belongs to ticket #15; it plugs in here.
+    /// unavailable authority folds to no decision.
     pub fn outbound_mode(&self) -> Option<OutboundMode> {
         let decision = self
             .effective()
@@ -108,12 +109,49 @@ impl Policy {
         serde_json::from_value(decision.payload.as_ref()?.get("mode")?.clone()).ok()
     }
 
+    /// The effective inbound mode.
+    ///
+    /// A signed `mode:inbound` record wins. With no signed record, an
+    /// available authority falls back to `config.inbound` only to TIGHTEN:
+    /// legacy `known-only` is honored, while legacy `permissive` cannot
+    /// loosen anything. An unavailable authority, a tampered log, or an
+    /// unparseable signed payload fails closed to `known-only`.
+    pub fn inbound_mode(&self) -> InboundMode {
+        let Ok(policy) = self.effective() else {
+            return InboundMode::KnownOnly;
+        };
+        let Some(decision) = policy.decisions.get(subject::INBOUND_MODE) else {
+            let available = self
+                .authority
+                .status()
+                .map(|status| status.available)
+                .unwrap_or(false);
+            return if available {
+                self.config.inbound
+            } else {
+                InboundMode::KnownOnly
+            };
+        };
+        decision
+            .payload
+            .as_ref()
+            .and_then(|payload| payload.get("mode"))
+            .and_then(|mode| serde_json::from_value(mode.clone()).ok())
+            .unwrap_or(InboundMode::KnownOnly)
+    }
+
+    /// True when the signed outbound mode is `open`. The only place a config
+    /// mode could leak is [`Policy::outbound`], which this gate never reads.
+    fn mode_allows(&self) -> bool {
+        self.outbound_mode() == Some(OutboundMode::Open)
+    }
+
     /// The outbound gate: a signed open-mode record, or a signed allow entry.
     /// The legacy `[allow] send` config and a hand-edited record log never
     /// grant a send, and an unavailable authority leaves both empty, so
     /// gated sends fail closed.
     pub fn may_send(&self, to: &str) -> bool {
-        self.outbound_mode() == Some(OutboundMode::Open) || self.is_allowed(to)
+        self.mode_allows() || self.is_allowed(to)
     }
 
     /// True when the latest signed allow decision for `name` is an add.
@@ -140,9 +178,20 @@ impl Policy {
         Ok(names)
     }
 
-    /// The configured pickup relay url, if any.
+    /// The effective signed pickup relay url, if any. Clear means no relay;
+    /// the legacy `[relay] url` config never becomes the fetch target.
     pub fn relay_url(&self) -> Option<String> {
-        self.config.relay_url()
+        let decision = self.effective().ok()?.decisions.get(subject::RELAY)?;
+        if decision.action != crate::authority::AuthorityAction::RelaySet {
+            return None;
+        }
+        decision
+            .payload
+            .as_ref()?
+            .get("url")?
+            .as_str()
+            .filter(|url| !url.is_empty())
+            .map(str::to_string)
     }
 
     /// The per-recipient relay route, if known (never affects trust).
@@ -238,15 +287,12 @@ mod tests {
         let (root, alice) = legacy_root(&authority);
         let policy = Policy::load(root.path(), authority.clone()).unwrap();
 
-        // the signed log supplies the allowlist; config still carries the
-        // display-only mode and relay; the keyring carries the route overlay
+        // Legacy config remains display-only: signed records supply the
+        // allowlist, and relay/mode behavior comes only from signed records.
         assert_eq!(policy.outbound(), OutboundMode::Gated);
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
         assert_eq!(policy.allow_list().unwrap(), ["zoe".to_string()]);
-        assert_eq!(
-            policy.relay_url().as_deref(),
-            Some("https://relay.example.com")
-        );
+        assert_eq!(policy.relay_url(), None);
         assert_eq!(
             policy.route("alice").unwrap().as_deref(),
             Some("https://alice.example.com")
@@ -264,7 +310,8 @@ mod tests {
         assert!(!Policy::load(root.path(), authority.clone())
             .unwrap()
             .may_send("mallory"));
-        // a signed open-mode record is what opens the gate
+
+        // A signed open mode and a signed relay record are effective.
         authority
             .sign_action(
                 root.path(),
@@ -273,9 +320,37 @@ mod tests {
                 &serde_json::json!({ "mode": "open" }),
             )
             .unwrap();
-        assert!(Policy::load(root.path(), authority.clone())
-            .unwrap()
-            .may_send("mallory"));
+        authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::RelaySet,
+                subject::RELAY,
+                &serde_json::json!({ "url": "https://signed.example.com" }),
+            )
+            .unwrap();
+        let signed = Policy::load(root.path(), authority.clone()).unwrap();
+        assert_eq!(signed.outbound_mode(), Some(OutboundMode::Open));
+        assert!(signed.may_send("mallory"));
+        assert_eq!(
+            signed.relay_url().as_deref(),
+            Some("https://signed.example.com")
+        );
+
+        // Latest relay decision wins: clear disables the target.
+        authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::RelayClear,
+                subject::RELAY,
+                &serde_json::json!({}),
+            )
+            .unwrap();
+        assert_eq!(
+            Policy::load(root.path(), authority.clone())
+                .unwrap()
+                .relay_url(),
+            None
+        );
 
         // trust through the seam is exactly the trust module on that keyring
         let env = signed_alice(&alice);
@@ -338,10 +413,7 @@ mod tests {
         let policy = Policy::load(root.path(), authority.clone()).unwrap();
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
         assert_eq!(policy.allow_list().unwrap(), ["zoe".to_string()]);
-        assert_eq!(
-            policy.relay_url().as_deref(),
-            Some("https://relay.example.com")
-        );
+        assert_eq!(policy.relay_url(), None);
         assert!(policy.may_send("zoe"));
         assert!(!policy.may_send("mallory"));
 

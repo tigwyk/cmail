@@ -24,6 +24,7 @@ pub enum AuditEvent {
     // v0.3 relay events (spec §3.4): routing decisions and relay traffic
     KeyRoute,
     RelaySet,
+    ModeSet,
     SendRelay,
     Fetch,
 }

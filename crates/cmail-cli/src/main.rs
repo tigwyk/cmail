@@ -130,6 +130,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: RelayCommand,
     },
+    /// Show or change the root-wide outbound/inbound policy modes (human-only)
+    Mode {
+        #[command(subcommand)]
+        cmd: ModeCommand,
+    },
     /// Inspect quarantine (human-only)
     Quarantine {
         #[command(subcommand)]
@@ -216,6 +221,16 @@ pub enum RelayCommand {
 }
 
 #[derive(Subcommand)]
+pub enum ModeCommand {
+    /// Show the effective signed modes
+    Show,
+    /// Set the signed outbound mode (gated | open)
+    Outbound { mode: String },
+    /// Set the signed inbound mode (permissive | known-only)
+    Inbound { mode: String },
+}
+
+#[derive(Subcommand)]
 pub enum QuarantineCommand {
     List,
     Show { id: String },
@@ -277,6 +292,14 @@ fn map_relay(cmd: &RelayCommand) -> commands::admin::RelayCmd {
         RelayCommand::Set { url } => commands::admin::RelayCmd::Set { url: url.clone() },
         RelayCommand::Clear => commands::admin::RelayCmd::Clear,
         RelayCommand::Show => commands::admin::RelayCmd::Show,
+    }
+}
+
+fn map_mode(cmd: &ModeCommand) -> commands::admin::ModeCmd {
+    match cmd {
+        ModeCommand::Show => commands::admin::ModeCmd::Show,
+        ModeCommand::Outbound { mode } => commands::admin::ModeCmd::Outbound { mode: mode.clone() },
+        ModeCommand::Inbound { mode } => commands::admin::ModeCmd::Inbound { mode: mode.clone() },
     }
 }
 
@@ -352,6 +375,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Reject { id } => commands::admin::reject(cli, id),
         Commands::Keyring { cmd } => commands::admin::keyring(cli, map_keyring(cmd)),
         Commands::Relay { cmd } => commands::admin::relay(cli, map_relay(cmd)),
+        Commands::Mode { cmd } => commands::admin::mode(cli, map_mode(cmd)),
         Commands::Quarantine { cmd } => commands::admin::quarantine(cli, map_quarantine(cmd)),
         Commands::Audit { tail } => commands::admin::audit(cli, *tail),
         Commands::RelayServe {

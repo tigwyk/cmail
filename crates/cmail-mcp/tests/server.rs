@@ -1,16 +1,33 @@
 use std::io::Cursor;
 
 fn drive(root: &std::path::Path, lines: &[&str]) -> Vec<serde_json::Value> {
+    drive_with(root, lines, cmail_core::authority::system_authority())
+}
+
+/// An available authority with no signed records: the permissive inbound
+/// default applies instead of the unavailable-authority known-only fallback.
+fn memory_authority() -> std::sync::Arc<dyn cmail_core::authority::Authority> {
+    let authority = cmail_core::authority::InMemoryAuthority::new();
+    cmail_core::authority::Authority::init(&authority).unwrap();
+    std::sync::Arc::new(authority)
+}
+
+fn drive_with(
+    root: &std::path::Path,
+    lines: &[&str],
+    authority: std::sync::Arc<dyn cmail_core::authority::Authority>,
+) -> Vec<serde_json::Value> {
     let input = lines.join("\n");
     let mut out = Vec::new();
     let writer = Vec::new();
     let result = {
         let mut writer = Cursor::new(writer);
-        let r = cmail_mcp::run_server(
+        let r = cmail_mcp::run_server_with_authority(
             root.to_path_buf(),
             Some("zoe".into()),
             Cursor::new(input),
             &mut writer,
+            authority,
         );
         r.unwrap();
         writer
@@ -226,7 +243,7 @@ fn inbox_read_reply_wait_covered_via_mcp() {
         r#"{"jsonrpc":"2.0","id":5,"method":"tools/call","params":{"name":"cmail_wait","arguments":{"timeout_seconds":1}}}"#.into(),
     ];
     let refs: Vec<&str> = lines.iter().map(String::as_str).collect();
-    let out = drive(root.path(), &refs);
+    let out = drive_with(root.path(), &refs, memory_authority());
     // Responses (notification silent): [initialize, inbox, read, reply, wait].
     let inbox: serde_json::Value =
         serde_json::from_str(out[1]["result"]["content"][0]["text"].as_str().unwrap()).unwrap();

@@ -81,6 +81,9 @@ fn tamper_zoe_inbox_created(root: &TempDir) {
 #[test]
 fn full_lifecycle_with_json_shapes() {
     let root = TempDir::new().unwrap();
+    // An available authority keeps the no-record inbound default permissive;
+    // without one the gate fails closed to known-only.
+    let cmail = |root: &TempDir| cmail(root);
 
     // two identities
     let init = json_out(
@@ -418,6 +421,9 @@ fn corrupt_lands_in_quarantine_never_inbox() {
 #[test]
 fn hand_edited_keyring_never_grants_trust() {
     let root = TempDir::new().unwrap();
+    // Available authority: no signed record, so inbound uses the permissive
+    // default rather than the unavailable-authority known-only fallback.
+    let cmail = |root: &TempDir| cmail(root);
     cmail(&root)
         .arg("init")
         .arg("--name")
@@ -765,28 +771,144 @@ fn keyring_route_and_relay_config_lifecycle() {
         .code(1)
         .stdout(contains("\"error\""));
 
-    // relay set -> config shows the url -> relay show -> clear
+    // relay set -> signed latest wins -> hand-edited config ignored -> clear
     let rset = json_out(
         cmail(&root)
             .arg("--json")
             .arg("relay")
             .arg("set")
-            .arg("https://pickup.example.com"),
+            .arg("https://one.example.com"),
     );
     assert_eq!(rset["status"], "set");
-    assert_eq!(rset["url"], "https://pickup.example.com");
+    assert_eq!(rset["url"], "https://one.example.com");
+    assert_eq!(rset["scope"], "root-wide");
     let cfg = json_out(cmail(&root).arg("--json").arg("config"));
-    assert_eq!(cfg["config"]["relay"]["url"], "https://pickup.example.com");
+    assert!(
+        cfg["config"]["relay"]["url"]
+            .as_str()
+            .unwrap_or("")
+            .is_empty(),
+        "signed relay must not write the config file"
+    );
     let shown = json_out(cmail(&root).arg("--json").arg("relay").arg("show"));
-    assert_eq!(shown["url"], "https://pickup.example.com");
+    assert_eq!(shown["url"], "https://one.example.com");
+    assert_eq!(shown["scope"], "root-wide");
+
+    let rset2 = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("relay")
+            .arg("set")
+            .arg("https://two.example.com"),
+    );
+    assert_eq!(rset2["status"], "set");
+    assert_eq!(
+        json_out(cmail(&root).arg("--json").arg("relay").arg("show"))["url"],
+        "https://two.example.com"
+    );
+
+    // A hand-edited config relay never replaces the signed target.
+    let mut cfg = cmail_core::Config::load_or_init(root.path()).unwrap();
+    cfg.relay.url = Some("https://evil.example.com".into());
+    cfg.save(root.path()).unwrap();
+    assert_eq!(
+        json_out(cmail(&root).arg("--json").arg("relay").arg("show"))["url"],
+        "https://two.example.com"
+    );
+
+    // signed modes are latest-wins; hand-edited config never moves them, and
+    // the outbound gate follows the signed record only
+    let mut cfg = cmail_core::Config::load_or_init(root.path()).unwrap();
+    cfg.outbound = cmail_core::config::OutboundMode::Open;
+    cfg.inbound = cmail_core::config::InboundMode::KnownOnly;
+    cfg.save(root.path()).unwrap();
+    assert_eq!(
+        json_out(cmail(&root).arg("--json").arg("mode").arg("show"))["outbound"],
+        "gated"
+    );
+    let held = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("alice")
+            .arg("--json")
+            .arg("send")
+            .arg("--to")
+            .arg("zoe")
+            .arg("--body")
+            .arg("gated"),
+    );
+    assert_eq!(held["status"], "held");
+
+    let opened = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("mode")
+            .arg("outbound")
+            .arg("open"),
+    );
+    assert_eq!(opened["status"], "set");
+    assert_eq!(opened["value"], "open");
+    assert_eq!(opened["scope"], "root-wide");
+    assert_eq!(
+        json_out(cmail(&root).arg("--json").arg("mode").arg("show"))["outbound"],
+        "open"
+    );
+    let sent = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("alice")
+            .arg("--json")
+            .arg("send")
+            .arg("--to")
+            .arg("zoe")
+            .arg("--body")
+            .arg("open"),
+    );
+    assert_eq!(sent["status"], "sent");
+
+    let gated = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("mode")
+            .arg("outbound")
+            .arg("gated"),
+    );
+    assert_eq!(gated["value"], "gated");
+    let held_again = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("alice")
+            .arg("--json")
+            .arg("send")
+            .arg("--to")
+            .arg("zoe")
+            .arg("--body")
+            .arg("gated again"),
+    );
+    assert_eq!(held_again["status"], "held");
+
+    let strict = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("mode")
+            .arg("inbound")
+            .arg("known-only"),
+    );
+    assert_eq!(strict["value"], "known-only");
+    let modes = json_out(cmail(&root).arg("--json").arg("mode").arg("show"));
+    assert_eq!(modes["outbound"], "gated");
+    assert_eq!(modes["inbound"], "known-only");
+    assert_eq!(modes["scope"], "root-wide");
+
     let rclear = json_out(cmail(&root).arg("--json").arg("relay").arg("clear"));
     assert_eq!(rclear["status"], "cleared");
-    let cfg2 = json_out(cmail(&root).arg("--json").arg("config"));
-    assert!(cfg2["config"]["relay"]["url"].is_null());
-    let shown2 = json_out(cmail(&root).arg("--json").arg("relay").arg("show"));
-    assert!(shown2["url"].is_null());
+    assert_eq!(rclear["scope"], "root-wide");
+    assert!(
+        json_out(cmail(&root).arg("--json").arg("relay").arg("show"))["url"].is_null(),
+        "clear disables the relay even with a hand-edited config url"
+    );
 
-    // audit saw the routing and relay-config decisions
+    // audit saw the routing, relay, and mode decisions
     let audit = json_out(
         cmail(&root)
             .arg("--json")
@@ -800,12 +922,63 @@ fn keyring_route_and_relay_config_lifecycle() {
         .iter()
         .map(|r| r["event"].as_str().unwrap())
         .collect();
-    for expected in ["key_route", "relay_set"] {
+    for expected in ["key_route", "relay_set", "mode_set"] {
         assert!(
             events.contains(&expected),
             "missing {expected} in {events:?}"
         );
     }
+}
+
+/// Without an authority backend, relay and mode changes fail closed with typed
+/// guidance and write no record. Reads stay sane: no signed relay, default
+/// gated/permissive modes.
+#[test]
+fn relay_and_mode_changes_fail_closed_without_authority() {
+    let root = TempDir::new().unwrap();
+    for args in [
+        vec!["relay", "set", "https://evil.example.com"],
+        vec!["relay", "clear"],
+        vec!["mode", "outbound", "open"],
+        vec!["mode", "inbound", "known-only"],
+    ] {
+        let mut cmd = cmail(&root);
+        cmd.arg("--json").arg("--test-unavailable-authority");
+        for arg in &args {
+            cmd.arg(arg);
+        }
+        let out = cmd.assert().code(1).get_output().stdout.clone();
+        let value: serde_json::Value = serde_json::from_slice(&out).unwrap();
+        let message = value["error"].as_str().unwrap_or_default();
+        assert!(
+            message.contains("authority unavailable"),
+            "{args:?} must fail closed, got {message}"
+        );
+        assert!(
+            !root.path().join("authority.log").exists(),
+            "{args:?} wrote a signed record without authority"
+        );
+    }
+
+    let shown = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("--test-unavailable-authority")
+            .arg("relay")
+            .arg("show"),
+    );
+    assert!(shown["url"].is_null());
+    assert_eq!(shown["scope"], "root-wide");
+    let modes = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("--test-unavailable-authority")
+            .arg("mode")
+            .arg("show"),
+    );
+    assert_eq!(modes["outbound"], "gated");
+    assert_eq!(modes["inbound"], "known-only");
+    assert_eq!(modes["scope"], "root-wide");
 }
 
 #[test]
