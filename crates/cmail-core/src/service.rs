@@ -1392,6 +1392,14 @@ mod tests {
         authority
     }
 
+    /// A new "process": same signing key, no in-memory pinned head or cache,
+    /// so only the persisted record log carries the decision.
+    fn restarted_authority(authority: &TestAuthority) -> std::sync::Arc<dyn Authority> {
+        std::sync::Arc::new(crate::authority::InMemoryAuthority::with_signing_key(
+            authority.signing_key().unwrap(),
+        ))
+    }
+
     #[test]
     fn init_refuses_silent_collision_and_reuse_is_explicit() {
         let root = TempDir::new().unwrap();
@@ -1858,7 +1866,10 @@ mod tests {
 
     #[test]
     fn signed_remove_by_name_revokes_trust_and_survives_restart() {
-        let (root, c) = svc();
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
         c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
         let alice = load_identity(&c.root, "alice").unwrap().signing.clone();
         let env = envelope_from("alice", &alice);
@@ -1869,14 +1880,17 @@ mod tests {
         assert!(c.keyring_list().unwrap().is_empty());
 
         // A new process with the same key sees the persisted revocation.
-        let restarted = open_with(root.path(), c.authority.clone()).unwrap();
+        let restarted = open_with(root.path(), restarted_authority(&authority)).unwrap();
         assert_eq!(level(&restarted, &env), TrustLevel::Untrusted);
         assert!(restarted.keyring_remove("alice").is_err());
     }
 
     #[test]
     fn rotation_revokes_the_old_key_and_trusts_the_new_one() {
-        let (root, c) = svc();
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
         c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
         let old = load_identity(&c.root, "alice").unwrap().signing.clone();
         let fresh = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
@@ -1903,7 +1917,7 @@ mod tests {
             TrustLevel::Verified
         );
 
-        let restarted = open_with(root.path(), c.authority.clone()).unwrap();
+        let restarted = open_with(root.path(), restarted_authority(&authority)).unwrap();
         assert_eq!(
             level(&restarted, &envelope_from("alice", &old)),
             TrustLevel::SpoofSuspect
