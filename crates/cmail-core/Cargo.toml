@@ -39,6 +39,14 @@ secret-service = { version = "4", default-features = false, features = [
     "rt-async-io-crypto-rust",
 ] }
 
+[target.'cfg(target_os = "windows")'.dependencies]
+pollster = "0.4"
+windows = { version = "0.62", features = [
+    "Security_Credentials_UI",
+    "Win32_Security_Credentials",
+    "Win32_System_WinRT",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 # Dev-only (legal Cargo cycle): in-process relay fixtures for the routed-send
