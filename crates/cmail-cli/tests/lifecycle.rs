@@ -25,15 +25,14 @@ fn json_out(cmd: &mut Command) -> serde_json::Value {
     serde_json::from_slice(&out).expect("valid json on stdout")
 }
 
-/// Approve every held message (outbound gate defaults to `gated`, so a fresh
-/// send only reaches the recipient after the human releases it).
-fn approve_all_held(root: &TempDir) {
-    let apps = json_out(cmail(root).arg("--json").arg("approvals"));
-    for h in apps.as_array().unwrap() {
-        let id = h["id"].as_str().unwrap();
-        let out = json_out(cmail(root).arg("--json").arg("approve").arg(id));
-        assert_eq!(out["status"], "approved");
-    }
+/// Allowlist a recipient for future sends. CLI approve/reject require the
+/// human authority, which cannot be satisfied in CI without a Touch ID prompt,
+/// so lifecycle delivery uses the unsigned outbound allowlist instead. Signed
+/// approval release is covered by the core service tests against the
+/// in-memory authority seam.
+fn allow_send_to(root: &TempDir, name: &str) {
+    let out = json_out(cmail(root).arg("--json").arg("allow").arg("add").arg(name));
+    assert_eq!(out["status"], "allowed");
 }
 
 /// Tamper with zoe's single inbox message by rewriting its `created` value in
@@ -110,15 +109,47 @@ fn full_lifecycle_with_json_shapes() {
     );
     assert_eq!(empty.as_array().map(Vec::len), Some(0));
 
-    // approve (human); --remember allowlists zoe for alice's future sends
-    let approved = json_out(
+    // approvals is read-only: it lists the held message without releasing it.
+    let apps = json_out(cmail(&root).arg("--json").arg("approvals"));
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+    assert_eq!(apps[0]["id"], id.as_str());
+
+    // Approve and reject need the human authority. With no usable authority
+    // both fail closed with typed guidance and leave the queue untouched; no
+    // real presence prompt is available in CI.
+    for cmd in ["approve", "reject"] {
         cmail(&root)
             .arg("--json")
-            .arg("approve")
+            .arg("--test-unavailable-authority")
+            .arg(cmd)
             .arg(&id)
-            .arg("--remember"),
+            .assert()
+            .failure()
+            .stdout(contains("authority unavailable"));
+    }
+    let apps = json_out(cmail(&root).arg("--json").arg("approvals"));
+    assert_eq!(apps.as_array().unwrap().len(), 1);
+
+    // The unsigned allowlist only affects future sends; the held message stays
+    // held. Send a fresh message that the gate now delivers.
+    allow_send_to(&root, "zoe");
+    let sent = json_out(
+        cmail(&root)
+            .arg("--as")
+            .arg("alice")
+            .arg("--json")
+            .arg("send")
+            .arg("--to")
+            .arg("zoe")
+            .arg("--kind")
+            .arg("handoff")
+            .arg("--subject")
+            .arg("handoff")
+            .arg("--body")
+            .arg("the state"),
     );
-    assert_eq!(approved["status"], "approved");
+    assert_eq!(sent["status"], "sent");
+    let id = sent["id"].as_str().unwrap().to_string();
 
     // sealed on the wire (spec 4.1): zoe's inbox file carries only the `enc`
     // ciphertext — the sent body appears nowhere in plaintext
@@ -201,7 +232,7 @@ fn full_lifecycle_with_json_shapes() {
             .arg("--body")
             .arg("again"),
     );
-    assert_eq!(sent2["status"], "sent"); // remember flag allowlisted zoe for alice
+    assert_eq!(sent2["status"], "sent"); // allow_send_to allowed zoe for alice
     let inbox2 = json_out(
         cmail(&root)
             .arg("--as")
@@ -225,8 +256,8 @@ fn full_lifecycle_with_json_shapes() {
     assert!(read2["body"].as_str().unwrap().contains("again"));
 
     // reply threads: only zoe is allowlisted (alice is not), so zoe's reply is held.
-    // Deterministic: `approve --remember` added "zoe"; the denied keyring add
-    // never touches the allowlist; the gate checks the recipient (alice) -> held.
+    // Deterministic: allow_send_to added "zoe"; the denied keyring add never
+    // touches the allowlist; the gate checks the recipient (alice) -> held.
     let rep = json_out(
         cmail(&root)
             .arg("--as")
@@ -284,12 +315,15 @@ fn full_lifecycle_with_json_shapes() {
         .iter()
         .map(|r| r["event"].as_str().unwrap())
         .collect();
-    for expected in ["init", "send", "held", "approve", "read"] {
+    for expected in ["init", "send", "held", "allow_add", "read"] {
         assert!(
             events.contains(&expected),
             "missing {expected} in {events:?}"
         );
     }
+    // approval requires a signed authority record; the fail-closed attempts
+    // wrote no approval event
+    assert!(!events.contains(&"approve"), "{events:?}");
     // the denied keyring add wrote no audit grant
     assert!(!events.contains(&"key_add"), "{events:?}");
 }
@@ -312,7 +346,9 @@ fn corrupt_lands_in_quarantine_never_inbox() {
         .assert()
         .success();
 
-    // alice sends a real message; the gate holds it, the human approves it
+    // alice sends a real message; allowlisting zoe delivers it, then tampering
+    // breaks the self-signature
+    allow_send_to(&root, "zoe");
     cmail(&root)
         .arg("--as")
         .arg("alice")
@@ -324,7 +360,6 @@ fn corrupt_lands_in_quarantine_never_inbox() {
         .arg("hi")
         .assert()
         .success();
-    approve_all_held(&root);
 
     // tamper: rewrite the created timestamp in zoe's inbox file -> signature
     // no longer matches the envelope content -> quarantined on the next scan
@@ -458,6 +493,7 @@ fn quarantine_release_success_moves_to_archive_and_reads() {
         .arg("zoe")
         .assert()
         .success();
+    allow_send_to(&root, "zoe");
     cmail(&root)
         .arg("--as")
         .arg("alice")
@@ -469,7 +505,6 @@ fn quarantine_release_success_moves_to_archive_and_reads() {
         .arg("hi")
         .assert()
         .success();
-    approve_all_held(&root);
 
     // break the signature; the next scan quarantines it (corrupt path)
     tamper_zoe_inbox_created(&root);

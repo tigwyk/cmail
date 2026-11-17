@@ -5,7 +5,7 @@
 //! and display cache and grants nothing. Config-backed reads (outbound gate,
 //! relay selection) still use the root-local `config.toml`.
 
-use crate::authority::Authority;
+use crate::authority::{Authority, EffectivePolicy};
 use crate::config::{Config, InboundMode, OutboundMode};
 use crate::envelope::Envelope;
 use crate::error::{CoreError, Result};
@@ -23,6 +23,8 @@ pub struct Policy {
     /// Derived on first use: relay/config-only reads must not need authority
     /// material (fetch, relay show, allow list never needed it before).
     keyring: OnceCell<KeyRing>,
+    /// Derived on first use. Approval release reads decisions from here.
+    effective: OnceCell<EffectivePolicy>,
 }
 
 impl Policy {
@@ -34,6 +36,7 @@ impl Policy {
             config: Config::load_or_init(root)?,
             authority,
             keyring: OnceCell::new(),
+            effective: OnceCell::new(),
         })
     }
 
@@ -60,6 +63,25 @@ impl Policy {
             let _ = self.keyring.set(effective);
         }
         Ok(self.keyring.get().expect("keyring was just set"))
+    }
+
+    /// The effective policy derived only from valid signed records.
+    ///
+    /// An unavailable authority backend yields an empty policy: no decision
+    /// exists, so protected actions stay refused. A tampered, truncated, or
+    /// foreign-key log still fails closed with an error. Success is cached so a
+    /// long-lived handle reads decisions once; callers load a fresh `Policy`
+    /// when they need to observe records signed after the handle opened.
+    pub fn effective(&self) -> Result<&EffectivePolicy> {
+        if self.effective.get().is_none() {
+            let effective = match self.authority.load_effective_policy(&self.root) {
+                Ok(policy) => policy,
+                Err(CoreError::AuthorityUnavailable(_)) => EffectivePolicy::default(),
+                Err(error) => return Err(error),
+            };
+            let _ = self.effective.set(effective);
+        }
+        Ok(self.effective.get().expect("effective policy was just set"))
     }
 
     /// Trust level for `env` under this policy's keyring.
