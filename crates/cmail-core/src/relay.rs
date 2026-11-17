@@ -182,7 +182,12 @@ fn ensure_fp_matches(pubkey_b64: &str, fp: &str) -> Result<()> {
     }
 }
 
-fn agent() -> ureq::Agent {
+/// Build the shared relay HTTP client. One agent owns one connection pool:
+/// callers reuse it across a burst (challenge + request) so keep-alive works,
+/// and discard it between bursts so a pooled connection cannot sit idle past
+/// a server-side keep-alive timeout. ureq retries idempotent requests only on
+/// recycled connections, which is the case this bounds.
+pub(crate) fn agent() -> ureq::Agent {
     // Redirects are disabled (ureq follows up to 5 by default): a malicious
     // or compromised relay must not be able to 30x cmail traffic — sealed
     // parcels, signatures — off to an arbitrary origin. A 3xx surfaces as a
@@ -280,13 +285,13 @@ fn authed(
 
 /// `POST /mailbox/{fp}` with the Parcel body (open route, spec §2).
 /// Client-side pre-checks: parcel validity and fingerprint(pubkey) == fp.
-pub fn deposit(base_url: &str, fp: &str, parcel: &Parcel) -> Result<()> {
+pub fn deposit(agent: &ureq::Agent, base_url: &str, fp: &str, parcel: &Parcel) -> Result<()> {
     let base = normalize_base(base_url)?;
     parcel.validate()?;
     ensure_fp_matches(&parcel.pubkey, fp)?;
     let body = serde_json::to_string(parcel)?;
     map_ureq(
-        agent()
+        agent
             .post(&format!("{base}/mailbox/{fp}"))
             .set("Content-Type", "application/json")
             .send_string(&body),
@@ -299,10 +304,15 @@ pub fn deposit(base_url: &str, fp: &str, parcel: &Parcel) -> Result<()> {
 /// mailbox) IS "no pending mail" for an identity that has never been mailed
 /// — returned as an empty list, not an error. Every other status and all
 /// transport failures propagate untouched.
-pub fn list_pending(base_url: &str, fp: &str, signing: &SigningKey) -> Result<Vec<String>> {
+pub fn list_pending(
+    agent: &ureq::Agent,
+    base_url: &str,
+    fp: &str,
+    signing: &SigningKey,
+) -> Result<Vec<String>> {
     let base = normalize_base(base_url)?;
     let body = match authed(
-        &agent(),
+        agent,
         &base,
         "GET",
         &format!("/mailbox/{fp}"),
@@ -324,10 +334,16 @@ pub fn list_pending(base_url: &str, fp: &str, signing: &SigningKey) -> Result<Ve
 }
 
 /// `GET /mailbox/{fp}/{id}` (auth) → parsed + validated parcel.
-pub fn fetch_parcel(base_url: &str, fp: &str, id: &str, signing: &SigningKey) -> Result<Parcel> {
+pub fn fetch_parcel(
+    agent: &ureq::Agent,
+    base_url: &str,
+    fp: &str,
+    id: &str,
+    signing: &SigningKey,
+) -> Result<Parcel> {
     let base = normalize_base(base_url)?;
     let body = authed(
-        &agent(),
+        agent,
         &base,
         "GET",
         &format!("/mailbox/{fp}/{id}"),
@@ -343,10 +359,16 @@ pub fn fetch_parcel(base_url: &str, fp: &str, id: &str, signing: &SigningKey) ->
 }
 
 /// `DELETE /mailbox/{fp}/{id}` (auth) → acknowledge receipt.
-pub fn ack(base_url: &str, fp: &str, id: &str, signing: &SigningKey) -> Result<()> {
+pub fn ack(
+    agent: &ureq::Agent,
+    base_url: &str,
+    fp: &str,
+    id: &str,
+    signing: &SigningKey,
+) -> Result<()> {
     let base = normalize_base(base_url)?;
     authed(
-        &agent(),
+        agent,
         &base,
         "DELETE",
         &format!("/mailbox/{fp}/{id}"),
@@ -363,6 +385,11 @@ mod tests {
     use crate::envelope::{build_and_sign, new_id, NewEnvelope};
     use ed25519_dalek::SigningKey;
     use rand::rngs::OsRng;
+    use std::io::{BufRead, BufReader, Write};
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use std::thread;
 
     fn envelope_fixture() -> (Envelope, SigningKey) {
         let key = SigningKey::generate(&mut OsRng);
@@ -388,6 +415,136 @@ mod tests {
 
     fn recipient_key_b64() -> String {
         B64.encode(SigningKey::generate(&mut OsRng).verifying_key().as_bytes())
+    }
+
+    /// Loopback HTTP server counting accepted TCP connections. Serves only
+    /// the two GETs `list_pending` needs. Handles at most `max_connections`,
+    /// then exits, so an unexpected extra connection fails the client
+    /// instead of hanging the test. `close_after` closes a connection after
+    /// that many responses, simulating a relay keep-alive timeout.
+    struct CountingRelay {
+        base: String,
+        accepts: Arc<AtomicUsize>,
+        handle: Option<thread::JoinHandle<()>>,
+    }
+
+    impl CountingRelay {
+        fn start(max_connections: usize, close_after: Option<usize>) -> Self {
+            let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}", listener.local_addr().unwrap());
+            let accepts = Arc::new(AtomicUsize::new(0));
+            let counter = accepts.clone();
+            let handle = thread::spawn(move || {
+                for _ in 0..max_connections {
+                    let Ok((stream, _)) = listener.accept() else {
+                        return;
+                    };
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    serve_connection(stream, close_after);
+                }
+            });
+            Self {
+                base,
+                accepts,
+                handle: Some(handle),
+            }
+        }
+
+        fn finish(mut self) -> usize {
+            if let Some(handle) = self.handle.take() {
+                handle.join().unwrap();
+            }
+            self.accepts.load(Ordering::SeqCst)
+        }
+    }
+
+    fn serve_connection(stream: TcpStream, close_after: Option<usize>) {
+        let mut reader = BufReader::new(stream.try_clone().unwrap());
+        let mut writer = stream;
+        let mut served = 0usize;
+        loop {
+            let mut request_line = String::new();
+            match reader.read_line(&mut request_line) {
+                Ok(0) | Err(_) => return,
+                Ok(_) => {}
+            }
+            loop {
+                let mut header = String::new();
+                match reader.read_line(&mut header) {
+                    Ok(0) | Err(_) => return,
+                    Ok(_) if header == "\r\n" || header == "\n" => break,
+                    Ok(_) => {}
+                }
+            }
+            let body = if request_line.contains("/challenge/") {
+                r#"{"nonce":"n1","expires":"2030-01-01T00:00:00Z"}"#
+            } else {
+                r#"{"ids":[]}"#
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+                body.len()
+            );
+            if writer.write_all(response.as_bytes()).is_err() {
+                return;
+            }
+            served += 1;
+            if close_after == Some(served) {
+                return;
+            }
+        }
+    }
+
+    fn fp_of(key: &SigningKey) -> String {
+        fingerprint_of(&B64.encode(key.verifying_key().as_bytes()))
+    }
+
+    #[test]
+    fn shared_agent_reuses_one_connection() {
+        let relay = CountingRelay::start(1, None);
+        let key = SigningKey::generate(&mut OsRng);
+        let fp = fp_of(&key);
+        let agent = agent();
+        assert!(list_pending(&agent, &relay.base, &fp, &key)
+            .unwrap()
+            .is_empty());
+        assert!(list_pending(&agent, &relay.base, &fp, &key)
+            .unwrap()
+            .is_empty());
+        drop(agent); // close the pooled connection so the server can exit
+        assert_eq!(relay.finish(), 1);
+    }
+
+    #[test]
+    fn fresh_agents_open_one_connection_each() {
+        let relay = CountingRelay::start(2, None);
+        let key = SigningKey::generate(&mut OsRng);
+        let fp = fp_of(&key);
+        for _ in 0..2 {
+            let agent = agent();
+            assert!(list_pending(&agent, &relay.base, &fp, &key)
+                .unwrap()
+                .is_empty());
+        }
+        assert_eq!(relay.finish(), 2);
+    }
+
+    #[test]
+    fn recycled_connection_closed_by_relay_is_retried() {
+        // Each connection answers once then closes: every reuse of a pooled
+        // connection fails on the prelude and ureq retries on a fresh one.
+        let relay = CountingRelay::start(4, Some(1));
+        let key = SigningKey::generate(&mut OsRng);
+        let fp = fp_of(&key);
+        let agent = agent();
+        assert!(list_pending(&agent, &relay.base, &fp, &key)
+            .unwrap()
+            .is_empty());
+        assert!(list_pending(&agent, &relay.base, &fp, &key)
+            .unwrap()
+            .is_empty());
+        drop(agent);
+        assert_eq!(relay.finish(), 4);
     }
 
     #[test]

@@ -386,7 +386,8 @@ impl Cmail {
         let frames = self.read_attachment_frames(&env.id)?;
         let parcel = build_parcel(env, &frames, &entry.public_key)?;
         let fp = fingerprint_of(&entry.public_key);
-        deposit(route, &fp, &parcel)?;
+        let agent = crate::relay::agent();
+        deposit(&agent, route, &fp, &parcel)?;
         Ok(())
     }
 
@@ -903,11 +904,15 @@ impl Cmail {
         let mut deferred: Option<CoreError> = None;
         let start = std::time::Instant::now();
         loop {
+            // One agent per pass: the challenge and its request share a
+            // pooled connection; the wait sleep starts a fresh pool so no
+            // connection idles past the relay's keep-alive timeout.
+            let agent = crate::relay::agent();
             // 404-as-empty is `list_pending`'s own typed-status policy (relay.rs)
-            let ids = crate::relay::list_pending(&base, &fp, &identity.signing)?;
+            let ids = crate::relay::list_pending(&agent, &base, &fp, &identity.signing)?;
             if !ids.is_empty() {
                 for id in ids {
-                    let parcel = match fetch_parcel(&base, &fp, &id, &identity.signing) {
+                    let parcel = match fetch_parcel(&agent, &base, &fp, &id, &identity.signing) {
                         Ok(p) => p,
                         Err(e) => {
                             deferred = Some(e);
@@ -926,7 +931,7 @@ impl Cmail {
                         break;
                     }
                     report.fetched += 1;
-                    if let Err(e) = crate::relay::ack(&base, &fp, &id, &identity.signing) {
+                    if let Err(e) = crate::relay::ack(&agent, &base, &fp, &id, &identity.signing) {
                         deferred = Some(e);
                         break;
                     }
@@ -2058,9 +2063,10 @@ mod tests {
         // fetch itself lands in R5 — here verify the PARCEL is on the relay via
         // the core relay client, sealed to zoe's key, frames intact
         let fp = zoe.fingerprint();
-        let ids = crate::relay::list_pending(&base, &fp, &zoe.signing).unwrap();
+        let agent = crate::relay::agent();
+        let ids = crate::relay::list_pending(&agent, &base, &fp, &zoe.signing).unwrap();
         assert_eq!(ids.len(), 1);
-        let parcel = crate::relay::fetch_parcel(&base, &fp, &ids[0], &zoe.signing).unwrap();
+        let parcel = crate::relay::fetch_parcel(&agent, &base, &fp, &ids[0], &zoe.signing).unwrap();
         assert!(parcel.envelope.is_sealed());
         let opened = open_envelope(&parcel.envelope, &x25519_secret(&zoe.signing)).unwrap();
         assert_eq!(opened.body, "hello machine");
@@ -2106,11 +2112,13 @@ mod tests {
         // nothing on the relay yet: a never-deposited mailbox cannot even be
         // listed (auth needs its stored pubkey), and list_pending's typed
         // 404-as-empty policy makes that exactly Ok(no mail)
-        let ids = crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing).unwrap();
+        let agent = crate::relay::agent();
+        let ids =
+            crate::relay::list_pending(&agent, &base, &zoe.fingerprint(), &zoe.signing).unwrap();
         assert!(ids.is_empty());
         sender.approve(&id, true).unwrap(); // approve performs the POST
         assert_eq!(
-            crate::relay::list_pending(&base, &zoe.fingerprint(), &zoe.signing)
+            crate::relay::list_pending(&agent, &base, &zoe.fingerprint(), &zoe.signing)
                 .unwrap()
                 .len(),
             1
@@ -2280,11 +2288,14 @@ mod tests {
             .unwrap();
         assert_eq!(plain, b"machine state");
         // the relay mailbox is empty after the ack
-        assert!(
-            crate::relay::list_pending(&fix.base, &fix.zoe.fingerprint(), &fix.zoe.signing)
-                .unwrap()
-                .is_empty()
-        );
+        assert!(crate::relay::list_pending(
+            &crate::relay::agent(),
+            &fix.base,
+            &fix.zoe.fingerprint(),
+            &fix.zoe.signing
+        )
+        .unwrap()
+        .is_empty());
         // one fetch audit record for the run, detail "n fetched, m kept"
         let recs = fix.recipient.audit_tail(5).unwrap();
         let fetches: Vec<_> = recs
@@ -2349,8 +2360,13 @@ mod tests {
         );
         // NOT acked: the tampered parcel is still listed on the relay
         assert_eq!(
-            crate::relay::list_pending(&fix.base, &fix.zoe.fingerprint(), &fix.zoe.signing)
-                .unwrap(),
+            crate::relay::list_pending(
+                &crate::relay::agent(),
+                &fix.base,
+                &fix.zoe.fingerprint(),
+                &fix.zoe.signing
+            )
+            .unwrap(),
             vec![relay_id.clone()]
         );
         // audited corrupt, exactly once, with the pinned detail
