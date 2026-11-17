@@ -692,8 +692,8 @@ impl Cmail {
     }
 
     /// Display-oriented audit tail: skips malformed lines so a damaged log
-    /// still renders. The fail-closed `was_released` gate keeps using strict
-    /// `audit::tail` directly.
+    /// still renders. Read-only observability: audit events are unsigned and
+    /// grant no authority (quarantine release reads the signed policy fold).
     pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRecord>> {
         crate::audit::tail_lossy(&self.root, n)
     }
@@ -812,7 +812,7 @@ impl Cmail {
                 .mail_file_path(&archive, id)
                 .map(|p| p.exists())
                 .unwrap_or(false)
-            && self.was_released(id);
+            && self.released_by_policy(id)?;
         if !in_inbox && !released {
             return Err(CoreError::MessageNotFound(format!(
                 "{id} (already read or not found)"
@@ -872,19 +872,20 @@ impl Cmail {
         })
     }
 
-    /// Whether `id` was released from quarantine by a human (a
-    /// `quarantine_release` audit event). Release = "human-approved for
+    /// Whether `id` was released from quarantine by a human (a valid signed
+    /// `quarantine:<id>` authority decision). Release = "human-approved for
     /// reading", so released mail stays re-readable; every read is still
-    /// audited.
-    fn was_released(&self, id: &str) -> bool {
-        crate::audit::tail(&self.root, usize::MAX)
-            .map(|records| {
-                records.iter().any(|r| {
-                    r.event == crate::audit::AuditEvent::QuarantineRelease
-                        && r.msg_id.as_deref() == Some(id)
-                })
-            })
-            .unwrap_or(false) // log absent/corrupt -> not released -> archived mail stays locked (fail-closed)
+    /// audited. The unsigned audit event is observability only and grants
+    /// nothing, so a hand-edited `audit.log` can never unlock mail.
+    fn released_by_policy(&self, id: &str) -> Result<bool> {
+        let policy = self.policy()?;
+        Ok(matches!(
+            policy
+                .effective()?
+                .decisions
+                .get(&crate::authority::subject::quarantine(id)),
+            Some(decision) if decision.action == AuthorityAction::QuarantineRelease
+        ))
     }
 
     pub fn reply(
@@ -1171,25 +1172,58 @@ impl Cmail {
     /// spoof/corrupt mail. Never re-verifies: release is an explicit human
     /// decision overriding the automatic routing; the released copy stays
     /// readable by id via `read_message`, wrapped unless verified.
+    ///
+    /// The decision is a presence-gated, signed `quarantine:<id>` authority
+    /// record. A caller-supplied id, a hand-edited log, or an unsigned audit
+    /// event can never release: release fails closed unless the fold yields a
+    /// valid signed decision. Repeating a release is a no-op.
     pub fn quarantine_release(&self, id: &str) -> Result<()> {
-        for owner in crate::identity::list_identities(&self.root) {
-            let q = self.store.quarantine_dir(&owner);
-            if self
-                .store
-                .mail_file_path(&q, id)
+        let identities = crate::identity::list_identities(&self.root);
+        let quarantined = |owner: &str| {
+            self.store
+                .mail_file_path(&self.store.quarantine_dir(owner), id)
                 .map(|p| p.exists())
                 .unwrap_or(false)
-            {
-                self.store
-                    .move_message(&q, &self.store.archive_dir(&owner), id)?;
-                append(
-                    &self.root,
-                    &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(id),
-                )?;
+        };
+        let archived = |owner: &str| {
+            self.store
+                .mail_file_path(&self.store.archive_dir(owner), id)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+        };
+        let Some(owner) = identities.iter().find(|owner| quarantined(owner)) else {
+            // Idempotent repeat: an already-archived copy with a valid signed
+            // decision is released; anything else is simply not releaseable.
+            if identities.iter().any(|owner| archived(owner)) && self.released_by_policy(id)? {
                 return Ok(());
             }
+            return Err(CoreError::MessageNotFound(id.to_string()));
+        };
+        if !self.released_by_policy(id)? {
+            self.authority.sign_action(
+                &self.root,
+                AuthorityAction::QuarantineRelease,
+                &crate::authority::subject::quarantine(id),
+                &serde_json::json!({ "message_id": id }),
+            )?;
+            // The signature alone is not the release: only a decision the
+            // fold accepts (right key, intact chain) counts.
+            if !self.released_by_policy(id)? {
+                return Err(CoreError::AuthorityRequired(format!(
+                    "quarantine release for {id} is not backed by a valid signed decision"
+                )));
+            }
         }
-        Err(CoreError::MessageNotFound(id.to_string()))
+        self.store.move_message(
+            &self.store.quarantine_dir(owner),
+            &self.store.archive_dir(owner),
+            id,
+        )?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(id),
+        )?;
+        Ok(())
     }
 
     pub fn keyring_list(&self) -> Result<Vec<(String, crate::keyring::KeyEntry)>> {
@@ -1728,8 +1762,8 @@ mod tests {
     }
 
     #[test]
-    fn archived_mail_stays_locked_when_audit_log_missing() {
-        let (root, c) = svc();
+    fn unsigned_audit_release_does_not_unlock_archived_mail() {
+        let (_root, c) = svc();
         let SendOutcome::Held { id, .. } = c
             .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
             .unwrap()
@@ -1743,9 +1777,14 @@ mod tests {
             .archive_dir("zoe")
             .join(format!("{id}.mail"))
             .exists());
-        // Audit-log loss must fail closed: an archived copy with no
-        // quarantine-release on record stays locked ("already read").
-        std::fs::remove_file(root.path().join("audit.log")).unwrap();
+        // The audit log is unsigned observability: writing a release event
+        // must not admit the archived copy. Only a signed decision does.
+        append(
+            &c.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(&id),
+        )
+        .unwrap();
+        assert!(!c.released_by_policy(&id).unwrap());
         let err = c.read_message(Some("zoe"), &id).unwrap_err().to_string();
         assert!(err.contains("already read") || err.contains("not found"));
     }
@@ -1761,6 +1800,126 @@ mod tests {
         std::fs::write(p, "not json at all").unwrap();
         assert!(c.inbox(Some("zoe")).unwrap().is_empty());
         assert_eq!(c.store.list_ids(&c.store.quarantine_dir("zoe")).len(), 1);
+    }
+
+    // --- Ticket #16: quarantine release is a signed human decision ---
+
+    const QID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
+
+    /// Put an unparseable message directly in zoe's quarantine.
+    fn quarantined(c: &Cmail, id: &str) -> std::path::PathBuf {
+        c.store.ensure_mailbox("zoe").unwrap();
+        let path = c.store.quarantine_dir("zoe").join(format!("{id}.mail"));
+        std::fs::write(&path, "not json at all").unwrap();
+        path
+    }
+
+    fn signed_record_count(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("authority.log"))
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn released_by_decision(c: &Cmail, id: &str) -> bool {
+        matches!(
+            c.policy()
+                .unwrap()
+                .effective()
+                .unwrap()
+                .decisions
+                .get(&crate::authority::subject::quarantine(id)),
+            Some(decision) if decision.action == AuthorityAction::QuarantineRelease
+        )
+    }
+
+    #[test]
+    fn signed_quarantine_release_records_decision_and_is_idempotent() {
+        let authority = test_authority();
+        let root = TempDir::new().unwrap();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("zoe", false).unwrap();
+        let path = quarantined(&c, QID);
+
+        c.quarantine_release(QID).unwrap();
+        assert!(!path.exists());
+        assert!(c
+            .store
+            .archive_dir("zoe")
+            .join(format!("{QID}.mail"))
+            .exists());
+        assert!(released_by_decision(&c, QID));
+        // the record is signed by the authority key, so a fresh process with
+        // the same key derives the same release decision from disk alone
+        let restarted = open_with(root.path(), restarted_authority(&authority)).unwrap();
+        assert!(released_by_decision(&restarted, QID));
+
+        // repeating the release is a no-op: no second record, still Ok
+        let records = signed_record_count(root.path());
+        c.quarantine_release(QID).unwrap();
+        assert_eq!(signed_record_count(root.path()), records);
+
+        // an id with no quarantined copy is never released by name alone
+        let err = c.quarantine_release("feedfeedfeedfeedfeedfeedfeedfeed");
+        assert!(matches!(err, Err(CoreError::MessageNotFound(_))));
+    }
+
+    #[test]
+    fn quarantine_release_fails_closed_without_authority() {
+        let root = TempDir::new().unwrap();
+        let c = open_with(
+            root.path(),
+            std::sync::Arc::new(crate::authority::InMemoryAuthority::new()),
+        )
+        .unwrap();
+        c.init("zoe", false).unwrap();
+        let path = quarantined(&c, QID);
+        // An unsigned audit event is observability, never a decision.
+        append(
+            &c.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(QID),
+        )
+        .unwrap();
+
+        let err = c.quarantine_release(QID).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err:?}");
+        assert!(path.exists());
+        assert!(!c
+            .store
+            .archive_dir("zoe")
+            .join(format!("{QID}.mail"))
+            .exists());
+        assert_eq!(signed_record_count(root.path()), 0);
+    }
+
+    #[test]
+    fn hand_edited_authority_log_cannot_release() {
+        use crate::authority::{subject, AuthorityRecord};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let root = TempDir::new().unwrap();
+        let c = open_with(root.path(), test_authority()).unwrap();
+        c.init("zoe", false).unwrap();
+        let path = quarantined(&c, QID);
+
+        // Shape-valid release record signed by a key that is not the
+        // authority's: the fold refuses it, so release must fail closed.
+        let attacker = SigningKey::generate(&mut OsRng);
+        let forged = AuthorityRecord::sign(
+            1,
+            "0".repeat(64),
+            now_rfc3339(),
+            AuthorityAction::QuarantineRelease,
+            subject::quarantine(QID),
+            &serde_json::json!({ "message_id": QID }),
+            &attacker,
+        );
+        let line = crate::canonical::canonical_json(&serde_json::to_value(&forged).unwrap());
+        std::fs::write(root.path().join("authority.log"), format!("{line}\n")).unwrap();
+
+        let err = c.quarantine_release(QID).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err:?}");
+        assert!(path.exists());
     }
 
     #[test]

@@ -5,7 +5,7 @@
 //! and display cache and grants nothing. Config-backed reads (outbound gate,
 //! relay selection) still use the root-local `config.toml`.
 
-use crate::authority::Authority;
+use crate::authority::{Authority, EffectivePolicy};
 use crate::config::{Config, InboundMode, OutboundMode};
 use crate::envelope::Envelope;
 use crate::error::{CoreError, Result};
@@ -17,11 +17,13 @@ use std::path::{Path, PathBuf};
 pub struct Policy {
     root: PathBuf,
     config: Config,
-    /// Verifies the signed record log that grants trust. Presence is never
+    /// Verifies the signed record log that grants policy. Presence is never
     /// requested on this path: only the public key is read.
     authority: std::sync::Arc<dyn Authority>,
     /// Derived on first use: relay/config-only reads must not need authority
     /// material (fetch, relay show, allow list never needed it before).
+    effective: OnceCell<EffectivePolicy>,
+    /// Derived from `effective` on first use.
     keyring: OnceCell<KeyRing>,
 }
 
@@ -33,24 +35,34 @@ impl Policy {
             root: root.to_path_buf(),
             config: Config::load_or_init(root)?,
             authority,
+            effective: OnceCell::new(),
             keyring: OnceCell::new(),
         })
     }
 
-    /// The effective trust keyring, derived only from valid signed records.
-    /// The legacy `keyring.json` contributes relay routes and nothing else.
+    /// The effective policy: only valid signed records, folded latest-wins.
     ///
-    /// An unavailable authority backend yields an empty keyring (no trust
-    /// anchor, so nothing verifies) instead of making mail unreadable; a
-    /// tampered or rolled-back log still fails closed with an error.
-    pub fn keyring(&self) -> Result<&KeyRing> {
-        if self.keyring.get().is_none() {
+    /// An unavailable authority backend yields an empty policy (no decision
+    /// is trusted) instead of making mail unreadable; a tampered or
+    /// rolled-back log still fails closed with an error.
+    pub fn effective(&self) -> Result<&EffectivePolicy> {
+        if self.effective.get().is_none() {
             let effective = match self.authority.load_effective_policy(&self.root) {
-                Ok(policy) => KeyRing::from_decisions(&policy),
-                Err(CoreError::AuthorityUnavailable(_)) => KeyRing::default(),
+                Ok(policy) => policy,
+                Err(CoreError::AuthorityUnavailable(_)) => EffectivePolicy::default(),
                 Err(error) => return Err(error),
             };
-            let mut effective = effective;
+            // Cache success only: a tampered log cannot become valid mid-process.
+            let _ = self.effective.set(effective);
+        }
+        Ok(self.effective.get().expect("effective policy was just set"))
+    }
+
+    /// The effective trust keyring, derived only from valid signed records.
+    /// The legacy `keyring.json` contributes relay routes and nothing else.
+    pub fn keyring(&self) -> Result<&KeyRing> {
+        if self.keyring.get().is_none() {
+            let mut effective = KeyRing::from_decisions(self.effective()?);
             // Routes are routing, never trust: a stale or hand-edited legacy
             // file can redirect mail at most, never verify a key.
             if let Ok(legacy) = KeyRing::load(&self.root) {
