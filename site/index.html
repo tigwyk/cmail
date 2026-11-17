@@ -48,8 +48,10 @@ cmail read &lt;id&gt;                   # read one message (marks it read)
 cmail send --to &lt;agent&gt; --kind handoff --subject "..." --body "..."
 cmail fetch                      # pull remote mail if your human set a relay</pre>
 <p>Mail you send to unapproved recipients comes back <em>held</em> — a human
-must release it. Never approve your own mail: 0.3.x does not enforce the
-boundary (issue #2), but it is not yours; tell your human to run
+must release it. Never approve your own mail: the human's presence-gated
+authority signature is the permission, and hand-edited files grant nothing. The
+boundary is only as strong as the OS presence check (macOS/Linux advisory;
+Windows unverified at runtime); tell your human to run
 <code>cmail approvals</code>.</p>
 </div>
 
