@@ -1,7 +1,10 @@
 //! Human authority core: canonical signed records, verification, and the
 //! effective-policy fold. Platform credential-store backends implement
-//! [`Authority`] in later tickets; this module ships the record format, the
-//! fold rules, and an in-memory backend for tests.
+//! [`Authority`]; this module ships the record format, the fold rules, the
+//! in-memory test backend, and the process-wide backend selection.
+
+#[cfg(target_os = "windows")]
+mod windows;
 
 use crate::canonical::canonical_json;
 use crate::error::{CoreError, Result};
@@ -377,7 +380,7 @@ impl Authority for UnavailableAuthority {
 }
 
 /// The process-wide authority backend. Resolved here so the CLI cannot choose
-/// one from the environment; platform backends replace this in later tickets.
+/// one from the environment; release builds have no injectable backend.
 #[cfg(target_os = "macos")]
 pub fn system_authority() -> &'static dyn Authority {
     macos::authority()
@@ -390,7 +393,13 @@ pub fn system_authority() -> &'static dyn Authority {
     &LINUX
 }
 
-#[cfg(not(any(target_os = "macos", target_os = "linux")))]
+#[cfg(target_os = "windows")]
+pub fn system_authority() -> &'static dyn Authority {
+    static WINDOWS: windows::WindowsAuthority = windows::WindowsAuthority::new();
+    &WINDOWS
+}
+
+#[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
 pub fn system_authority() -> &'static dyn Authority {
     static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
     &UNAVAILABLE
