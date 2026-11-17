@@ -109,15 +109,28 @@ impl Policy {
         serde_json::from_value(decision.payload.as_ref()?.get("mode")?.clone()).ok()
     }
 
-    /// The signed inbound mode. No record (including an unavailable authority)
-    /// means the documented default `permissive`; an unparseable signed payload
-    /// or tampered log fails closed to `known-only`.
+    /// The effective inbound mode.
+    ///
+    /// A signed `mode:inbound` record wins. With no signed record, an
+    /// available authority falls back to `config.inbound` only to TIGHTEN:
+    /// legacy `known-only` is honored, while legacy `permissive` cannot
+    /// loosen anything. An unavailable authority, a tampered log, or an
+    /// unparseable signed payload fails closed to `known-only`.
     pub fn inbound_mode(&self) -> InboundMode {
         let Ok(policy) = self.effective() else {
             return InboundMode::KnownOnly;
         };
         let Some(decision) = policy.decisions.get(subject::INBOUND_MODE) else {
-            return InboundMode::Permissive;
+            let available = self
+                .authority
+                .status()
+                .map(|status| status.available)
+                .unwrap_or(false);
+            return if available {
+                self.config.inbound
+            } else {
+                InboundMode::KnownOnly
+            };
         };
         decision
             .payload

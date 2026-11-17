@@ -3140,7 +3140,7 @@ mod tests {
     }
 
     #[test]
-    fn hand_edited_config_modes_are_ignored() {
+    fn hand_edited_config_modes_only_tighten_inbound() {
         let root = TempDir::new().unwrap();
         let c = open(root.path()).unwrap();
         c.init("alice", false).unwrap();
@@ -3151,8 +3151,10 @@ mod tests {
         cfg.inbound = InboundMode::KnownOnly;
         cfg.save(root.path()).unwrap();
         let c = open(root.path()).unwrap();
+        // Config can never open the outbound gate, but an available authority
+        // honors a tighter legacy inbound mode.
         assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
-        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
         assert!(matches!(
             c.send(Some("alice"), "bob", "note", "s", "b", &[], None)
                 .unwrap(),
@@ -3163,6 +3165,12 @@ mod tests {
         c.set_outbound_mode(OutboundMode::Open).unwrap();
         c.set_inbound_mode(InboundMode::KnownOnly).unwrap();
         assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Open);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+
+        // Signed knows-only wins: a hand-edited permissive never loosens it.
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.inbound = InboundMode::Permissive;
+        cfg.save(root.path()).unwrap();
         assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
     }
 
@@ -3184,9 +3192,10 @@ mod tests {
         assert!(c.set_inbound_mode(InboundMode::Permissive).is_err());
         assert!(!root.path().join("authority.log").exists());
 
-        // Gated reads default closed: no signed open mode, no signed allowlist.
+        // Gated reads default closed: no signed open mode, no signed allowlist,
+        // and unavailable authority cannot honor even a tighter config mode.
         assert_eq!(c.relay_url().unwrap(), None);
         assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
-        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
     }
 }

@@ -5,7 +5,7 @@
 //! does not change live policy reads.
 
 use crate::authority::{subject, Authority, AuthorityAction, AuthorityRecord};
-use crate::config::Config;
+use crate::config::{Config, InboundMode, OutboundMode};
 use crate::error::Result;
 use crate::identity::fingerprint_of;
 use crate::keyring::KeyRing;
@@ -45,6 +45,8 @@ pub struct LegacySnapshot {
     pub keyring: Vec<LegacyKey>,
     pub allow: Vec<String>,
     pub relay_url: Option<String>,
+    pub outbound_mode: OutboundMode,
+    pub inbound_mode: InboundMode,
     pub approvals: Vec<LegacyApproval>,
 }
 
@@ -54,6 +56,8 @@ impl LegacySnapshot {
             && self.allow.is_empty()
             && self.relay_url.is_none()
             && self.approvals.is_empty()
+            && self.outbound_mode == OutboundMode::Gated
+            && self.inbound_mode == InboundMode::Permissive
     }
 }
 
@@ -117,6 +121,8 @@ pub fn plan(
             .collect(),
         allow: config.allow.send.clone(),
         relay_url: config.relay.url.clone().filter(|url| !url.is_empty()),
+        outbound_mode: config.outbound,
+        inbound_mode: config.inbound,
         approvals,
     };
     let policy = authority.load_effective_policy(root)?;
@@ -178,6 +184,32 @@ fn proposals(legacy: &LegacySnapshot) -> Vec<AdoptionEntry> {
             summary: format!("relay set {url}"),
         });
     }
+    // Modes are signed so an upgrade cannot silently loosen the gate: a
+    // pre-enforcement `known-only` config becomes a `mode:inbound` record.
+    entries.push(AdoptionEntry {
+        action: AuthorityAction::OutboundMode,
+        subject: subject::OUTBOUND_MODE.to_string(),
+        payload: json!({ "mode": legacy.outbound_mode }),
+        summary: format!(
+            "outbound mode {}",
+            match legacy.outbound_mode {
+                OutboundMode::Gated => "gated",
+                OutboundMode::Open => "open",
+            }
+        ),
+    });
+    entries.push(AdoptionEntry {
+        action: AuthorityAction::InboundMode,
+        subject: subject::INBOUND_MODE.to_string(),
+        payload: json!({ "mode": legacy.inbound_mode }),
+        summary: format!(
+            "inbound mode {}",
+            match legacy.inbound_mode {
+                InboundMode::Permissive => "permissive",
+                InboundMode::KnownOnly => "known-only",
+            }
+        ),
+    });
     for approval in &legacy.approvals {
         entries.push(AdoptionEntry {
             action: AuthorityAction::Approve,
@@ -250,7 +282,7 @@ mod tests {
 
         assert!(plan.first_adoption());
         assert!(plan.already_adopted.is_empty());
-        assert_eq!(plan.pending.len(), 4);
+        assert_eq!(plan.pending.len(), 6);
 
         let key = alice_key(&c);
         assert!(plan.pending.iter().any(|e| {
@@ -268,6 +300,18 @@ mod tests {
                 && e.payload["url"] == "https://relay.example.com"
                 && e.summary.contains("https://relay.example.com")
         }));
+        assert!(plan.pending.iter().any(|e| {
+            e.action == AuthorityAction::OutboundMode
+                && e.subject == subject::OUTBOUND_MODE
+                && e.payload["mode"] == "gated"
+                && e.summary.contains("outbound mode gated")
+        }));
+        assert!(plan.pending.iter().any(|e| {
+            e.action == AuthorityAction::InboundMode
+                && e.subject == subject::INBOUND_MODE
+                && e.payload["mode"] == "permissive"
+                && e.summary.contains("inbound mode permissive")
+        }));
         let held = c.approvals(None).unwrap();
         assert_eq!(held.len(), 1);
         assert!(plan.pending.iter().any(|e| {
@@ -284,7 +328,7 @@ mod tests {
         let outcome = c.adopt_legacy(&authority, false).unwrap();
 
         assert!(outcome.signed.is_empty());
-        assert_eq!(outcome.plan.pending.len(), 4);
+        assert_eq!(outcome.plan.pending.len(), 6);
         assert!(authority
             .load_effective_policy(root.path())
             .unwrap()
@@ -308,10 +352,10 @@ mod tests {
         let key = alice_key(&c);
         let outcome = c.adopt_legacy(&authority, true).unwrap();
 
-        assert_eq!(outcome.signed.len(), 4);
+        assert_eq!(outcome.signed.len(), 6);
         assert_eq!(outcome.signed[0].version, RECORD_VERSION);
         let policy = authority.load_effective_policy(root.path()).unwrap();
-        assert_eq!(policy.decisions.len(), 4);
+        assert_eq!(policy.decisions.len(), 6);
         assert_eq!(
             policy.decisions[&key_subject("alice", &key)].action,
             AuthorityAction::KeyAdd
@@ -334,6 +378,38 @@ mod tests {
             AuthorityAction::Approve
         );
         assert!(authority.status().unwrap().last_grant.is_some());
+    }
+
+    #[test]
+    fn adopts_legacy_known_only_inbound_mode_and_restores_it() {
+        let (root, c) = legacy_service();
+        let mut cfg = Config::load_or_init(root.path()).unwrap();
+        cfg.inbound = InboundMode::KnownOnly;
+        cfg.save(root.path()).unwrap();
+
+        let authority = authority();
+        let plan = c.adoption_plan(&authority).unwrap();
+        assert!(plan.pending.iter().any(|e| {
+            e.action == AuthorityAction::InboundMode
+                && e.subject == subject::INBOUND_MODE
+                && e.payload["mode"] == "known-only"
+                && e.summary.contains("inbound mode known-only")
+        }));
+        let outcome = c.adopt_legacy(&authority, true).unwrap();
+        assert_eq!(outcome.signed.len(), 6);
+
+        // A fresh verifier sees the signed known-only record, so the upgrade
+        // cannot silently return to permissive.
+        let restart = std::sync::Arc::new(InMemoryAuthority::with_signing_key(
+            authority.signing_key().unwrap(),
+        ));
+        let policy = crate::policy::Policy::load(root.path(), restart).unwrap();
+        assert_eq!(policy.inbound_mode(), InboundMode::KnownOnly);
+        assert_eq!(policy.outbound_mode(), Some(OutboundMode::Gated));
+
+        // Re-adoption is idempotent: every mode record is already settled.
+        let second = c.adoption_plan(&authority).unwrap();
+        assert!(second.pending.is_empty());
     }
 
     #[test]
@@ -364,7 +440,7 @@ mod tests {
         let (root, c) = legacy_service();
         let first = authority();
         let outcome = c.adopt_legacy(&first, true).unwrap();
-        assert_eq!(outcome.signed.len(), 4);
+        assert_eq!(outcome.signed.len(), 6);
 
         // A new process: same key, fresh in-memory state, records only on disk.
         let second = InMemoryAuthority::with_signing_key(first.signing_key().unwrap());

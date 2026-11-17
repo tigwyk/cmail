@@ -76,6 +76,9 @@ fn tamper_zoe_inbox_created(root: &TempDir) {
 #[test]
 fn full_lifecycle_with_json_shapes() {
     let root = TempDir::new().unwrap();
+    // An available authority keeps the no-record inbound default permissive;
+    // without one the gate fails closed to known-only.
+    let cmail = |root: &TempDir| cmail_signed(root);
 
     // two identities
     let init = json_out(
@@ -386,6 +389,9 @@ fn corrupt_lands_in_quarantine_never_inbox() {
 #[test]
 fn hand_edited_keyring_never_grants_trust() {
     let root = TempDir::new().unwrap();
+    // Available authority: no signed record, so inbound uses the permissive
+    // default rather than the unavailable-authority known-only fallback.
+    let cmail = |root: &TempDir| cmail_signed(root);
     cmail(&root)
         .arg("init")
         .arg("--name")
@@ -939,7 +945,7 @@ fn relay_and_mode_changes_fail_closed_without_authority() {
             .arg("show"),
     );
     assert_eq!(modes["outbound"], "gated");
-    assert_eq!(modes["inbound"], "permissive");
+    assert_eq!(modes["inbound"], "known-only");
     assert_eq!(modes["scope"], "root-wide");
 }
 
