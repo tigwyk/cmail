@@ -54,7 +54,7 @@ Trust computation, the outbound gate, relay selection, approvals, and quarantine
 
 ### Adoption and visibility
 
-`authority init` creates the key. `authority adopt` shows the legacy keyring, allowlist, relay, and pending approvals as a diff, then writes one signed batch after an explicit human confirmation; declining leaves legacy state inert. Adoption is idempotent. `authority status` reports the authority fingerprint, backend, assurance level, and last grant, so an operator can tell whether enforcement is real on this machine. Audit events record the authority record id behind each applied decision; the audit log is append-only but is not itself a trust boundary.
+`authority init` creates the key. `authority adopt` shows the legacy keyring, outbound allowlist, relay URL, outbound and inbound policy modes, pending approvals, and message ids a pre-enforcement build released from quarantine as a diff, then writes one signed batch after an explicit human confirmation; declining leaves legacy state inert. Adoption is idempotent. `authority status` reports the authority fingerprint, backend, assurance level, and last grant, so an operator can tell whether enforcement is real on this machine. Audit events record the authority record id behind each applied decision; the audit log is append-only but is not itself a trust boundary. The operator runbook — upgrade sequence, backup, rollback, lost-key recovery, and mixed-version rules — is `docs/authority-operations.md`.
 
 ## Platform assurance
 
@@ -62,11 +62,11 @@ Assurance is reported honestly by `authority status`. "Strong" means the key is 
 
 | Platform | Backend | Presence check | Assurance | Honest limitation |
 | --- | --- | --- | --- | --- |
-| macOS | Login Keychain generic password + LocalAuthentication | Touch ID / passcode prompt | Advisory until a presence-bound Keychain item or hardened-runtime build is available | The command-line tool lacks the data-protection entitlement for a `kSecAttrAccessControl` item and is not built with the hardened runtime. Presence is an in-process speed bump: the item is not cryptographically bound to the check, and a same-user process can bypass it (for example with `DYLD_INSERT_LIBRARIES`). Ed25519 is also not a Secure Enclave algorithm, so the key is not hardware-bound; a human can be tricked into approving a prompt. |
-| Windows | Credential Manager (DPAPI) + Windows Hello | Windows Hello via `UserConsentVerifier` | Moderate | Hello proves the human is present, but the DPAPI-protected blob is not cryptographically bound to that check; a same-user process that locates the blob can decrypt it after login. |
+| macOS | Login Keychain generic password + LocalAuthentication | Touch ID / passcode prompt | Advisory (no hardened build shipped) | The command-line tool lacks the data-protection entitlement for a `kSecAttrAccessControl` item and is not built with the hardened runtime. Presence is an in-process speed bump: the item is not cryptographically bound to the check, and a same-user process can bypass it (for example with `DYLD_INSERT_LIBRARIES`). Ed25519 is also not a Secure Enclave algorithm, so the key is not hardware-bound; a human can be tricked into approving a prompt. Developer ID signing with the hardened runtime plus a presence-bound Keychain item is future work, not shipped. |
+| Windows | Credential Manager (DPAPI) + Windows Hello | Windows Hello via `UserConsentVerifier` | Unverified at runtime; `authority status` reports Moderate if the backend answers | Hello proves the human is present, but the DPAPI-protected blob is not cryptographically bound to that check; a same-user process that locates the blob can decrypt it after login. This project has not verified the prompt, denial, or credential lifecycle on Windows at runtime, so documentation must not claim enforcement there. |
 | Linux | Secret Service (GNOME Keyring / KWallet), optionally polkit | Collection unlock / polkit prompt | Advisory, conditionally Moderate | A login-keyring collection is typically unlocked for the session and readable by any same-user process; Secret Service has no per-use presence guarantee. Where no usable backend exists, human-only commands fail closed. |
 
-The project's public claim stays "advisory" unless `authority status` reports Strong on the host in question. Documentation must not promise a boundary that the backend cannot provide.
+No platform reports Strong, so public documentation claims "advisory" for macOS and Linux and "unverified at runtime" for Windows. No platform is documented as an enforced OS boundary, and documentation must match `authority status` on the host in question rather than promise a boundary the backend cannot provide.
 
 ## Mixed-version operation
 
