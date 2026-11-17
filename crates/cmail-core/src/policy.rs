@@ -1,11 +1,12 @@
 //! Effective-policy seam: every protected policy read goes through [`Policy`].
 //!
-//! Trust for a sender name comes only from the signed authority-record log
-//! (a latest valid `key_add`); the legacy `keyring.json` supplies relay routes
-//! and display cache and grants nothing. Config-backed reads (outbound gate,
-//! relay selection) still use the root-local `config.toml`.
+//! Trust for a sender name, the outbound allowlist, and outbound mode come
+//! only from the signed authority-record log. The legacy `keyring.json`
+//! supplies relay routes and display cache and grants nothing. The legacy
+//! `config.toml` allowlist and outbound mode are display/routing state only
+//! and never open the outbound gate.
 
-use crate::authority::{subject, Authority, EffectivePolicy};
+use crate::authority::{subject, Authority, AuthorityAction, EffectivePolicy};
 use crate::config::{Config, InboundMode, OutboundMode};
 use crate::envelope::Envelope;
 use crate::error::{CoreError, Result};
@@ -132,16 +133,36 @@ impl Policy {
         self.outbound_mode() == Some(OutboundMode::Open)
     }
 
-    /// The outbound gate: signed open mode, or the recipient is allowlisted.
-    /// The legacy `[allow] send` config remains for ticket #13 to replace with
-    /// the signed allowlist; a hand-edited config never opens the mode gate.
+    /// The outbound gate: a signed open-mode record, or a signed allow entry.
+    /// The legacy `[allow] send` config and a hand-edited record log never
+    /// grant a send, and an unavailable authority leaves both empty, so
+    /// gated sends fail closed.
     pub fn may_send(&self, to: &str) -> bool {
-        self.mode_allows() || self.config.is_send_allowed(to)
+        self.mode_allows() || self.is_allowed(to)
     }
 
-    /// Names pre-authorized for outbound, in config order.
-    pub fn allow_list(&self) -> &[String] {
-        &self.config.allow.send
+    /// True when the latest signed allow decision for `name` is an add.
+    fn is_allowed(&self, name: &str) -> bool {
+        self.effective().is_ok_and(|policy| {
+            matches!(
+                policy.decisions.get(&subject::allow(name)),
+                Some(decision) if decision.action == AuthorityAction::AllowAdd
+            )
+        })
+    }
+
+    /// Names pre-authorized for outbound by signed `allow_add` records, sorted.
+    pub fn allow_list(&self) -> Result<Vec<String>> {
+        let policy = self.effective()?;
+        let mut names: Vec<String> = policy
+            .decisions
+            .iter()
+            .filter(|(_, decision)| decision.action == AuthorityAction::AllowAdd)
+            .filter_map(|(subject, _)| subject::name_in(subject, subject::ALLOW))
+            .map(str::to_string)
+            .collect();
+        names.sort();
+        Ok(names)
     }
 
     /// The effective signed pickup relay url, if any. Clear means no relay;
@@ -215,6 +236,16 @@ mod tests {
                 &serde_json::json!({ "name": "alice", "public_key": public_key }),
             )
             .unwrap();
+        // The legacy config allowlist entry is display-only; the effective
+        // allowlist comes from this signed record.
+        authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::AllowAdd,
+                &subject::allow("zoe"),
+                &serde_json::json!({ "name": "zoe" }),
+            )
+            .unwrap();
         (root, alice)
     }
 
@@ -243,11 +274,11 @@ mod tests {
         let (root, alice) = legacy_root(&authority);
         let policy = Policy::load(root.path(), authority.clone()).unwrap();
 
-        // Legacy config still reports through the display accessors, but the
-        // signed log is the only source of relay and gate behavior.
+        // Legacy config remains display-only: signed records supply the
+        // allowlist, and relay/mode behavior comes only from signed records.
         assert_eq!(policy.outbound(), OutboundMode::Gated);
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
-        assert_eq!(policy.allow_list(), ["zoe".to_string()]);
+        assert_eq!(policy.allow_list().unwrap(), ["zoe".to_string()]);
         assert_eq!(policy.relay_url(), None);
         assert_eq!(
             policy.route("alice").unwrap().as_deref(),
@@ -256,8 +287,8 @@ mod tests {
         assert_eq!(policy.route("ghost").unwrap(), None);
         assert!(policy.keyring().unwrap().get("alice").is_some());
 
-        // outbound gate: allowlisted passes, unknown holds; a hand-edited
-        // config open mode never opens it.
+        // outbound gate: signed allowlisted passes, unknown holds, and a
+        // hand-edited config open mode does not open it
         assert!(policy.may_send("zoe"));
         assert!(!policy.may_send("mallory"));
         let mut open = Config::load_or_init(root.path()).unwrap();
@@ -368,7 +399,7 @@ mod tests {
 
         let policy = Policy::load(root.path(), authority.clone()).unwrap();
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
-        assert_eq!(policy.allow_list(), ["zoe".to_string()]);
+        assert_eq!(policy.allow_list().unwrap(), ["zoe".to_string()]);
         assert_eq!(policy.relay_url(), None);
         assert!(policy.may_send("zoe"));
         assert!(!policy.may_send("mallory"));
