@@ -821,6 +821,23 @@ fn authority_status_reports_backend_and_assurance() {
 
 #[cfg(not(target_os = "macos"))]
 #[test]
+fn authority_adopt_fails_closed_without_backend() {
+    let root = TempDir::new().unwrap();
+    let stdout = cmail(&root)
+        .arg("--json")
+        .arg("authority")
+        .arg("adopt")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let out: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let message = out["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+}
+
+#[test]
 fn authority_init_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();
     let stdout = cmail(&root)

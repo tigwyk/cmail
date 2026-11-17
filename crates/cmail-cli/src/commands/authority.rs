@@ -1,7 +1,10 @@
 use crate::output;
 use crate::Cli;
 use anyhow::Result;
+use cmail_core::adoption::AdoptionPlan;
 use cmail_core::authority::{system_authority, Assurance, AuthorityStatus};
+use cmail_core::Cmail;
+use std::io::{self, Write};
 
 fn assurance_label(assurance: Assurance) -> &'static str {
     match assurance {
@@ -39,6 +42,61 @@ pub fn init(cli: &Cli) -> Result<()> {
     } else {
         println!("authority initialized");
         print_status(&status);
+    }
+    Ok(())
+}
+
+fn print_plan(plan: &AdoptionPlan) {
+    if plan.first_adoption() {
+        println!(
+            "Back up the mailbox root now: the authority private key cannot be exported.\n\
+             Rollback restores that snapshot and the previous binary."
+        );
+    }
+    if plan.pending.is_empty() {
+        println!("nothing to adopt");
+    } else {
+        println!("legacy policy to sign (root-wide):");
+        for entry in &plan.pending {
+            println!("  + {}", entry.summary);
+        }
+    }
+    if !plan.already_adopted.is_empty() {
+        println!("already adopted:");
+        for entry in &plan.already_adopted {
+            println!("  = {}", entry.summary);
+        }
+    }
+}
+
+fn confirm() -> Result<bool> {
+    eprint!("sign these records? [y/N] ");
+    io::stderr().flush()?;
+    let mut line = String::new();
+    io::stdin().read_line(&mut line)?;
+    Ok(matches!(
+        line.trim().to_ascii_lowercase().as_str(),
+        "y" | "yes"
+    ))
+}
+
+pub fn adopt(cli: &Cli) -> Result<()> {
+    let c = Cmail::open(&cli.root_path()?)?;
+    let authority = system_authority();
+    let plan = c.adoption_plan(authority)?;
+    if !cli.json {
+        print_plan(&plan);
+    }
+    let confirmed = plan.pending.is_empty() || confirm()?;
+    let outcome = c.sign_adoption(authority, plan, confirmed)?;
+    if cli.json {
+        output::print_json(&outcome);
+    } else if outcome.plan.pending.is_empty() {
+        println!("nothing to adopt");
+    } else if confirmed {
+        println!("adopted {} signed record(s)", outcome.signed.len());
+    } else {
+        println!("declined; no records written");
     }
     Ok(())
 }
