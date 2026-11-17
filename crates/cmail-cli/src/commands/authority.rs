@@ -2,9 +2,25 @@ use crate::output;
 use crate::Cli;
 use anyhow::Result;
 use cmail_core::adoption::AdoptionPlan;
-use cmail_core::authority::{system_authority, Assurance, AuthorityStatus};
+#[cfg(debug_assertions)]
+use cmail_core::authority::UnavailableAuthority;
+use cmail_core::authority::{system_authority, Assurance, Authority, AuthorityStatus};
 use cmail_core::Cmail;
 use std::io::{self, Write};
+
+/// Resolve the authority port for this invocation. Debug builds can force the
+/// fail-closed backend so the CLI failure path is testable without touching a
+/// real credential store; release builds compile the override out.
+fn authority(cli: &Cli) -> &'static dyn Authority {
+    #[cfg(debug_assertions)]
+    if cli.test_unavailable_authority {
+        static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
+        return &UNAVAILABLE;
+    }
+    #[cfg(not(debug_assertions))]
+    let _ = cli;
+    system_authority()
+}
 
 fn assurance_label(assurance: Assurance) -> &'static str {
     match assurance {
@@ -39,7 +55,7 @@ fn print_status(status: &AuthorityStatus) {
 }
 
 pub fn init(cli: &Cli) -> Result<()> {
-    let status = system_authority().init()?;
+    let status = authority(cli).init()?;
     if cli.json {
         output::print_json(&status);
     } else {
@@ -85,7 +101,7 @@ fn confirm() -> Result<bool> {
 
 pub fn adopt(cli: &Cli) -> Result<()> {
     let c = Cmail::open(&cli.root_path()?)?;
-    let authority = system_authority();
+    let authority = authority(cli);
     let plan = c.adoption_plan(authority)?;
     if !cli.json {
         print_plan(&plan);
@@ -105,7 +121,7 @@ pub fn adopt(cli: &Cli) -> Result<()> {
 }
 
 pub fn status(cli: &Cli) -> Result<()> {
-    let status = system_authority().status()?;
+    let status = authority(cli).status()?;
     if cli.json {
         output::print_json(&status);
     } else {

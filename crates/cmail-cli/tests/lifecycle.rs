@@ -804,7 +804,7 @@ fn authority_status_reports_backend_and_assurance() {
         // may not already hold the authority item.
         assert_eq!(out["backend"], "macos-keychain");
         assert!(
-            out["assurance"] == "none" || out["assurance"] == "moderate",
+            out["assurance"] == "none" || out["assurance"] == "advisory",
             "unexpected assurance: {}",
             out["assurance"]
         );
@@ -819,12 +819,12 @@ fn authority_status_reports_backend_and_assurance() {
     }
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn authority_adopt_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();
     let stdout = cmail(&root)
         .arg("--json")
+        .arg("--test-unavailable-authority")
         .arg("authority")
         .arg("adopt")
         .assert()
@@ -837,12 +837,12 @@ fn authority_adopt_fails_closed_without_backend() {
     assert!(message.contains("authority unavailable"), "{message}");
 }
 
-#[cfg(not(target_os = "macos"))]
 #[test]
 fn authority_init_fails_closed_without_backend() {
     let root = TempDir::new().unwrap();
     let stdout = cmail(&root)
         .arg("--json")
+        .arg("--test-unavailable-authority")
         .arg("authority")
         .arg("init")
         .assert()

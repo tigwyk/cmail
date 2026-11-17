@@ -8,11 +8,12 @@
 //!
 //! Apple's per-item `kSecAttrAccessControl` user-presence ACL only works with
 //! the data protection keychain, which requires an app-bundle entitlement that
-//! a plain command-line tool does not have (`errSecMissingEntitlement`). This
-//! backend therefore reports [`Assurance::Moderate`]: presence is checked on
-//! every use, but the key material is not cryptographically bound to the
-//! presence check. A same-user process that obtains Keychain access to the item
-//! can bypass cmail. Reporting Strong here would be dishonest.
+//! a plain command-line tool does not have (`errSecMissingEntitlement`). The
+//! binary is also not built with the hardened runtime. This backend therefore
+//! reports [`Assurance::Advisory`]: presence is an in-process speed bump, the
+//! Keychain item is not cryptographically bound to that check, and a same-user
+//! process can bypass it, for example by injecting into cmail with
+//! `DYLD_INSERT_LIBRARIES`. Reporting Moderate or Strong would be dishonest.
 
 use super::{
     fold_records, Assurance, Authority, AuthorityAction, AuthorityRecord, AuthorityStatus,
@@ -257,10 +258,10 @@ impl Authority for MacAuthority {
             available: true,
             fingerprint: Some(fingerprint_of(&B64.encode(key.as_bytes()))),
             backend: "macos-keychain".into(),
-            assurance: Assurance::Moderate,
+            assurance: Assurance::Advisory,
             last_grant: self.state()?.last_grant.clone(),
             explanation: Some(
-                "LocalAuthentication checks Touch ID or passcode, but the Keychain seed is not cryptographically bound to that check; a same-user process with Keychain access can bypass cmail"
+                "presence is an in-process LocalAuthentication speed bump; the Keychain item is not cryptographically bound to that check, and without the hardened runtime a same-user process can bypass it (for example with DYLD_INSERT_LIBRARIES)"
                     .into(),
             ),
         })
