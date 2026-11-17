@@ -30,10 +30,13 @@ pub struct Cli {
 
 #[derive(Subcommand)]
 pub enum Commands {
-    /// Create (or reuse) an identity
+    /// Create an identity (fails on an existing name unless --reuse)
     Init {
         #[arg(long)]
         name: String,
+        /// Share an existing identity instead of failing on the name collision
+        #[arg(long)]
+        reuse: bool,
     },
     /// Show active identity and root
     Whoami,
@@ -265,8 +268,11 @@ fn main() {
 
 fn dispatch(cli: &Cli) -> anyhow::Result<()> {
     match &cli.command {
-        Commands::Init { name } => commands::account::run(
-            commands::account::AccountCommand::Init { name: name.clone() },
+        Commands::Init { name, reuse } => commands::account::run(
+            commands::account::AccountCommand::Init {
+                name: name.clone(),
+                reuse: *reuse,
+            },
             cli,
         ),
         Commands::Whoami => commands::account::run(commands::account::AccountCommand::Whoami, cli),

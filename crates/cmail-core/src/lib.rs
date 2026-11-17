@@ -14,4 +14,4 @@ pub mod trust;
 
 pub use config::Config;
 pub use error::{CoreError, Result};
-pub use service::Cmail;
+pub use service::{Cmail, InitOutcome};

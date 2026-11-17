@@ -4,7 +4,7 @@ use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
 use crate::error::{CoreError, Result};
 use crate::identity::{
-    create_identity, fingerprint_of, identity_exists, load_identity, now_rfc3339,
+    collision_error, create_identity, fingerprint_of, identity_exists, load_identity, now_rfc3339,
 };
 use crate::keyring::KeyRing;
 use crate::relay::{build_parcel, deposit, fetch_parcel, normalize_base};
@@ -17,6 +17,13 @@ pub struct Cmail {
     pub root: PathBuf,
     pub store: MailStore,
     pub config: Config,
+}
+
+/// Result of [`Cmail::init`]: a fresh identity or an explicitly reused one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum InitOutcome {
+    Created,
+    Reused,
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq)]
@@ -102,18 +109,44 @@ impl Cmail {
         })
     }
 
-    pub fn init(&self, name: &str) -> Result<()> {
+    /// Create an identity, or reuse an existing one only with `reuse`.
+    ///
+    /// A name collision is an error by default: two agents that happen to pick
+    /// the same deterministic name must not silently share one key and mailbox.
+    /// Concurrent creators are safe: key publication is atomic, and the loser
+    /// observes `IdentityExists` (or reuses when `reuse` is set).
+    pub fn init(&self, name: &str, reuse: bool) -> Result<InitOutcome> {
         let existed = identity_exists(&self.root, name);
-        create_identity(&self.root, name)?;
-        append(
-            &self.root,
-            &AuditRecord::now(AuditEvent::Init, name).outcome(if existed {
-                "existing"
-            } else {
-                "created"
-            }),
-        )?;
-        Ok(())
+        if existed && !reuse {
+            return Err(collision_error(&self.root, name));
+        }
+        if existed {
+            // Surface a corrupt key instead of silently reusing it.
+            load_identity(&self.root, name)?;
+            append(
+                &self.root,
+                &AuditRecord::now(AuditEvent::Init, name).outcome("existing"),
+            )?;
+            return Ok(InitOutcome::Reused);
+        }
+        match create_identity(&self.root, name) {
+            Ok(_) => {
+                append(
+                    &self.root,
+                    &AuditRecord::now(AuditEvent::Init, name).outcome("created"),
+                )?;
+                Ok(InitOutcome::Created)
+            }
+            // Lost a creation race against another process.
+            Err(CoreError::IdentityExists { .. }) if reuse => {
+                append(
+                    &self.root,
+                    &AuditRecord::now(AuditEvent::Init, name).outcome("existing"),
+                )?;
+                Ok(InitOutcome::Reused)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     pub fn resolve_identity(&self, as_name: Option<&str>) -> Result<String> {
@@ -1204,11 +1237,117 @@ mod tests {
     /// `resolve_identity(None)` race (review hardening).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[test]
+    fn init_refuses_silent_collision_and_reuse_is_explicit() {
+        let root = TempDir::new().unwrap();
+        let c = Cmail::open(root.path()).unwrap();
+        assert_eq!(c.init("dup", false).unwrap(), InitOutcome::Created);
+        let key_path = root.path().join("identities/dup/key.ed25519");
+        let key_before = std::fs::read(&key_path).unwrap();
+
+        let err = c.init("dup", false).unwrap_err();
+        match err {
+            CoreError::IdentityExists {
+                name,
+                fingerprint,
+                created,
+            } => {
+                assert_eq!(name, "dup");
+                assert_eq!(
+                    fingerprint,
+                    load_identity(root.path(), "dup").unwrap().fingerprint()
+                );
+                assert!(!created.is_empty(), "collision must print creation time");
+            }
+            other => panic!("expected IdentityExists, got {other:?}"),
+        }
+
+        assert_eq!(c.init("dup", true).unwrap(), InitOutcome::Reused);
+        assert_eq!(std::fs::read(&key_path).unwrap(), key_before);
+        let outcomes: Vec<_> = c
+            .audit_tail(10)
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.event == AuditEvent::Init)
+            .map(|r| r.outcome)
+            .collect();
+        assert_eq!(outcomes, ["created", "existing"]);
+    }
+
+    #[test]
+    fn concurrent_init_is_atomic() {
+        fn race(
+            path: std::path::PathBuf,
+            name: &'static str,
+            reuse: bool,
+        ) -> Vec<Result<InitOutcome>> {
+            let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+            let handles: Vec<_> = (0..2)
+                .map(|_| {
+                    let path = path.clone();
+                    let barrier = barrier.clone();
+                    std::thread::spawn(move || {
+                        let c = Cmail::open(&path).unwrap();
+                        barrier.wait();
+                        c.init(name, reuse)
+                    })
+                })
+                .collect();
+            handles.into_iter().map(|h| h.join().unwrap()).collect()
+        }
+
+        let root = TempDir::new().unwrap();
+        let collision = race(root.path().to_path_buf(), "race", false);
+        assert_eq!(
+            collision
+                .iter()
+                .filter(|r| matches!(r, Ok(InitOutcome::Created)))
+                .count(),
+            1,
+            "{collision:?}"
+        );
+        assert_eq!(
+            collision
+                .iter()
+                .filter(|r| matches!(r, Err(CoreError::IdentityExists { .. })))
+                .count(),
+            1,
+            "{collision:?}"
+        );
+        // The surviving key is complete and loadable (no truncation).
+        assert_eq!(
+            std::fs::read(root.path().join("identities/race/key.ed25519"))
+                .unwrap()
+                .len(),
+            32
+        );
+        load_identity(root.path(), "race").unwrap();
+
+        let shared = race(root.path().to_path_buf(), "share", true);
+        assert_eq!(
+            shared
+                .iter()
+                .filter(|r| matches!(r, Ok(InitOutcome::Created)))
+                .count(),
+            1,
+            "{shared:?}"
+        );
+        assert_eq!(
+            shared
+                .iter()
+                .filter(|r| matches!(r, Ok(InitOutcome::Reused)))
+                .count(),
+            1,
+            "{shared:?}"
+        );
+        load_identity(root.path(), "share").unwrap();
+    }
+
     fn svc() -> (TempDir, Cmail) {
         let root = TempDir::new().unwrap();
         let c = Cmail::open(root.path()).unwrap();
-        c.init("alice").unwrap();
-        c.init("zoe").unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
         (root, c)
     }
 
@@ -1280,8 +1419,8 @@ mod tests {
         ));
         let root2 = TempDir::new().unwrap();
         let c2 = Cmail::open(root2.path()).unwrap();
-        c2.init("a").unwrap();
-        c2.init("b").unwrap();
+        c2.init("a", false).unwrap();
+        c2.init("b", false).unwrap();
         let mut cfg = c2.config.clone();
         cfg.outbound = OutboundMode::Open;
         cfg.save(&c2.root).unwrap();
@@ -1372,7 +1511,7 @@ mod tests {
         let (_root, c) = svc();
         c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
         // mallory creates her own identity, then hand-crafts an envelope claiming from=alice
-        c.init("mallory").unwrap();
+        c.init("mallory", false).unwrap();
         let mallory = load_identity(&c.root, "mallory").unwrap();
         let env = build_and_sign(
             &crate::envelope::new_id(),
@@ -1762,7 +1901,7 @@ mod tests {
         };
         // re-seal for a DIFFERENT recipient by swapping in a foreign inbox: simulate by
         // delivering into mallory's mailbox instead (mallory has no matching key)
-        c.init("mallory").unwrap();
+        c.init("mallory", false).unwrap();
         c.store.ensure_mailbox("mallory").unwrap(); // init only creates the identity
         let raw = c.store.read_raw(&c.store.inbox_dir("zoe"), &id).unwrap();
         std::fs::write(c.store.inbox_dir("mallory").join(format!("{id}.mail")), raw).unwrap();
@@ -1905,7 +2044,7 @@ mod tests {
     fn spoof_of_sealed_mail_quarantines_without_decryption() {
         let (_root, c) = svc();
         c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
-        c.init("mallory").unwrap();
+        c.init("mallory", false).unwrap();
         let mallory = crate::identity::load_identity(_root.path(), "mallory").unwrap();
         let rx = crate::crypto::recipient_public_from_b64(
             &crate::identity::load_identity(_root.path(), "zoe")
@@ -2009,7 +2148,7 @@ mod tests {
             cmail_relayd::RelayServer::start("127.0.0.1:0", rroot.path().to_path_buf(), 7).unwrap();
         let base = server.base_url();
         let c = Cmail::open(root.path()).unwrap();
-        c.init("alice").unwrap();
+        c.init("alice", false).unwrap();
         (root, c, server, base)
     }
 
@@ -2208,7 +2347,7 @@ mod tests {
                 .unwrap();
         let base = server.base_url();
         let sender = Cmail::open(sender_root.path()).unwrap();
-        sender.init("alice").unwrap();
+        sender.init("alice", false).unwrap();
         let zoe = crate::identity::create_identity(recv_root.path(), "zoe").unwrap();
         let recipient = Cmail::open(recv_root.path()).unwrap();
         // out-of-band key exchange + route on the sender's side (through the

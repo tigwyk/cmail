@@ -25,8 +25,8 @@ fn drive(root: &std::path::Path, lines: &[&str]) -> Vec<serde_json::Value> {
 fn setup() -> tempfile::TempDir {
     let root = tempfile::tempdir().unwrap();
     let c = cmail_core::Cmail::open(root.path()).unwrap();
-    c.init("alice").unwrap();
-    c.init("zoe").unwrap();
+    c.init("alice", false).unwrap();
+    c.init("zoe", false).unwrap();
     root
 }
 

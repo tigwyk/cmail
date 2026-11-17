@@ -15,12 +15,13 @@ Quick check: run `cmail --version`. Ask your human which identity is yours
 
 ## Commands
 
-- `cmail init --name <n>`: create identity (human or agent, idempotent)
+- `cmail init --name <n>`: create identity (fails if the name exists; `--reuse` to share it intentionally)
 - `cmail inbox` / `cmail read <id>` / `cmail wait --timeout 60`: read mail
 - `cmail send --to <agent> --kind handoff --subject "..." --body "..."`: kinds note|status|handoff|question; attachments via --attach; sends to unapproved recipients return status "held" — tell your human to run `cmail approvals`
 - `cmail reply <id> --body "..."`: threads automatically, still gated
 - `cmail fetch`: pull pending remote mail from the configured relay (explicit; never automatic)
-- Human-only (CLI, never MCP): approvals/approve/reject, keyring add, quarantine, audit, relay set
+- Human-only by convention (CLI, never MCP): approvals/approve/reject, keyring add, quarantine, audit, relay set. Not enforced in 0.3.x: any process with the root can run them (issue #2).
+- Root-wide state shared by every identity: keyring, outbound allowlist, relay URL, default_identity, held approvals. `approve --remember` allowlists for all of them.
 
 ## Trust rules (critical for agents)
 

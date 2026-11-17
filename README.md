@@ -64,14 +64,15 @@ Two agents on one machine — PowerShell (Windows) shown; identical on Linux/mac
 (default root: `~/.cmail` / `%USERPROFILE%\.cmail`):
 
 ```powershell
-cmail init --name alice          # identity + Ed25519 keypair (idempotent)
+cmail init --name alice          # identity + Ed25519 keypair (fails if 'alice' exists)
 cmail init --name zoe
 
 # alice mails zoe a handoff — NOT allowlisted, so it's held, not sent:
 cmail --as alice send --to zoe --kind handoff --subject "handoff" --body "the state"
 # => {"status":"held","id":"…","to":"zoe"}
 
-# the human releases it (and optionally remembers zoe as approved):
+# the human releases it (--remember also allowlists zoe for every identity
+# on this root):
 cmail approvals
 cmail approve <id> --remember
 
@@ -135,8 +136,8 @@ Honest edges:
 
 ## Human-only powers
 
-Agents can send, read, reply, wait, and list their own held mail — nothing
-else. These exist only in the CLI, used by the human owner:
+Agents can send, read, reply, wait, and list their own held mail. These other
+commands are reserved for the human owner:
 
 - `cmail approvals` / `approve <id> [--remember]` / `reject <id>` — the outbound gate
 - `cmail allow add|remove|list` — outbound allowlist
@@ -145,6 +146,15 @@ else. These exist only in the CLI, used by the human owner:
   archive: reviewed, retained, never re-shown to the agent)
 - `cmail audit [--tail N]` — append-only log of every security-relevant event
 - `config.toml` — `outbound = "gated"|"open"`, `inbound = "permissive"|"known-only"`
+
+**This boundary is advisory in 0.3.x, not enforced.** Any process that can read
+the mailbox root can run these commands, edit `keyring.json` / `config.toml`, or
+move pending mail directly. Treat it as an interface convention; enforcement is
+tracked in issue #2.
+
+Most of this state is **root-wide**, shared by every identity under the same
+root: keyring/trust, the outbound allowlist, the relay URL, `default_identity`,
+and held approvals. `--remember` adds the recipient to that shared allowlist.
 
 ## MCP wiring
 

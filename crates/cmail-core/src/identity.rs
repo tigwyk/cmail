@@ -8,6 +8,8 @@ use sha2::{Digest, Sha256};
 use std::fs;
 use std::path::{Path, PathBuf};
 
+static KEY_TMP_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 #[derive(Debug)]
 pub struct Identity {
     pub name: String,
@@ -64,21 +66,82 @@ pub fn identity_exists(root: &Path, name: &str) -> bool {
     validate_name(name).is_ok() && identity_dir(root, name).join("key.ed25519").exists()
 }
 
+/// Creation timestamp from an existing identity's `meta.json`, if readable.
+pub fn identity_created(root: &Path, name: &str) -> Option<String> {
+    let raw = fs::read_to_string(identity_dir(root, name).join("meta.json")).ok()?;
+    let meta: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    meta.get("created")?.as_str().map(str::to_string)
+}
+
 pub fn create_identity(root: &Path, name: &str) -> Result<Identity> {
-    if identity_exists(root, name) {
-        return load_identity(root, name);
-    }
-    let id = Identity::generate(name)?;
+    validate_name(name)?;
     let dir = identity_dir(root, name);
     fs::create_dir_all(&dir)?;
-    fs::write(dir.join("key.ed25519"), id.signing.as_bytes())?;
-    let perms_notice = set_private_perms(&dir.join("key.ed25519"));
-    let _ = perms_notice;
+    let id = Identity::generate(name)?;
+    // Publish the key atomically: write a temp file, then hard-link it to
+    // key.ed25519. link(2) fails with AlreadyExists instead of rewriting, so
+    // two concurrent `init --name X` calls cannot truncate each other's key.
+    let key_path = dir.join("key.ed25519");
+    let tmp = dir.join(format!(
+        ".key.{}.{}.tmp",
+        std::process::id(),
+        KEY_TMP_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+    ));
+    if let Err(e) = fs::write(&tmp, id.signing.as_bytes()) {
+        let _ = fs::remove_file(&tmp);
+        return Err(e.into());
+    }
+    let _ = set_private_perms(&tmp);
+    let linked = fs::hard_link(&tmp, &key_path);
+    let _ = fs::remove_file(&tmp);
+    match linked {
+        Ok(()) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+            return Err(collision_error(root, name));
+        }
+        // ponytail: filesystems without hard links (e.g. exFAT USB roots)
+        // fall back to exclusive create + write. Ownership is still atomic;
+        // only that filesystem has a tiny window where the loser can read a
+        // partial key, which surfaces as "already exists".
+        Err(_) => {
+            let mut file = match std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(&key_path)
+            {
+                Ok(file) => file,
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    return Err(collision_error(root, name));
+                }
+                Err(e) => return Err(e.into()),
+            };
+            if let Err(e) = std::io::Write::write_all(&mut file, id.signing.as_bytes()) {
+                drop(file);
+                let _ = fs::remove_file(&key_path);
+                return Err(e.into());
+            }
+            drop(file);
+            let _ = set_private_perms(&key_path);
+        }
+    }
     fs::write(
         dir.join("meta.json"),
         json!({"name": name, "created": now_rfc3339()}).to_string(),
     )?;
     Ok(id)
+}
+
+/// The typed collision error: fingerprint of the existing identity, plus its
+/// creation time when `meta.json` is already readable.
+pub(crate) fn collision_error(root: &Path, name: &str) -> CoreError {
+    match load_identity(root, name) {
+        Ok(id) => CoreError::IdentityExists {
+            name: name.to_string(),
+            fingerprint: id.fingerprint(),
+            created: identity_created(root, name).unwrap_or_else(|| "unknown".into()),
+        },
+        Err(e) => e,
+    }
 }
 
 pub fn load_identity(root: &Path, name: &str) -> Result<Identity> {
@@ -159,12 +222,23 @@ mod tests {
     }
 
     #[test]
-    fn create_is_idempotent_and_loadable() {
+    fn create_is_atomic_and_loadable() {
         let root = root();
         let created = create_identity(root.path(), "zoe").unwrap();
-        let again = create_identity(root.path(), "zoe").unwrap();
-        assert_eq!(created.public_key_b64(), again.public_key_b64());
-        assert_eq!(created.fingerprint(), again.fingerprint());
+        let key_path = root.path().join("identities/zoe/key.ed25519");
+        let key = fs::read(&key_path).unwrap();
+        let err = create_identity(root.path(), "zoe").unwrap_err();
+        match err {
+            CoreError::IdentityExists { fingerprint, .. } => {
+                assert_eq!(fingerprint, created.fingerprint());
+            }
+            other => panic!("expected IdentityExists, got {other:?}"),
+        }
+        assert_eq!(
+            fs::read(&key_path).unwrap(),
+            key,
+            "collision must not rewrite"
+        );
         assert_eq!(created.fingerprint().len(), 16);
         assert!(identity_exists(root.path(), "zoe"));
         assert_eq!(list_identities(root.path()), vec!["zoe"]);

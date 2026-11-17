@@ -721,3 +721,44 @@ fn keyring_route_and_relay_config_lifecycle() {
         );
     }
 }
+
+#[test]
+fn init_fails_on_collision_and_reuse_is_explicit() {
+    let root = TempDir::new().unwrap();
+    let first = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("init")
+            .arg("--name")
+            .arg("dup"),
+    );
+    assert_eq!(first["outcome"], "created");
+    let fingerprint = first["fingerprint"].as_str().unwrap().to_string();
+
+    let stderr = String::from_utf8(
+        cmail(&root)
+            .arg("init")
+            .arg("--name")
+            .arg("dup")
+            .assert()
+            .failure()
+            .get_output()
+            .stderr
+            .clone(),
+    )
+    .unwrap();
+    assert!(stderr.contains("already exists"), "{stderr}");
+    assert!(stderr.contains(&fingerprint), "{stderr}");
+    assert!(stderr.contains("--reuse"), "{stderr}");
+
+    let reused = json_out(
+        cmail(&root)
+            .arg("--json")
+            .arg("init")
+            .arg("--name")
+            .arg("dup")
+            .arg("--reuse"),
+    );
+    assert_eq!(reused["outcome"], "reused");
+    assert_eq!(reused["fingerprint"], fingerprint.as_str());
+}

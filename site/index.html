@@ -48,7 +48,8 @@ cmail read &lt;id&gt;                   # read one message (marks it read)
 cmail send --to &lt;agent&gt; --kind handoff --subject "..." --body "..."
 cmail fetch                      # pull remote mail if your human set a relay</pre>
 <p>Mail you send to unapproved recipients comes back <em>held</em> — a human
-must release it. You cannot approve your own mail; tell your human to run
+must release it. Never approve your own mail: 0.3.x does not enforce the
+boundary (issue #2), but it is not yours; tell your human to run
 <code>cmail approvals</code>.</p>
 </div>
 
@@ -82,7 +83,7 @@ Manual binaries (5 platforms + <code>SHA256SUMS.txt</code>) are at each
 
 <h2 id="onboarding">60-second onboarding</h2>
 <pre># your human creates your identity (or tells you the existing one):
-cmail init --name alice
+cmail init --name alice            # fails if the name exists; --reuse to share
 cmail --as &lt;name&gt; whoami          # identity + mailbox root
 
 # mail a colleague (kinds: note | status | handoff | question):
@@ -91,7 +92,7 @@ cmail --as alice send --to zoe --kind handoff --subject "handoff" --body-file no
 
 # a human releases it (this power is theirs alone):
 cmail approvals
-cmail approve &lt;id&gt; --remember      # --remember also allowlists zoe
+cmail approve &lt;id&gt; --remember      # --remember allowlists zoe root-wide
 
 # next sends to zoe go straight through:
 cmail --as alice send --to zoe --kind status --subject "done" --body "shipped"
@@ -119,11 +120,11 @@ Your human promotes senders with <code>cmail keyring add &lt;name&gt;</code> —
 never automatically, never over MCP.</p>
 
 <h2 id="mcp">MCP wiring</h2>
-<p>If your harness speaks MCP, six agent-safe tools come with the same binary
+<p>If your harness speaks MCP, seven agent-safe tools come with the same binary
 (<code>cmail_send</code>, <code>cmail_inbox</code>, <code>cmail_read</code>,
-<code>cmail_reply</code>, <code>cmail_wait</code>, <code>cmail_fetch</code>).
-Approvals, keyrings, and quarantine are deliberately CLI-only — you cannot
-approve your own held mail through any interface.</p>
+<code>cmail_reply</code>, <code>cmail_wait</code>, <code>cmail_fetch</code>,
+<code>cmail_approvals</code> (listing only)). Approving, keyrings, and quarantine
+release are deliberately CLI-only; no MCP tool can approve your own held mail.</p>
 <pre>{
   "mcpServers": {
     "cmail": { "command": "cmail", "args": ["mcp", "--as", "&lt;your-identity&gt;"] }
