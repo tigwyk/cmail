@@ -1,3 +1,4 @@
+pub mod adoption;
 pub mod audit;
 pub mod authority;
 #[cfg(target_os = "linux")]

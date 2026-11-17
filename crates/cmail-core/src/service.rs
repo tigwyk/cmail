@@ -1,4 +1,6 @@
+use crate::adoption::{self, AdoptionOutcome, AdoptionPlan, LegacyApproval};
 use crate::audit::{append, AuditEvent, AuditRecord};
+use crate::authority::Authority;
 use crate::config::{Config, InboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
@@ -492,6 +494,43 @@ impl Cmail {
         }
         out.sort_by(|a, b| a.created.cmp(&b.created));
         Ok(out)
+    }
+
+    /// Diff legacy keyring, allowlist, relay, and held approvals against the
+    /// effective signed policy. Read-only: no signature is requested.
+    pub fn adoption_plan(&self, authority: &dyn Authority) -> Result<AdoptionPlan> {
+        let approvals = self
+            .approvals(None)?
+            .into_iter()
+            .map(|held| LegacyApproval {
+                id: held.id,
+                from: held.from,
+                to: held.to,
+                subject: held.subject,
+                created: held.created,
+            })
+            .collect();
+        adoption::plan(&self.root, authority, approvals)
+    }
+
+    /// Sign a previously reviewed plan. `confirmed = false` writes nothing.
+    pub fn sign_adoption(
+        &self,
+        authority: &dyn Authority,
+        plan: AdoptionPlan,
+        confirmed: bool,
+    ) -> Result<AdoptionOutcome> {
+        adoption::apply(authority, plan, confirmed)
+    }
+
+    /// Plan and (when confirmed) sign legacy state in one call.
+    pub fn adopt_legacy(
+        &self,
+        authority: &dyn Authority,
+        confirmed: bool,
+    ) -> Result<AdoptionOutcome> {
+        let plan = self.adoption_plan(authority)?;
+        self.sign_adoption(authority, plan, confirmed)
     }
 
     pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
