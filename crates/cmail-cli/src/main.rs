@@ -24,6 +24,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub root: Option<PathBuf>,
 
+    /// Test-only: force the unavailable authority backend (debug builds only)
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    pub test_unavailable_authority: bool,
+
+    /// Test-only: use an in-memory authority with this base64 signing key
+    /// (debug builds only; never a real presence check)
+    #[cfg(debug_assertions)]
+    #[arg(long, global = true, hide = true)]
+    pub test_authority_key: Option<String>,
+
     #[command(subcommand)]
     pub command: Commands,
 }
@@ -42,6 +53,11 @@ pub enum Commands {
     Whoami,
     /// Show config and paths
     Config,
+    /// Inspect or initialize the human authority (human-only)
+    Authority {
+        #[command(subcommand)]
+        cmd: AuthorityCommand,
+    },
     /// Send mail (subject to outbound gate)
     Send {
         #[arg(long)]
@@ -114,6 +130,11 @@ pub enum Commands {
         #[command(subcommand)]
         cmd: RelayCommand,
     },
+    /// Show or change the root-wide outbound/inbound policy modes (human-only)
+    Mode {
+        #[command(subcommand)]
+        cmd: ModeCommand,
+    },
     /// Inspect quarantine (human-only)
     Quarantine {
         #[command(subcommand)]
@@ -150,6 +171,19 @@ pub enum AllowCommand {
 }
 
 #[derive(Subcommand)]
+pub enum AuthorityCommand {
+    /// Create the authority key (fails closed when no backend is available)
+    Init,
+    /// Adopt legacy keyring, allowlist, relay, and held approvals
+    Adopt,
+    /// Report authority fingerprint, backend, and assurance
+    Status,
+    /// Recover from a lost key: discard all signed policy and create a fresh
+    /// authority key (requires human presence)
+    Reset,
+}
+
+#[derive(Subcommand)]
 pub enum KeyringCommand {
     Add {
         name: String,
@@ -160,6 +194,11 @@ pub enum KeyringCommand {
         /// Relay base URL for this name (set the route at add time)
         #[arg(long)]
         route: Option<String>,
+    },
+    /// Remove a name's trusted key (human-only); the signed revocation wins
+    /// over every earlier grant
+    Remove {
+        name: String,
     },
     /// Set or clear a name's relay route (human-only)
     Route {
@@ -179,6 +218,16 @@ pub enum RelayCommand {
     Clear,
     /// Show the configured pickup relay url
     Show,
+}
+
+#[derive(Subcommand)]
+pub enum ModeCommand {
+    /// Show the effective signed modes
+    Show,
+    /// Set the signed outbound mode (gated | open)
+    Outbound { mode: String },
+    /// Set the signed inbound mode (permissive | known-only)
+    Inbound { mode: String },
 }
 
 #[derive(Subcommand)]
@@ -226,6 +275,9 @@ fn map_keyring(cmd: &KeyringCommand) -> commands::admin::KeyringCmd {
             from_message: from_message.clone(),
             route: route.clone(),
         },
+        KeyringCommand::Remove { name } => {
+            commands::admin::KeyringCmd::Remove { name: name.clone() }
+        }
         KeyringCommand::Route { name, url, clear } => commands::admin::KeyringCmd::Route {
             name: name.clone(),
             url: url.clone(),
@@ -240,6 +292,14 @@ fn map_relay(cmd: &RelayCommand) -> commands::admin::RelayCmd {
         RelayCommand::Set { url } => commands::admin::RelayCmd::Set { url: url.clone() },
         RelayCommand::Clear => commands::admin::RelayCmd::Clear,
         RelayCommand::Show => commands::admin::RelayCmd::Show,
+    }
+}
+
+fn map_mode(cmd: &ModeCommand) -> commands::admin::ModeCmd {
+    match cmd {
+        ModeCommand::Show => commands::admin::ModeCmd::Show,
+        ModeCommand::Outbound { mode } => commands::admin::ModeCmd::Outbound { mode: mode.clone() },
+        ModeCommand::Inbound { mode } => commands::admin::ModeCmd::Inbound { mode: mode.clone() },
     }
 }
 
@@ -277,6 +337,12 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         ),
         Commands::Whoami => commands::account::run(commands::account::AccountCommand::Whoami, cli),
         Commands::Config => commands::account::run(commands::account::AccountCommand::Config, cli),
+        Commands::Authority { cmd } => match cmd {
+            AuthorityCommand::Init => commands::authority::init(cli),
+            AuthorityCommand::Adopt => commands::authority::adopt(cli),
+            AuthorityCommand::Status => commands::authority::status(cli),
+            AuthorityCommand::Reset => commands::authority::reset(cli),
+        },
         Commands::Send {
             to,
             kind,
@@ -309,6 +375,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Reject { id } => commands::admin::reject(cli, id),
         Commands::Keyring { cmd } => commands::admin::keyring(cli, map_keyring(cmd)),
         Commands::Relay { cmd } => commands::admin::relay(cli, map_relay(cmd)),
+        Commands::Mode { cmd } => commands::admin::mode(cli, map_mode(cmd)),
         Commands::Quarantine { cmd } => commands::admin::quarantine(cli, map_quarantine(cmd)),
         Commands::Audit { tail } => commands::admin::audit(cli, *tail),
         Commands::RelayServe {

@@ -1,4 +1,6 @@
+use crate::adoption::{self, AdoptionOutcome, AdoptionPlan, LegacyApproval};
 use crate::audit::{append, AuditEvent, AuditRecord};
+use crate::authority::{subject, Authority, AuthorityAction, AuthorityStatus};
 use crate::config::{Config, InboundMode, OutboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
@@ -7,6 +9,7 @@ use crate::identity::{
     collision_error, create_identity, fingerprint_of, identity_exists, load_identity, now_rfc3339,
 };
 use crate::keyring::KeyRing;
+use crate::policy::Policy;
 use crate::relay::{build_parcel, deposit, fetch_parcel, normalize_base};
 use crate::store::MailStore;
 use crate::trust::TrustLevel;
@@ -17,6 +20,9 @@ pub struct Cmail {
     pub root: PathBuf,
     pub store: MailStore,
     pub config: Config,
+    /// The process authority: verifies signed policy on trust reads and gates
+    /// every human-only keyring decision. Resolved once per handle.
+    authority: std::sync::Arc<dyn Authority>,
 }
 
 /// Result of [`Cmail::init`]: a fresh identity or an explicitly reused one.
@@ -99,14 +105,32 @@ pub enum KeySource {
 }
 
 impl Cmail {
+    /// Open with the process authority backend (the only release path).
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_authority(root, crate::authority::system_authority())
+    }
+
+    /// Open with an explicit authority port. The CLI passes the backend it
+    /// selected (including the debug-only unavailable one) so command output
+    /// and trust reads agree; production callers use [`Cmail::open`].
+    pub fn open_with_authority(
+        root: &Path,
+        authority: std::sync::Arc<dyn Authority>,
+    ) -> Result<Self> {
         fs_ensure_root(root)?;
         let config = Config::load_or_init(root)?;
         Ok(Self {
             root: root.to_path_buf(),
             store: MailStore::new(root),
             config,
+            authority,
         })
+    }
+
+    /// The effective-policy seam, loaded fresh so human edits made since this
+    /// handle opened are observed (long-lived MCP process).
+    fn policy(&self) -> Result<Policy> {
+        Policy::load(&self.root, self.authority.clone())
     }
 
     /// Create an identity, or reuse an existing one only with `reuse`.
@@ -196,7 +220,8 @@ impl Cmail {
         // (the synced-root cross-machine case: only the remote machine holds
         // identities/<to>/; locally the keyring entry carries the encrypt-to
         // key, resolved by recipient_x25519 below).
-        if !identity_exists(&self.root, to) && KeyRing::load(&self.root)?.get(to).is_none() {
+        let policy = self.policy()?;
+        if !identity_exists(&self.root, to) && policy.keyring()?.get(to).is_none() {
             return Err(CoreError::UnknownRecipient(to.to_string()));
         }
         if let Some(parent) = reply_to {
@@ -220,7 +245,7 @@ impl Cmail {
         let remote_route = if identity_exists(&self.root, to) {
             None
         } else {
-            KeyRing::load(&self.root)?.get_route(to)
+            policy.route(to)?
         };
         let outcome = match remote_route {
             Some(route) => self.send_remote(
@@ -263,7 +288,8 @@ impl Cmail {
         let public_key_b64 = if identity_exists(&self.root, to) {
             load_identity(&self.root, to)?.public_key_b64()
         } else {
-            KeyRing::load(&self.root)?
+            self.policy()?
+                .keyring()?
                 .get(to)
                 .map(|e| e.public_key.clone())
                 .ok_or_else(|| CoreError::UnknownRecipient(to.to_string()))?
@@ -306,10 +332,10 @@ impl Cmail {
         )?;
         self.store.ensure_mailbox(from)?;
         self.store.ensure_mailbox(to)?;
-        // Gate on the current on-disk config: allow_add/approve may have updated the
-        // allowlist after this Cmail handle was opened (long-lived MCP process).
-        let gate = Config::load_or_init(&self.root)?;
-        if gate.outbound == OutboundMode::Open || gate.is_send_allowed(to) {
+        // Gate on the effective policy, loaded fresh: allow_add/approve may have
+        // updated the allowlist after this Cmail handle was opened (long-lived
+        // MCP process).
+        if self.policy()?.may_send(to) {
             self.store.write_envelope(&self.store.inbox_dir(to), &env)?;
             append(
                 &self.root,
@@ -375,10 +401,9 @@ impl Cmail {
             &now_rfc3339(),
             &identity.signing,
         )?;
-        // Gate on the current on-disk config (long-lived MCP process), held
-        // BEFORE network — identical gate semantics to send_gated.
-        let gate = Config::load_or_init(&self.root)?;
-        if gate.outbound != OutboundMode::Open && !gate.is_send_allowed(to) {
+        // Gate on the effective policy (long-lived MCP process), held BEFORE
+        // network — identical gate semantics to send_gated.
+        if !self.policy()?.may_send(to) {
             self.store
                 .write_envelope(&self.store.pending_dir(from), &env)?;
             append(
@@ -412,7 +437,9 @@ impl Cmail {
     /// parcel assembly: the CALLER owns the audit ordering (`send_relay` is
     /// appended by each caller after its own bookkeeping).
     fn deposit_remote(&self, env: &Envelope, route: &str) -> Result<()> {
-        let entry = KeyRing::load(&self.root)?
+        let entry = self
+            .policy()?
+            .keyring()?
             .get(&env.to)
             .cloned()
             .ok_or_else(|| CoreError::UnknownRecipient(env.to.clone()))?;
@@ -491,17 +518,102 @@ impl Cmail {
         Ok(out)
     }
 
-    pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
+    /// Diff legacy keyring, allowlist, relay, and held approvals against the
+    /// effective signed policy. Read-only: no signature is requested.
+    pub fn adoption_plan(&self, authority: &dyn Authority) -> Result<AdoptionPlan> {
+        let approvals = self
+            .approvals(None)?
+            .into_iter()
+            .map(|held| LegacyApproval {
+                id: held.id,
+                from: held.from,
+                to: held.to,
+                subject: held.subject,
+                created: held.created,
+            })
+            .collect();
+        adoption::plan(&self.root, authority, approvals)
+    }
+
+    /// Sign a previously reviewed plan. `confirmed = false` writes nothing.
+    pub fn sign_adoption(
+        &self,
+        authority: &dyn Authority,
+        plan: AdoptionPlan,
+        confirmed: bool,
+    ) -> Result<AdoptionOutcome> {
+        adoption::apply(&self.root, authority, plan, confirmed)
+    }
+
+    /// Plan and (when confirmed) sign legacy state in one call.
+    pub fn adopt_legacy(
+        &self,
+        authority: &dyn Authority,
+        confirmed: bool,
+    ) -> Result<AdoptionOutcome> {
+        let plan = self.adoption_plan(authority)?;
+        self.sign_adoption(authority, plan, confirmed)
+    }
+
+    /// Presence-gated recovery: discard the pinned head and this root's signed
+    /// record log, then re-provision the authority key. A denied presence
+    /// prompt leaves everything untouched.
+    pub fn reset_authority(&self, authority: &dyn Authority) -> Result<AuthorityStatus> {
+        authority.reset(&self.root)
+    }
+
+    /// Sign a per-message approval, then release it. The signature is the
+    /// permission: a pending file with no valid `approval:<id>` record in the
+    /// effective policy is never delivered, even if config or the queue was
+    /// hand-edited.
+    pub fn approve(&self, id: &str, remember: bool) -> Result<String> {
+        // Locate before prompting: a stale or caller-supplied id must not
+        // consume a presence check or append a record for nothing.
+        let (_owner, env) = self.store.find_pending(id)?;
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::Approve,
+            &subject::approval(id),
+            &serde_json::json!({ "id": id }),
+        )?;
+        self.release_approved(id, remember)?;
+        Ok(env.to)
+    }
+
+    /// Release one pending message only when the effective policy carries a
+    /// valid signed approve for that exact id. Split from [`approve`] so tests
+    /// can prove absent, unsigned, or foreign-key records release nothing.
+    fn release_approved(&self, id: &str, remember: bool) -> Result<()> {
+        let policy = self.policy()?;
+        let authorizing = match policy.effective()?.decisions.get(&subject::approval(id)) {
+            Some(decision) if decision.action == AuthorityAction::Approve => decision.sequence,
+            Some(_) => {
+                return Err(CoreError::AuthorityRequired(format!(
+                    "message {id} has a signed reject; it cannot be released"
+                )))
+            }
+            None => {
+                return Err(CoreError::AuthorityRequired(format!(
+                    "message {id} has no signed approval; ask your human to run: cmail approve {id}"
+                )))
+            }
+        };
         let (owner, env) = self.store.find_pending(id)?;
-        let keyring = KeyRing::load(&self.root)?;
         // Re-verify the recipient is still releasable: the same disjunction
         // send() accepts (local identity OR keyring-known). A local identity
         // may have been removed after the mail was held — but on a synced
         // root the keyring entry alone still carries the encrypt-to key
         // (review hardening + whole-branch fix: held mail to keyring-only
         // recipients must be approvable, not just sendable).
-        if !identity_exists(&self.root, &env.to) && keyring.get(&env.to).is_none() {
+        if !identity_exists(&self.root, &env.to) && policy.keyring()?.get(&env.to).is_none() {
             return Err(CoreError::UnknownRecipient(env.to));
+        }
+        // `--remember` signs a root-wide allow record BEFORE the release: if
+        // the human-presence signature is refused, nothing is released and
+        // the human can retry. A later relay failure leaves the approved
+        // name signed and the pending file in place.
+        if remember {
+            self.allow_add(&env.to)?;
         }
         // Routed held mail (spec §3.2): the recipient has no local identity
         // but has keyring+route at approve time — the approval performs the
@@ -510,7 +622,7 @@ impl Cmail {
         // recipient WITHOUT a route keeps the synced-root local move below
         // (v1.1 rule).
         if !identity_exists(&self.root, &env.to) {
-            if let Some(route) = keyring.get_route(&env.to) {
+            if let Some(route) = policy.route(&env.to)? {
                 self.deposit_remote(&env, &route)?;
                 self.store
                     .delete_message(&self.store.pending_dir(&owner), id)?;
@@ -519,7 +631,8 @@ impl Cmail {
                     &self.root,
                     &AuditRecord::now(AuditEvent::Approve, "human")
                         .msg(id)
-                        .counterpart(&env.to),
+                        .counterpart(&env.to)
+                        .detail(&format!("authority sequence {authorizing}")),
                 )?;
                 append(
                     &self.root,
@@ -527,9 +640,6 @@ impl Cmail {
                         .msg(id)
                         .counterpart(&env.to),
                 )?;
-                if remember {
-                    self.allow_add(&env.to)?;
-                }
                 return Ok(());
             }
         }
@@ -543,14 +653,14 @@ impl Cmail {
             &self.root,
             &AuditRecord::now(AuditEvent::Approve, "human")
                 .msg(id)
-                .counterpart(&env.to),
+                .counterpart(&env.to)
+                .detail(&format!("authority sequence {authorizing}")),
         )?;
-        if remember {
-            self.allow_add(&env.to)?;
-        }
         Ok(())
     }
 
+    /// Sign a per-message reject, then delete only that pending message. A
+    /// signed reject never releases mail and supersedes an earlier approval.
     pub fn reject(&self, id: &str) -> Result<()> {
         // Locate WITHOUT parsing: a corrupt pending file (visible in approvals
         // since H5) must be clearable by the human, not just well-formed held
@@ -558,6 +668,12 @@ impl Cmail {
         let Some((owner, path)) = self.store.find_pending_file(id) else {
             return Err(CoreError::MessageNotFound(id.to_string()));
         };
+        let record = self.authority.sign_action(
+            &self.root,
+            AuthorityAction::Reject,
+            &subject::approval(id),
+            &serde_json::json!({ "id": id }),
+        )?;
         let env = std::fs::read_to_string(&path)
             .ok()
             .and_then(|raw| Envelope::parse(&raw).ok());
@@ -583,17 +699,22 @@ impl Cmail {
             &AuditRecord::now(AuditEvent::Reject, "human")
                 .msg(id)
                 .counterpart(&counterpart)
-                .outcome(outcome),
+                .outcome(outcome)
+                .detail(&format!("authority sequence {}", record.sequence)),
         )?;
         Ok(())
     }
 
+    /// Sign an `allow:<name>` decision. Root-wide: every identity on this
+    /// root shares the allowlist. An unavailable or denied authority writes
+    /// no record and returns the typed refusal.
     pub fn allow_add(&self, name: &str) -> Result<()> {
-        let mut cfg = Config::load_or_init(&self.root)?;
-        if !cfg.allow.send.iter().any(|n| n == name) {
-            cfg.allow.send.push(name.to_string());
-            cfg.save(&self.root)?;
-        }
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::AllowAdd,
+            &crate::authority::subject::allow(name),
+            &serde_json::json!({ "name": name }),
+        )?;
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::AllowAdd, "human").counterpart(name),
@@ -601,12 +722,15 @@ impl Cmail {
         Ok(())
     }
 
+    /// Sign an `allow:<name>` revocation. Latest valid record wins, so the
+    /// name leaves the effective allowlist immediately.
     pub fn allow_remove(&self, name: &str) -> Result<()> {
-        // Load fresh: allow_add/approve may have updated the allowlist after
-        // this handle was opened (long-lived MCP process), mirroring allow_add.
-        let mut cfg = Config::load_or_init(&self.root)?;
-        cfg.allow.send.retain(|n| n != name);
-        cfg.save(&self.root)?;
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::AllowRemove,
+            &crate::authority::subject::allow(name),
+            &serde_json::json!({ "name": name }),
+        )?;
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::AllowRemove, "human").counterpart(name),
@@ -615,14 +739,12 @@ impl Cmail {
     }
 
     pub fn allow_list(&self) -> Result<Vec<String>> {
-        let mut v = Config::load_or_init(&self.root)?.allow.send;
-        v.sort();
-        Ok(v)
+        self.policy()?.allow_list()
     }
 
     /// Display-oriented audit tail: skips malformed lines so a damaged log
-    /// still renders. The fail-closed `was_released` gate keeps using strict
-    /// `audit::tail` directly.
+    /// still renders. Read-only observability: audit events are unsigned and
+    /// grant no authority (quarantine release reads the signed policy fold).
     pub fn audit_tail(&self, n: usize) -> Result<Vec<AuditRecord>> {
         crate::audit::tail_lossy(&self.root, n)
     }
@@ -637,10 +759,10 @@ impl Cmail {
     pub fn inbox(&self, as_name: Option<&str>) -> Result<Vec<InboxItem>> {
         let me = self.resolve_identity(as_name)?;
         self.store.ensure_mailbox(&me)?;
-        let keyring = KeyRing::load(&self.root)?;
-        // Inbound mode is read fresh from disk: a human may have flipped it since
-        // this handle was opened (long-lived MCP process), mirroring send()'s gate.
-        let inbound = Config::load_or_init(&self.root)?.inbound;
+        let policy = self.policy()?;
+        // Policy is read fresh through the seam: the signed inbound mode is
+        // the only gate switch (config edits never move it), mirroring send().
+        let inbound = policy.inbound_mode();
         let inbox = self.store.inbox_dir(&me);
         let quarantine = self.store.quarantine_dir(&me);
         let mut items = Vec::new();
@@ -659,7 +781,7 @@ impl Cmail {
                 self.audit_corrupt(&id, "signature fails against from_key")?;
                 continue;
             }
-            let tr = crate::trust::evaluate(&env, &keyring);
+            let tr = policy.trust(&env)?;
             match tr.level {
                 TrustLevel::SpoofSuspect => {
                     self.store.move_message(&inbox, &quarantine, &id)?;
@@ -740,7 +862,7 @@ impl Cmail {
                 .mail_file_path(&archive, id)
                 .map(|p| p.exists())
                 .unwrap_or(false)
-            && self.was_released(id);
+            && self.released_by_policy(id)?;
         if !in_inbox && !released {
             return Err(CoreError::MessageNotFound(format!(
                 "{id} (already read or not found)"
@@ -748,8 +870,7 @@ impl Cmail {
         }
         let src = if in_inbox { &inbox } else { &archive };
         let env = self.load_envelope_from(std::slice::from_ref(src), id)?;
-        let keyring = KeyRing::load(&self.root)?;
-        let tr = crate::trust::evaluate(&env, &keyring);
+        let tr = self.policy()?.trust(&env)?;
         // Spec 4.2: signature and trust come from the visible header (above);
         // content is recovered here — a sealed envelope is opened with the
         // reader's X25519 identity key, a plain envelope passes through. A
@@ -801,19 +922,20 @@ impl Cmail {
         })
     }
 
-    /// Whether `id` was released from quarantine by a human (a
-    /// `quarantine_release` audit event). Release = "human-approved for
+    /// Whether `id` was released from quarantine by a human (a valid signed
+    /// `quarantine:<id>` authority decision). Release = "human-approved for
     /// reading", so released mail stays re-readable; every read is still
-    /// audited.
-    fn was_released(&self, id: &str) -> bool {
-        crate::audit::tail(&self.root, usize::MAX)
-            .map(|records| {
-                records.iter().any(|r| {
-                    r.event == crate::audit::AuditEvent::QuarantineRelease
-                        && r.msg_id.as_deref() == Some(id)
-                })
-            })
-            .unwrap_or(false) // log absent/corrupt -> not released -> archived mail stays locked (fail-closed)
+    /// audited. The unsigned audit event is observability only and grants
+    /// nothing, so a hand-edited `audit.log` can never unlock mail.
+    fn released_by_policy(&self, id: &str) -> Result<bool> {
+        let policy = self.policy()?;
+        Ok(matches!(
+            policy
+                .effective()?
+                .decisions
+                .get(&crate::authority::subject::quarantine(id)),
+            Some(decision) if decision.action == AuthorityAction::QuarantineRelease
+        ))
     }
 
     pub fn reply(
@@ -854,12 +976,12 @@ impl Cmail {
         let mut items = self.inbox(as_name)?;
         if all {
             let me = self.resolve_identity(as_name)?;
-            let keyring = KeyRing::load(&self.root)?;
+            let policy = self.policy()?;
             let archive = self.store.archive_dir(&me);
             for id in self.store.list_ids(&archive) {
                 let raw = self.store.read_raw(&archive, &id)?;
                 if let Ok(env) = Envelope::parse(&raw) {
-                    let tr = crate::trust::evaluate(&env, &keyring);
+                    let tr = policy.trust(&env)?;
                     let kind = env.kind_label().to_string();
                     let subject = env.subject_label().to_string();
                     items.push(InboxItem {
@@ -916,13 +1038,11 @@ impl Cmail {
     ) -> Result<FetchReport> {
         let me = self.resolve_identity(as_name)?;
         let identity = load_identity(&self.root, &me)?;
-        // Load fresh from disk: relay set/clear may have happened after this
-        // handle was opened (long-lived MCP process), mirroring relay_set.
-        let raw_url = Config::load_or_init(&self.root)?
-            .relay_url()
-            .ok_or_else(|| {
-                CoreError::Config("no relay configured; run: cmail relay set <url>".into())
-            })?;
+        // Load fresh through the seam: relay set/clear may have happened after
+        // this handle was opened (long-lived MCP process), mirroring relay_set.
+        let raw_url = self.policy()?.relay_url()?.ok_or_else(|| {
+            CoreError::Config("no relay configured; run: cmail relay set <url>".into())
+        })?;
         let base = normalize_base(&raw_url)?;
         let fp = identity.fingerprint();
         let mut report = FetchReport::default();
@@ -1057,8 +1177,7 @@ impl Cmail {
     pub fn quarantine_show(&self, owner: Option<&str>, id: &str) -> Result<ReadMessage> {
         let me = self.resolve_identity(owner)?;
         let env = Envelope::parse(&self.store.read_raw(&self.store.quarantine_dir(&me), id)?)?;
-        let keyring = KeyRing::load(&self.root)?;
-        let tr = crate::trust::evaluate(&env, &keyring);
+        let tr = self.policy()?.trust(&env)?;
         let my = load_identity(&self.root, &me)?;
         let (kind, subject, body, attachments, in_reply_to) =
             match open_envelope(&env, &x25519_secret(&my.signing)) {
@@ -1103,29 +1222,62 @@ impl Cmail {
     /// spoof/corrupt mail. Never re-verifies: release is an explicit human
     /// decision overriding the automatic routing; the released copy stays
     /// readable by id via `read_message`, wrapped unless verified.
+    ///
+    /// The decision is a presence-gated, signed `quarantine:<id>` authority
+    /// record. A caller-supplied id, a hand-edited log, or an unsigned audit
+    /// event can never release: release fails closed unless the fold yields a
+    /// valid signed decision. Repeating a release is a no-op.
     pub fn quarantine_release(&self, id: &str) -> Result<()> {
-        for owner in crate::identity::list_identities(&self.root) {
-            let q = self.store.quarantine_dir(&owner);
-            if self
-                .store
-                .mail_file_path(&q, id)
+        let identities = crate::identity::list_identities(&self.root);
+        let quarantined = |owner: &str| {
+            self.store
+                .mail_file_path(&self.store.quarantine_dir(owner), id)
                 .map(|p| p.exists())
                 .unwrap_or(false)
-            {
-                self.store
-                    .move_message(&q, &self.store.archive_dir(&owner), id)?;
-                append(
-                    &self.root,
-                    &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(id),
-                )?;
+        };
+        let archived = |owner: &str| {
+            self.store
+                .mail_file_path(&self.store.archive_dir(owner), id)
+                .map(|p| p.exists())
+                .unwrap_or(false)
+        };
+        let Some(owner) = identities.iter().find(|owner| quarantined(owner)) else {
+            // Idempotent repeat: an already-archived copy with a valid signed
+            // decision is released; anything else is simply not releaseable.
+            if identities.iter().any(|owner| archived(owner)) && self.released_by_policy(id)? {
                 return Ok(());
             }
+            return Err(CoreError::MessageNotFound(id.to_string()));
+        };
+        if !self.released_by_policy(id)? {
+            self.authority.sign_action(
+                &self.root,
+                AuthorityAction::QuarantineRelease,
+                &crate::authority::subject::quarantine(id),
+                &serde_json::json!({ "message_id": id }),
+            )?;
+            // The signature alone is not the release: only a decision the
+            // fold accepts (right key, intact chain) counts.
+            if !self.released_by_policy(id)? {
+                return Err(CoreError::AuthorityRequired(format!(
+                    "quarantine release for {id} is not backed by a valid signed decision"
+                )));
+            }
         }
-        Err(CoreError::MessageNotFound(id.to_string()))
+        self.store.move_message(
+            &self.store.quarantine_dir(owner),
+            &self.store.archive_dir(owner),
+            id,
+        )?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(id),
+        )?;
+        Ok(())
     }
 
     pub fn keyring_list(&self) -> Result<Vec<(String, crate::keyring::KeyEntry)>> {
-        Ok(KeyRing::load(&self.root)?.list())
+        Ok(self.policy()?.keyring()?.list())
     }
 
     pub fn keyring_add(&self, name: &str, source: KeySource) -> Result<()> {
@@ -1140,14 +1292,75 @@ impl Cmail {
                 env.from_key
             }
         };
-        let mut kr = KeyRing::load(&self.root)?;
-        kr.add(name, &key)?;
-        kr.save(&self.root)?;
+        // The signed log is the only thing that grants trust. Rotating a name
+        // revokes every live subject first, so the old key cannot stay trusted.
+        let policy = self.authority.load_effective_policy(&self.root)?;
+        let mut granted = KeyRing::granted_keys(&policy, name);
+        if granted.len() == 1 && granted[0] == key {
+            granted.clear();
+        }
+        for old_key in granted {
+            self.authority.sign_action(
+                &self.root,
+                AuthorityAction::KeyRemove,
+                &adoption::key_subject(name, &old_key),
+                &serde_json::json!({ "name": name, "public_key": old_key }),
+            )?;
+            append(
+                &self.root,
+                &AuditRecord::now(AuditEvent::KeyRemove, "human").counterpart(name),
+            )?;
+        }
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::KeyAdd,
+            &adoption::key_subject(name, &key),
+            &serde_json::json!({ "name": name, "public_key": key }),
+        )?;
+        // Non-trust cache: routes and display only. Trust ignores this file.
+        self.cache_key(name, &key)?;
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::KeyAdd, "human").counterpart(name),
         )?;
         Ok(())
+    }
+
+    /// Revoke every live signed grant for `name`. Revocation is a signed
+    /// record, so it wins over an earlier grant and survives a restart.
+    pub fn keyring_remove(&self, name: &str) -> Result<()> {
+        let policy = self.authority.load_effective_policy(&self.root)?;
+        let granted = KeyRing::granted_keys(&policy, name);
+        if granted.is_empty() {
+            return Err(CoreError::Config(format!(
+                "keyring has no entry for '{name}'"
+            )));
+        }
+        for public_key in granted {
+            self.authority.sign_action(
+                &self.root,
+                AuthorityAction::KeyRemove,
+                &adoption::key_subject(name, &public_key),
+                &serde_json::json!({ "name": name, "public_key": public_key }),
+            )?;
+        }
+        let mut kr = KeyRing::load(&self.root)?;
+        kr.remove(name);
+        kr.save(&self.root)?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::KeyRemove, "human").counterpart(name),
+        )?;
+        Ok(())
+    }
+
+    /// Keep the legacy keyring file as a non-trust cache of the signed key, so
+    /// routes keep working. Hand edits here never change trust.
+    fn cache_key(&self, name: &str, public_key: &str) -> Result<()> {
+        let mut kr = KeyRing::load(&self.root)?;
+        kr.remove(name);
+        kr.add(name, public_key)?;
+        kr.save(&self.root)
     }
 
     /// Set (`Some`) or clear (`None`) a keyring entry's relay route (spec
@@ -1167,14 +1380,27 @@ impl Cmail {
         Ok(())
     }
 
-    /// Set (`Some`) or clear (`None`) the pickup relay url (spec §3.3).
-    /// Human-only config decision: audited as `relay_set`.
+    /// The effective pickup relay url, if any. Signed-only: a hand-edited
+    /// `[relay] url` in config never becomes the fetch target.
+    pub fn relay_url(&self) -> Result<Option<String>> {
+        self.policy()?.relay_url()
+    }
+
+    /// Sign a relay decision (spec §3.3). Root-wide: every identity on this
+    /// root shares the pickup relay. `None` signs a clear; an unavailable or
+    /// denied authority writes no record and returns the typed refusal.
     pub fn relay_set(&self, url: Option<&str>) -> Result<()> {
-        // Load fresh: other config edits may have landed after this handle was
-        // opened (long-lived MCP process), mirroring allow_add.
-        let mut cfg = Config::load_or_init(&self.root)?;
-        cfg.relay.url = url.map(str::to_string);
-        cfg.save(&self.root)?;
+        let url = url.filter(|url| !url.is_empty());
+        let (action, payload) = match url {
+            Some(url) => (AuthorityAction::RelaySet, serde_json::json!({ "url": url })),
+            None => (AuthorityAction::RelayClear, serde_json::json!({})),
+        };
+        self.authority.sign_action(
+            &self.root,
+            action,
+            crate::authority::subject::RELAY,
+            &payload,
+        )?;
         let mut rec = AuditRecord::now(AuditEvent::RelaySet, "human").outcome(if url.is_some() {
             "set"
         } else {
@@ -1184,6 +1410,62 @@ impl Cmail {
             rec = rec.detail(u);
         }
         append(&self.root, &rec)?;
+        Ok(())
+    }
+
+    /// The effective signed outbound mode. No signed record means `gated`;
+    /// config never opens the gate.
+    pub fn outbound_mode(&self) -> Result<OutboundMode> {
+        Ok(self.policy()?.outbound_mode()?.unwrap_or_default())
+    }
+
+    /// The effective inbound mode. A signed record wins in either direction.
+    /// With no signed record, a reachable key honors legacy `config.inbound`;
+    /// an unavailable or locked key, a tampered log, or an unparseable signed
+    /// payload falls closed to `known-only`.
+    pub fn inbound_mode(&self) -> Result<InboundMode> {
+        Ok(self.policy()?.inbound_mode())
+    }
+
+    /// Sign an outbound-mode decision. Root-wide: every identity on this root
+    /// shares the gate mode.
+    pub fn set_outbound_mode(&self, mode: OutboundMode) -> Result<()> {
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::OutboundMode,
+            crate::authority::subject::OUTBOUND_MODE,
+            &serde_json::json!({ "mode": mode }),
+        )?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::ModeSet, "human")
+                .counterpart("outbound")
+                .outcome(match mode {
+                    OutboundMode::Open => "open",
+                    OutboundMode::Gated => "gated",
+                }),
+        )?;
+        Ok(())
+    }
+
+    /// Sign an inbound-mode decision. Root-wide: every identity on this root
+    /// shares the gate mode.
+    pub fn set_inbound_mode(&self, mode: InboundMode) -> Result<()> {
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::InboundMode,
+            crate::authority::subject::INBOUND_MODE,
+            &serde_json::json!({ "mode": mode }),
+        )?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::ModeSet, "human")
+                .counterpart("inbound")
+                .outcome(match mode {
+                    InboundMode::Permissive => "permissive",
+                    InboundMode::KnownOnly => "known-only",
+                }),
+        )?;
         Ok(())
     }
 
@@ -1227,7 +1509,7 @@ fn fs_ensure_root(root: &Path) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::OutboundMode;
+    use crate::config::{InboundMode, OutboundMode};
     use crate::envelope::{build_and_sign, NewEnvelope};
     use crate::error::CoreError;
     use tempfile::TempDir;
@@ -1237,10 +1519,39 @@ mod tests {
     /// `resolve_identity(None)` race (review hardening).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Service tests run against the in-memory authority: no presence prompt,
+    /// but the same persisted record log and fold as a platform backend.
+    fn open(root: &std::path::Path) -> Result<Cmail> {
+        open_with(root, test_authority())
+    }
+
+    fn open_with(
+        root: &std::path::Path,
+        authority: std::sync::Arc<dyn Authority>,
+    ) -> Result<Cmail> {
+        Cmail::open_with_authority(root, authority)
+    }
+
+    type TestAuthority = std::sync::Arc<crate::authority::InMemoryAuthority>;
+
+    fn test_authority() -> TestAuthority {
+        let authority = std::sync::Arc::new(crate::authority::InMemoryAuthority::new());
+        crate::authority::Authority::init(&*authority).unwrap();
+        authority
+    }
+
+    /// A new "process": same signing key, no in-memory pinned head or cache,
+    /// so only the persisted record log carries the decision.
+    fn restarted_authority(authority: &TestAuthority) -> std::sync::Arc<dyn Authority> {
+        std::sync::Arc::new(crate::authority::InMemoryAuthority::with_signing_key(
+            authority.signing_key().unwrap(),
+        ))
+    }
+
     #[test]
     fn init_refuses_silent_collision_and_reuse_is_explicit() {
         let root = TempDir::new().unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         assert_eq!(c.init("dup", false).unwrap(), InitOutcome::Created);
         let key_path = root.path().join("identities/dup/key.ed25519");
         let key_before = std::fs::read(&key_path).unwrap();
@@ -1287,7 +1598,7 @@ mod tests {
                     let path = path.clone();
                     let barrier = barrier.clone();
                     std::thread::spawn(move || {
-                        let c = Cmail::open(&path).unwrap();
+                        let c = open(&path).unwrap();
                         barrier.wait();
                         c.init(name, reuse)
                     })
@@ -1345,7 +1656,7 @@ mod tests {
 
     fn svc() -> (TempDir, Cmail) {
         let root = TempDir::new().unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         c.init("alice", false).unwrap();
         c.init("zoe", false).unwrap();
         (root, c)
@@ -1384,8 +1695,10 @@ mod tests {
         c.approve(&id, true).unwrap();
         assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
         assert!(c.approvals(None).unwrap().is_empty());
+        // --remember signs an allow record; the legacy config is untouched
+        assert_eq!(c.allow_list().unwrap(), vec!["zoe".to_string()]);
         let cfg = Config::load_or_init(&c.root).unwrap();
-        assert!(cfg.is_send_allowed("zoe"));
+        assert!(cfg.allow.send.is_empty());
         assert_eq!(to, "zoe");
         // now a second send goes straight through
         let out = c
@@ -1408,6 +1721,224 @@ mod tests {
         assert!(c.store.find_pending(&id).is_err());
     }
 
+    /// One held message from alice. The gate defaults to gated, so a send to a
+    /// local recipient that is not allowlisted lands in alice's pending dir.
+    fn held(c: &Cmail) -> String {
+        match c
+            .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+            .unwrap()
+        {
+            SendOutcome::Held { id, .. } => id,
+            other => panic!("expected Held, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn signed_approve_releases_and_audits_the_authorizing_record() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        c.approve(&id, false).unwrap();
+        assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.store.find_pending(&id).is_err());
+        assert!(c.approvals(None).unwrap().is_empty());
+        let rec = c
+            .audit_tail(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event == AuditEvent::Approve && r.msg_id.as_deref() == Some(&id))
+            .expect("approve audit");
+        assert!(
+            rec.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("authority sequence ")),
+            "{rec:?}"
+        );
+    }
+
+    #[test]
+    fn approval_record_releases_only_its_own_message() {
+        let (_root, c) = svc();
+        let approved = held(&c);
+        let other = held(&c);
+        c.authority
+            .sign_action(
+                &c.root,
+                AuthorityAction::Approve,
+                &subject::approval(&approved),
+                &serde_json::json!({ "id": approved }),
+            )
+            .unwrap();
+        c.release_approved(&approved, false).unwrap();
+        assert!(c
+            .store
+            .inbox_dir("zoe")
+            .join(format!("{approved}.mail"))
+            .exists());
+
+        let err = c.release_approved(&other, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&other).is_ok());
+
+        // A later signed reject supersedes the approval and still releases nothing.
+        c.authority
+            .sign_action(
+                &c.root,
+                AuthorityAction::Reject,
+                &subject::approval(&approved),
+                &serde_json::json!({ "id": approved }),
+            )
+            .unwrap();
+        let err = c.release_approved(&approved, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+    }
+
+    #[test]
+    fn later_reject_revokes_prior_approval_for_same_id() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        let key = subject::approval(&id);
+        for action in [AuthorityAction::Approve, AuthorityAction::Reject] {
+            c.authority
+                .sign_action(&c.root, action, &key, &serde_json::json!({ "id": id }))
+                .unwrap();
+        }
+        assert!(!key.contains("approve:") && !key.contains("reject:"));
+        let policy = c.policy().unwrap();
+        assert_eq!(
+            policy
+                .effective()
+                .unwrap()
+                .decisions
+                .get(&key)
+                .unwrap()
+                .action,
+            AuthorityAction::Reject
+        );
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+    }
+
+    #[test]
+    fn later_approve_supersedes_prior_reject_for_same_id() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        for action in [AuthorityAction::Reject, AuthorityAction::Approve] {
+            c.authority
+                .sign_action(
+                    &c.root,
+                    action,
+                    &subject::approval(&id),
+                    &serde_json::json!({ "id": id }),
+                )
+                .unwrap();
+        }
+        c.release_approved(&id, false).unwrap();
+        assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.store.find_pending(&id).is_err());
+    }
+
+    #[test]
+    fn unsigned_permission_does_not_release() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        // Hand-editing the unsigned allowlist is permission for future sends,
+        // never for an already-held message.
+        let mut cfg = Config::load_or_init(&c.root).unwrap();
+        cfg.allow.send.push("zoe".into());
+        cfg.save(&c.root).unwrap();
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+
+        // A hand-written approval record has no valid signature: the log fails
+        // closed and the message stays held.
+        let record = crate::authority::AuthorityRecord::unsigned(
+            1,
+            "0".repeat(64),
+            now_rfc3339(),
+            AuthorityAction::Approve,
+            subject::approval(&id),
+            &serde_json::json!({ "id": id }),
+            "deadbeef".into(),
+        );
+        std::fs::write(
+            c.root.join("authority.log"),
+            format!("{}\n", serde_json::to_string(&record).unwrap()),
+        )
+        .unwrap();
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+    }
+
+    #[test]
+    fn reject_does_not_release() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        c.reject(&id).unwrap();
+        assert!(c.store.find_pending(&id).is_err());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.approvals(None).unwrap().is_empty());
+        let rec = c
+            .audit_tail(10)
+            .unwrap()
+            .into_iter()
+            .find(|r| r.event == AuditEvent::Reject)
+            .expect("reject audit");
+        assert!(
+            rec.detail
+                .as_deref()
+                .is_some_and(|d| d.starts_with("authority sequence ")),
+            "{rec:?}"
+        );
+    }
+
+    #[test]
+    fn unavailable_authority_fails_closed_for_approve_and_reject() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+        let approved = held(&c);
+        let rejected = held(&c);
+        drop(c);
+
+        let c = open_with(
+            root.path(),
+            std::sync::Arc::new(crate::authority::UnavailableAuthority),
+        )
+        .unwrap();
+        // Listing stays read-only and does not need authority material.
+        assert_eq!(c.approvals(None).unwrap().len(), 2);
+        let err = c.approve(&approved, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        let err = c.reject(&rejected).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        assert!(c.store.find_pending(&approved).is_ok());
+        assert!(c.store.find_pending(&rejected).is_ok());
+        assert!(!c
+            .store
+            .inbox_dir("zoe")
+            .join(format!("{approved}.mail"))
+            .exists());
+    }
+
+    #[test]
+    fn second_approve_of_released_mail_is_idempotent() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        c.approve(&id, false).unwrap();
+        let err = c.approve(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::MessageNotFound(_)), "{err}");
+        let delivered = std::fs::read_dir(c.store.inbox_dir("zoe")).unwrap().count();
+        assert_eq!(delivered, 1);
+        assert!(c.approvals(None).unwrap().is_empty());
+    }
+
     #[test]
     fn allowlisted_and_open_modes_send_directly() {
         let (_root, c) = svc();
@@ -1418,13 +1949,11 @@ mod tests {
             SendOutcome::Sent { .. }
         ));
         let root2 = TempDir::new().unwrap();
-        let c2 = Cmail::open(root2.path()).unwrap();
+        let authority = test_authority();
+        let c2 = open_with(root2.path(), authority.clone()).unwrap();
         c2.init("a", false).unwrap();
         c2.init("b", false).unwrap();
-        let mut cfg = c2.config.clone();
-        cfg.outbound = OutboundMode::Open;
-        cfg.save(&c2.root).unwrap();
-        let c2 = Cmail::open(root2.path()).unwrap();
+        c2.set_outbound_mode(OutboundMode::Open).unwrap();
         assert!(matches!(
             c2.send(Some("a"), "b", "note", "s", "b", &[], None)
                 .unwrap(),
@@ -1452,7 +1981,7 @@ mod tests {
         let mut cfg = c.config.clone();
         cfg.default_identity = Some("zoe".into());
         cfg.save(root.path()).unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         assert_eq!(c.resolve_identity(None).unwrap(), "zoe");
         assert_eq!(c.resolve_identity(Some("alice")).unwrap(), "alice");
         std::env::set_var("CMAIL_IDENTITY", "alice");
@@ -1565,8 +2094,8 @@ mod tests {
     }
 
     #[test]
-    fn archived_mail_stays_locked_when_audit_log_missing() {
-        let (root, c) = svc();
+    fn unsigned_audit_release_does_not_unlock_archived_mail() {
+        let (_root, c) = svc();
         let SendOutcome::Held { id, .. } = c
             .send(Some("alice"), "zoe", "note", "s", "b", &[], None)
             .unwrap()
@@ -1580,9 +2109,14 @@ mod tests {
             .archive_dir("zoe")
             .join(format!("{id}.mail"))
             .exists());
-        // Audit-log loss must fail closed: an archived copy with no
-        // quarantine-release on record stays locked ("already read").
-        std::fs::remove_file(root.path().join("audit.log")).unwrap();
+        // The audit log is unsigned observability: writing a release event
+        // must not admit the archived copy. Only a signed decision does.
+        append(
+            &c.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(&id),
+        )
+        .unwrap();
+        assert!(!c.released_by_policy(&id).unwrap());
         let err = c.read_message(Some("zoe"), &id).unwrap_err().to_string();
         assert!(err.contains("already read") || err.contains("not found"));
     }
@@ -1598,6 +2132,157 @@ mod tests {
         std::fs::write(p, "not json at all").unwrap();
         assert!(c.inbox(Some("zoe")).unwrap().is_empty());
         assert_eq!(c.store.list_ids(&c.store.quarantine_dir("zoe")).len(), 1);
+    }
+
+    // --- Ticket #16: quarantine release is a signed human decision ---
+
+    const QID: &str = "deadbeefdeadbeefdeadbeefdeadbeef";
+
+    /// Put an unparseable message directly in zoe's quarantine.
+    fn quarantined(c: &Cmail, id: &str) -> std::path::PathBuf {
+        c.store.ensure_mailbox("zoe").unwrap();
+        let path = c.store.quarantine_dir("zoe").join(format!("{id}.mail"));
+        std::fs::write(&path, "not json at all").unwrap();
+        path
+    }
+
+    fn signed_record_count(root: &std::path::Path) -> usize {
+        std::fs::read_to_string(root.join("authority.log"))
+            .map(|log| log.lines().count())
+            .unwrap_or(0)
+    }
+
+    fn released_by_decision(c: &Cmail, id: &str) -> bool {
+        matches!(
+            c.policy()
+                .unwrap()
+                .effective()
+                .unwrap()
+                .decisions
+                .get(&crate::authority::subject::quarantine(id)),
+            Some(decision) if decision.action == AuthorityAction::QuarantineRelease
+        )
+    }
+
+    #[test]
+    fn signed_quarantine_release_records_decision_and_is_idempotent() {
+        let authority = test_authority();
+        let root = TempDir::new().unwrap();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("zoe", false).unwrap();
+        let path = quarantined(&c, QID);
+
+        c.quarantine_release(QID).unwrap();
+        assert!(!path.exists());
+        assert!(c
+            .store
+            .archive_dir("zoe")
+            .join(format!("{QID}.mail"))
+            .exists());
+        assert!(released_by_decision(&c, QID));
+        // the record is signed by the authority key, so a fresh process with
+        // the same key derives the same release decision from disk alone
+        let restarted = open_with(root.path(), restarted_authority(&authority)).unwrap();
+        assert!(released_by_decision(&restarted, QID));
+
+        // repeating the release is a no-op: no second record, still Ok
+        let records = signed_record_count(root.path());
+        c.quarantine_release(QID).unwrap();
+        assert_eq!(signed_record_count(root.path()), records);
+
+        // an id with no quarantined copy is never released by name alone
+        let err = c.quarantine_release("feedfeedfeedfeedfeedfeedfeedfeed");
+        assert!(matches!(err, Err(CoreError::MessageNotFound(_))));
+    }
+
+    #[test]
+    fn quarantine_release_fails_closed_without_authority() {
+        let root = TempDir::new().unwrap();
+        let c = open_with(
+            root.path(),
+            std::sync::Arc::new(crate::authority::InMemoryAuthority::new()),
+        )
+        .unwrap();
+        c.init("zoe", false).unwrap();
+        let path = quarantined(&c, QID);
+        // An unsigned audit event is observability, never a decision.
+        append(
+            &c.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(QID),
+        )
+        .unwrap();
+
+        let err = c.quarantine_release(QID).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err:?}");
+        assert!(path.exists());
+        assert!(!c
+            .store
+            .archive_dir("zoe")
+            .join(format!("{QID}.mail"))
+            .exists());
+        assert_eq!(signed_record_count(root.path()), 0);
+    }
+
+    #[test]
+    fn hand_edited_authority_log_cannot_release() {
+        use crate::authority::{subject, AuthorityRecord};
+        use ed25519_dalek::SigningKey;
+        use rand::rngs::OsRng;
+
+        let root = TempDir::new().unwrap();
+        let c = open_with(root.path(), test_authority()).unwrap();
+        c.init("zoe", false).unwrap();
+        let path = quarantined(&c, QID);
+
+        // Shape-valid release record signed by a key that is not the
+        // authority's: the fold refuses it, so release must fail closed.
+        let attacker = SigningKey::generate(&mut OsRng);
+        let forged = AuthorityRecord::sign(
+            1,
+            "0".repeat(64),
+            now_rfc3339(),
+            AuthorityAction::QuarantineRelease,
+            subject::quarantine(QID),
+            &serde_json::json!({ "message_id": QID }),
+            &attacker,
+        );
+        let line = crate::canonical::canonical_json(&serde_json::to_value(&forged).unwrap());
+        std::fs::write(root.path().join("authority.log"), format!("{line}\n")).unwrap();
+
+        let err = c.quarantine_release(QID).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityInvalid(_)), "{err:?}");
+        assert!(path.exists());
+    }
+
+    #[test]
+    fn adoption_makes_legacy_audit_release_readable() {
+        let authority = test_authority();
+        let root = TempDir::new().unwrap();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+        let id = deliver_direct(&c, "alice", "zoe", "legacy");
+        c.read_message(Some("zoe"), &id).unwrap(); // inbox -> archive
+                                                   // A 0.2 build recorded the release only as an unsigned audit event.
+        append(
+            &c.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(&id),
+        )
+        .unwrap();
+        assert!(c.read_message(Some("zoe"), &id).is_err());
+
+        // Adoption signs the legacy event; the archived copy unlocks.
+        let adopted = c.adopt_legacy(authority.as_ref(), true).unwrap();
+        assert!(adopted
+            .signed
+            .iter()
+            .any(|record| record.subject == crate::authority::subject::quarantine(&id)));
+        let msg = c.read_message(Some("zoe"), &id).unwrap();
+        assert!(msg.body.contains("legacy"));
+
+        // Re-adoption adds no further records.
+        let again = c.adopt_legacy(authority.as_ref(), true).unwrap();
+        assert!(again.signed.is_empty());
     }
 
     #[test]
@@ -1669,6 +2354,147 @@ mod tests {
         );
     }
 
+    // --- Signed keyring enforcement tests ---
+
+    fn envelope_from(name: &str, key: &ed25519_dalek::SigningKey) -> Envelope {
+        build_and_sign(
+            &"ab".repeat(16),
+            &NewEnvelope {
+                from: name.into(),
+                from_key: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    key.verifying_key().as_bytes(),
+                ),
+                to: "zoe".into(),
+                kind: "note".into(),
+                subject: "s".into(),
+                body: "b".into(),
+                attachments: vec![],
+                in_reply_to: None,
+                created: "2026-11-01T12:00:00Z".into(),
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    fn level(c: &Cmail, env: &Envelope) -> TrustLevel {
+        Policy::load(&c.root, c.authority.clone())
+            .unwrap()
+            .trust(env)
+            .unwrap()
+            .level
+    }
+
+    #[test]
+    fn signed_remove_by_name_revokes_trust_and_survives_restart() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        let alice = load_identity(&c.root, "alice").unwrap().signing.clone();
+        let env = envelope_from("alice", &alice);
+        assert_eq!(level(&c, &env), TrustLevel::Verified);
+
+        c.keyring_remove("alice").unwrap();
+        assert_eq!(level(&c, &env), TrustLevel::Untrusted);
+        assert!(c.keyring_list().unwrap().is_empty());
+
+        // A new process with the same key sees the persisted revocation.
+        let restarted = open_with(root.path(), restarted_authority(&authority)).unwrap();
+        assert_eq!(level(&restarted, &env), TrustLevel::Untrusted);
+        assert!(restarted.keyring_remove("alice").is_err());
+    }
+
+    #[test]
+    fn rotation_revokes_the_old_key_and_trusts_the_new_one() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        let old = load_identity(&c.root, "alice").unwrap().signing.clone();
+        let fresh = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        let key_file = root.path().join("fresh-alice.b64");
+        std::fs::write(
+            &key_file,
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                fresh.verifying_key().as_bytes(),
+            ),
+        )
+        .unwrap();
+        c.keyring_add("alice", KeySource::KeyFile(key_file))
+            .unwrap();
+
+        // The name is still known, so the old key is a spoof, never verified.
+        assert_eq!(
+            level(&c, &envelope_from("alice", &old)),
+            TrustLevel::SpoofSuspect
+        );
+        assert_eq!(
+            level(&c, &envelope_from("alice", &fresh)),
+            TrustLevel::Verified
+        );
+
+        let restarted = open_with(root.path(), restarted_authority(&authority)).unwrap();
+        assert_eq!(
+            level(&restarted, &envelope_from("alice", &old)),
+            TrustLevel::SpoofSuspect
+        );
+        assert_eq!(
+            level(&restarted, &envelope_from("alice", &fresh)),
+            TrustLevel::Verified
+        );
+    }
+
+    #[test]
+    fn hand_edited_keyring_cache_never_grants_trust() {
+        let (root, c) = svc();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        let alice = load_identity(&c.root, "alice").unwrap().signing.clone();
+        let mallory = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut cache = KeyRing::load(root.path()).unwrap();
+        cache.remove("alice");
+        cache
+            .add(
+                "alice",
+                &base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    mallory.verifying_key().as_bytes(),
+                ),
+            )
+            .unwrap();
+        cache.save(root.path()).unwrap();
+
+        assert_eq!(
+            level(&c, &envelope_from("alice", &alice)),
+            TrustLevel::Verified
+        );
+        assert_eq!(
+            level(&c, &envelope_from("alice", &mallory)),
+            TrustLevel::SpoofSuspect
+        );
+    }
+
+    #[test]
+    fn denied_presence_writes_no_record() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        authority.deny_presence();
+
+        let err = c
+            .keyring_add("alice", KeySource::LocalIdentity)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(!root.path().join("authority.log").exists());
+        assert!(c.keyring_list().unwrap().is_empty());
+    }
+
     // --- Task 12 test: admin passthroughs ---
 
     #[test]
@@ -1681,6 +2507,95 @@ mod tests {
         assert_eq!(c.allow_list().unwrap(), vec!["zoe"]);
         let recs = c.audit_tail(5).unwrap();
         assert!(recs.iter().any(|r| r.event == AuditEvent::AllowRemove));
+    }
+
+    #[test]
+    fn signed_allow_add_permits_and_remove_revokes() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        // a signed add is what permits the send; the record is namespaced
+        c.allow_add("zoe").unwrap();
+        let log = std::fs::read_to_string(root.path().join("authority.log")).unwrap();
+        assert!(log.contains("allow:zoe"), "{log}");
+        let effective = authority.load_effective_policy(root.path()).unwrap();
+        assert_eq!(
+            effective.decisions[&crate::authority::subject::allow("zoe")].action,
+            AuthorityAction::AllowAdd
+        );
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Sent { .. }
+        ));
+
+        // a signed remove revokes it again
+        c.allow_remove("zoe").unwrap();
+        assert!(c.allow_list().unwrap().is_empty());
+        let effective = authority.load_effective_policy(root.path()).unwrap();
+        assert_eq!(
+            effective.decisions[&crate::authority::subject::allow("zoe")].action,
+            AuthorityAction::AllowRemove
+        );
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+    }
+
+    #[test]
+    fn hand_edited_config_allowlist_does_not_permit() {
+        let (root, c) = svc();
+        let mut cfg = Config::load_or_init(root.path()).unwrap();
+        cfg.allow.send = vec!["zoe".into()];
+        cfg.outbound = OutboundMode::Open;
+        cfg.save(root.path()).unwrap();
+
+        // neither the legacy allow entry nor the config mode reaches the gate
+        assert!(c.allow_list().unwrap().is_empty());
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+        assert!(!root.path().join("authority.log").exists());
+    }
+
+    #[test]
+    fn unavailable_authority_gates_sends_and_allow_edits() {
+        let root = TempDir::new().unwrap();
+        let authority: std::sync::Arc<dyn Authority> =
+            std::sync::Arc::new(crate::authority::UnavailableAuthority);
+        let c = open_with(root.path(), authority).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+
+        // gated send holds rather than erroring; the allowlist reads empty
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+        assert!(c.allow_list().unwrap().is_empty());
+
+        // allow edits need the authority and fail with typed guidance
+        for err in [
+            c.allow_add("zoe").unwrap_err(),
+            c.allow_remove("zoe").unwrap_err(),
+        ] {
+            assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        }
+        assert!(!root.path().join("authority.log").exists());
     }
 
     // --- Task H5 tests: service consistency and failure cleanup ---
@@ -1761,7 +2676,11 @@ mod tests {
 
     #[test]
     fn strict_mode_quarantines_unknown_senders() {
-        let (root, c) = svc();
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
         // deliver one untrusted message (alice -> zoe, allowlisted for the test)
         c.allow_add("zoe").unwrap();
         let id = match c
@@ -1771,20 +2690,18 @@ mod tests {
             SendOutcome::Sent { id } => id,
             _ => panic!(),
         };
-        // flip to strict mode on disk; inbox() must quarantine the untrusted mail
-        let mut cfg = c.config.clone();
-        cfg.inbound = crate::config::InboundMode::KnownOnly;
-        cfg.save(root.path()).unwrap();
+        // sign strict mode; inbox() must quarantine the untrusted mail
+        c.set_inbound_mode(crate::config::InboundMode::KnownOnly)
+            .unwrap();
         assert!(c.inbox(Some("zoe")).unwrap().is_empty());
         assert_eq!(
             c.store.list_ids(&c.store.quarantine_dir("zoe")),
             vec![id.clone()]
         );
-        // back to permissive on a fresh handle: released-by-config, but still untrusted
-        let mut cfg = c.config.clone();
-        cfg.inbound = crate::config::InboundMode::Permissive;
-        cfg.save(root.path()).unwrap();
-        let c2 = Cmail::open(root.path()).unwrap();
+        // signed permissive on a fresh process: still untrusted, still quarantined
+        c.set_inbound_mode(crate::config::InboundMode::Permissive)
+            .unwrap();
+        let c2 = open_with(root.path(), authority.clone()).unwrap();
         assert_eq!(c2.inbox(Some("zoe")).unwrap().len(), 0); // still in quarantine, not re-listed
         c2.quarantine_release(&id).unwrap();
         let msg = c2.read_message(Some("zoe"), &id).unwrap();
@@ -1874,10 +2791,9 @@ mod tests {
         assert_eq!(msg.body, "the state");
         assert_eq!(msg.kind, "handoff");
         assert_eq!(msg.attachments, Vec::<String>::new());
-        // second send arrives AFTER removing alice's trust -> untrusted, fenced post-decrypt
-        let mut kr = crate::keyring::KeyRing::load(_root.path()).unwrap();
-        kr.remove("alice");
-        kr.save(_root.path()).unwrap();
+        // second send arrives AFTER signed revocation of alice -> untrusted,
+        // fenced post-decrypt
+        c.keyring_remove("alice").unwrap();
         let SendOutcome::Sent { id: id2 } = c
             .send(Some("alice"), "zoe", "note", "s2", "secret2", &[], None)
             .unwrap()
@@ -2113,17 +3029,18 @@ mod tests {
     #[test]
     fn relay_set_persists_and_audits() {
         let (_root, c) = svc();
-        assert_eq!(Config::load_or_init(&c.root).unwrap().relay_url(), None);
+        assert_eq!(c.relay_url().unwrap(), None);
         c.relay_set(Some("https://pickup.example.com")).unwrap();
         assert_eq!(
-            Config::load_or_init(&c.root)
-                .unwrap()
-                .relay_url()
-                .as_deref(),
+            c.relay_url().unwrap().as_deref(),
             Some("https://pickup.example.com")
         );
+        assert!(
+            Config::load_or_init(&c.root).unwrap().relay_url().is_none(),
+            "signed relay must not leak into config"
+        );
         c.relay_set(None).unwrap();
-        assert_eq!(Config::load_or_init(&c.root).unwrap().relay_url(), None);
+        assert_eq!(c.relay_url().unwrap(), None);
         let recs = c.audit_tail(10).unwrap();
         assert!(recs
             .iter()
@@ -2147,7 +3064,7 @@ mod tests {
         let server =
             cmail_relayd::RelayServer::start("127.0.0.1:0", rroot.path().to_path_buf(), 7).unwrap();
         let base = server.base_url();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         c.init("alice", false).unwrap();
         (root, c, server, base)
     }
@@ -2346,10 +3263,10 @@ mod tests {
             cmail_relayd::RelayServer::start("127.0.0.1:0", relay_root.path().to_path_buf(), 7)
                 .unwrap();
         let base = server.base_url();
-        let sender = Cmail::open(sender_root.path()).unwrap();
+        let sender = open(sender_root.path()).unwrap();
         sender.init("alice", false).unwrap();
         let zoe = crate::identity::create_identity(recv_root.path(), "zoe").unwrap();
-        let recipient = Cmail::open(recv_root.path()).unwrap();
+        let recipient = open(recv_root.path()).unwrap();
         // out-of-band key exchange + route on the sender's side (through the
         // gate); the pickup relay configured on zoe's side
         sender
@@ -2584,5 +3501,155 @@ mod tests {
         let inbox = fix.recipient.inbox(Some("zoe")).unwrap();
         assert_eq!(inbox.len(), 1);
         assert_eq!(inbox[0].trust, "untrusted");
+    }
+
+    #[test]
+    fn signed_relay_latest_wins_and_clear_disables() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        assert_eq!(c.relay_url().unwrap(), None);
+
+        c.relay_set(Some("https://one.example.com")).unwrap();
+        assert_eq!(
+            c.relay_url().unwrap().as_deref(),
+            Some("https://one.example.com")
+        );
+        // A fresh "process" observes only the persisted signed record.
+        let c2 = open_with(root.path(), restarted_authority(&authority)).unwrap();
+        assert_eq!(
+            c2.relay_url().unwrap().as_deref(),
+            Some("https://one.example.com")
+        );
+
+        c2.relay_set(Some("https://two.example.com")).unwrap();
+        assert_eq!(
+            open_with(root.path(), restarted_authority(&authority))
+                .unwrap()
+                .relay_url()
+                .unwrap()
+                .as_deref(),
+            Some("https://two.example.com")
+        );
+
+        c2.relay_set(None).unwrap();
+        assert_eq!(
+            open_with(root.path(), restarted_authority(&authority))
+                .unwrap()
+                .relay_url()
+                .unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn hand_edited_config_relay_is_ignored() {
+        let root = TempDir::new().unwrap();
+        let c = open(root.path()).unwrap();
+        c.relay_set(Some("https://signed.example.com")).unwrap();
+
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.relay.url = Some("https://evil.example.com".into());
+        cfg.save(root.path()).unwrap();
+        assert_eq!(
+            c.relay_url().unwrap().as_deref(),
+            Some("https://signed.example.com")
+        );
+
+        c.relay_set(None).unwrap();
+        cfg.save(root.path()).unwrap();
+        // A hand-edited URL after clear never becomes the pickup target.
+        assert_eq!(c.relay_url().unwrap(), None);
+    }
+
+    #[test]
+    fn signed_modes_latest_wins_and_gate_and_inbox_follow() {
+        let (_root, c) = svc();
+        c.init("mallory", false).unwrap();
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+        assert!(matches!(
+            c.send(Some("alice"), "mallory", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        c.set_outbound_mode(OutboundMode::Open).unwrap();
+        assert!(matches!(
+            c.send(Some("alice"), "mallory", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Sent { .. }
+        ));
+        c.set_outbound_mode(OutboundMode::Gated).unwrap();
+        assert!(matches!(
+            c.send(Some("alice"), "mallory", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        c.set_inbound_mode(InboundMode::KnownOnly).unwrap();
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+        c.set_inbound_mode(InboundMode::Permissive).unwrap();
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::Permissive);
+    }
+
+    #[test]
+    fn hand_edited_config_modes_only_tighten_inbound() {
+        let root = TempDir::new().unwrap();
+        let c = open(root.path()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("bob", false).unwrap();
+
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.outbound = OutboundMode::Open;
+        cfg.inbound = InboundMode::KnownOnly;
+        cfg.save(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
+        // Config can never open the outbound gate, but an available authority
+        // honors a tighter legacy inbound mode.
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+        assert!(matches!(
+            c.send(Some("alice"), "bob", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        // A signed record is the only thing that moves either mode.
+        c.set_outbound_mode(OutboundMode::Open).unwrap();
+        c.set_inbound_mode(InboundMode::KnownOnly).unwrap();
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Open);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+
+        // Signed knows-only wins: a hand-edited permissive never loosens it.
+        let mut cfg = crate::config::Config::load_or_init(root.path()).unwrap();
+        cfg.inbound = InboundMode::Permissive;
+        cfg.save(root.path()).unwrap();
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
+    }
+
+    #[test]
+    fn unavailable_authority_fails_closed_for_relay_and_modes() {
+        let root = TempDir::new().unwrap();
+        let c = open_with(
+            root.path(),
+            std::sync::Arc::new(crate::authority::UnavailableAuthority),
+        )
+        .unwrap();
+
+        let err = c.relay_set(Some("https://evil.example.com")).unwrap_err();
+        assert!(
+            matches!(err, CoreError::AuthorityUnavailable(_)),
+            "relay set must fail closed, got {err:?}"
+        );
+        assert!(c.set_outbound_mode(OutboundMode::Open).is_err());
+        assert!(c.set_inbound_mode(InboundMode::Permissive).is_err());
+        assert!(!root.path().join("authority.log").exists());
+
+        // Gated reads default closed: no signed open mode, no signed allowlist,
+        // and unavailable authority cannot honor even a tighter config mode.
+        assert_eq!(c.relay_url().unwrap(), None);
+        assert_eq!(c.outbound_mode().unwrap(), OutboundMode::Gated);
+        assert_eq!(c.inbound_mode().unwrap(), InboundMode::KnownOnly);
     }
 }

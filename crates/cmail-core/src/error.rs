@@ -28,6 +28,15 @@ pub enum CoreError {
     /// Displays exactly like the old stringly `Relay` status errors.
     #[error("relay: HTTP {0}: {1}")]
     RelayStatus(u16, String),
+    /// A human-only action could not obtain a presence-gated signature.
+    #[error("authority required: {0}")]
+    AuthorityRequired(String),
+    /// No usable authority material or backend exists; fail closed.
+    #[error("authority unavailable: {0}")]
+    AuthorityUnavailable(String),
+    /// Authority material or a requested decision is malformed.
+    #[error("authority invalid: {0}")]
+    AuthorityInvalid(String),
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
     #[error("json: {0}")]

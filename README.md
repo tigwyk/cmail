@@ -145,12 +145,33 @@ commands are reserved for the human owner:
 - `cmail quarantine list|show|release` — quarantine review (`release` moves to
   archive: reviewed, retained, never re-shown to the agent)
 - `cmail audit [--tail N]` — append-only log of every security-relevant event
-- `config.toml` — `outbound = "gated"|"open"`, `inbound = "permissive"|"known-only"`
+- `cmail mode outbound|inbound` — signed policy modes (`gated|open`,
+  `permissive|known-only`). Signed records are authoritative; the legacy
+  `config.toml` keys never open the outbound gate, never select a relay, and
+  only affect inbound when no signed mode exists and the key is reachable
 
-**This boundary is advisory in 0.3.x, not enforced.** Any process that can read
-the mailbox root can run these commands, edit `keyring.json` / `config.toml`, or
-move pending mail directly. Treat it as an interface convention; enforcement is
-tracked in issue #2.
+**These decisions are signed authority records, not file permissions.** A
+hand-edited `keyring.json`, `config.toml`, pending-mail file, or forged
+`authority.log` line grants nothing: policy is folded only from records that
+verify against an Ed25519 authority key kept in the OS credential store behind
+a presence check. Hand-edited state is ignored, and every protected action
+fails closed.
+
+The **strength of the boundary is the platform's presence check**, not a claim
+this project can make for it: macOS and Linux report `advisory` (a speed bump
+against a same-user process), and the Windows backend is unverified at runtime
+and claims no enforcement. No platform claims `strong`, so no platform gets an
+"enforced OS boundary" claim. Run `cmail authority status` on the host that
+matters.
+
+Backup, upgrade, rollback, lost-key recovery, mixed-version rules, the platform
+assurance matrix, and the exact limitations are in
+**[docs/authority-operations.md](docs/authority-operations.md)**. The design
+rationale is in
+**[docs/adr/0001-human-authority.md](docs/adr/0001-human-authority.md)**.
+Upgrading a root takes one human-confirmed batch: stop processes, snapshot the
+root, `cmail authority init`, `cmail authority adopt`, verify with
+`cmail authority status`, then enforce.
 
 Most of this state is **root-wide**, shared by every identity under the same
 root: keyring/trust, the outbound allowlist, the relay URL, `default_identity`,

@@ -4,6 +4,10 @@ version.workspace = true
 edition.workspace = true
 license.workspace = true
 
+[features]
+# Test-only in-memory signer; never enabled by release builds or the CLI.
+test-authority = []
+
 [dependencies]
 serde.workspace = true
 serde_json.workspace = true
@@ -20,6 +24,28 @@ toml.workspace = true
 time.workspace = true
 ureq.workspace = true
 url.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3"
+objc2 = "0.6"
+objc2-foundation = { version = "0.3", default-features = false, features = ["std", "NSString", "NSError"] }
+objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "block2"] }
+block2 = "0.6"
+
+# Linux presence-gated authority backend. Pure Rust: no system library is
+# required to build or cross-check it.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "4", default-features = false, features = [
+    "rt-async-io-crypto-rust",
+] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+pollster = "0.4"
+windows = { version = "0.62", features = [
+    "Security_Credentials_UI",
+    "Win32_Security_Credentials",
+    "Win32_System_WinRT",
+] }
 
 [dev-dependencies]
 tempfile.workspace = true

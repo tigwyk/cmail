@@ -4,22 +4,31 @@ use anyhow::Result;
 use cmail_core::service::KeySource;
 
 pub fn allow(cli: &Cli, cmd: AllowCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    // Signing commands share the authority seam so the debug/unavailable
+    // backend applies here exactly as it does to keyring edits.
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         AllowCmd::Add { name } => {
             c.allow_add(&name)?;
             if cli.json {
-                output::print_json(&serde_json::json!({"status": "allowed", "name": name}));
+                output::print_json(
+                    &serde_json::json!({"status": "allowed", "name": name, "scope": "root-wide"}),
+                );
             } else {
-                println!("allowed {name}");
+                println!("allowed {name} (root-wide: every identity on this root)");
             }
         }
         AllowCmd::Remove { name } => {
             c.allow_remove(&name)?;
             if cli.json {
-                output::print_json(&serde_json::json!({"status": "removed", "name": name}));
+                output::print_json(
+                    &serde_json::json!({"status": "removed", "name": name, "scope": "root-wide"}),
+                );
             } else {
-                println!("removed {name}");
+                println!("removed {name} (root-wide: every identity on this root)");
             }
         }
         AllowCmd::List => {
@@ -50,18 +59,34 @@ pub fn approvals(cli: &Cli) -> Result<()> {
 }
 
 pub fn approve(cli: &Cli, id: &str, remember: bool) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
-    c.approve(id, remember)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
+    let recipient = c.approve(id, remember)?;
     if cli.json {
-        output::print_json(&serde_json::json!({"status":"approved","id":id}));
+        let mut v = serde_json::json!({"status":"approved","id":id});
+        if remember {
+            v["recipient"] = serde_json::json!(recipient);
+            v["scope"] = serde_json::json!("root-wide");
+        }
+        output::print_json(&v);
     } else {
         println!("approved {id}");
+        if remember {
+            println!(
+                "remembered {recipient} on the root-wide outbound allowlist (every identity on this root)"
+            );
+        }
     }
     Ok(())
 }
 
 pub fn reject(cli: &Cli, id: &str) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     c.reject(id)?;
     if cli.json {
         output::print_json(&serde_json::json!({"status":"rejected","id":id}));
@@ -72,7 +97,10 @@ pub fn reject(cli: &Cli, id: &str) -> Result<()> {
 }
 
 pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         KeyringCmd::Add {
             name,
@@ -102,6 +130,14 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
                     Some(url) => println!("trusted {name} -> {url}"),
                     None => println!("trusted {name}"),
                 }
+            }
+        }
+        KeyringCmd::Remove { name } => {
+            c.keyring_remove(&name)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({"status":"removed","name":name}));
+            } else {
+                println!("removed {name}");
             }
         }
         KeyringCmd::Route { name, url, clear } => {
@@ -163,33 +199,100 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
 }
 
 pub fn relay(cli: &Cli, cmd: RelayCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         RelayCmd::Set { url } => {
             c.relay_set(Some(&url))?;
             if cli.json {
-                output::print_json(&serde_json::json!({"status":"set","url":url}));
+                output::print_json(
+                    &serde_json::json!({"status":"set","url":url,"scope":"root-wide"}),
+                );
             } else {
-                println!("relay set {url}");
+                println!("relay set {url} (root-wide: every identity on this root)");
             }
         }
         RelayCmd::Clear => {
             c.relay_set(None)?;
             if cli.json {
-                output::print_json(&serde_json::json!({"status":"cleared"}));
+                output::print_json(&serde_json::json!({"status":"cleared","scope":"root-wide"}));
             } else {
-                println!("relay cleared");
+                println!("relay cleared (root-wide: every identity on this root)");
             }
         }
         RelayCmd::Show => {
-            let url = cmail_core::Config::load_or_init(&c.root)?.relay_url();
+            let url = c.relay_url()?;
             if cli.json {
-                output::print_json(&serde_json::json!({"url": url}));
+                output::print_json(&serde_json::json!({"url": url, "scope":"root-wide"}));
             } else {
                 match url {
                     Some(u) => println!("{u}"),
                     None => println!("<none>"),
                 }
+                println!("scope: root-wide (every identity on this root)");
+            }
+        }
+    }
+    Ok(())
+}
+
+pub fn mode(cli: &Cli, cmd: ModeCmd) -> Result<()> {
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
+    let parse_outbound = |raw: &str| -> Result<cmail_core::config::OutboundMode> {
+        match raw {
+            "gated" => Ok(cmail_core::config::OutboundMode::Gated),
+            "open" => Ok(cmail_core::config::OutboundMode::Open),
+            other => anyhow::bail!("unknown outbound mode '{other}'; use gated or open"),
+        }
+    };
+    let parse_inbound = |raw: &str| -> Result<cmail_core::config::InboundMode> {
+        match raw {
+            "permissive" => Ok(cmail_core::config::InboundMode::Permissive),
+            "known-only" => Ok(cmail_core::config::InboundMode::KnownOnly),
+            other => anyhow::bail!("unknown inbound mode '{other}'; use permissive or known-only"),
+        }
+    };
+    match cmd {
+        ModeCmd::Show => {
+            let outbound = c.outbound_mode()?;
+            let inbound = c.inbound_mode()?;
+            if cli.json {
+                output::print_json(&serde_json::json!({
+                    "outbound": outbound,
+                    "inbound": inbound,
+                    "scope": "root-wide",
+                }));
+            } else {
+                println!("outbound: {outbound:?}");
+                println!("inbound:  {inbound:?}");
+                println!("scope: root-wide (every identity on this root)");
+            }
+        }
+        ModeCmd::Outbound { mode } => {
+            let mode = parse_outbound(&mode)?;
+            c.set_outbound_mode(mode)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({
+                    "status": "set", "mode": "outbound", "value": mode, "scope": "root-wide",
+                }));
+            } else {
+                println!("outbound mode set to {mode:?} (root-wide: every identity on this root)");
+            }
+        }
+        ModeCmd::Inbound { mode } => {
+            let mode = parse_inbound(&mode)?;
+            c.set_inbound_mode(mode)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({
+                    "status": "set", "mode": "inbound", "value": mode, "scope": "root-wide",
+                }));
+            } else {
+                println!("inbound mode set to {mode:?} (root-wide: every identity on this root)");
             }
         }
     }
@@ -197,7 +300,10 @@ pub fn relay(cli: &Cli, cmd: RelayCmd) -> Result<()> {
 }
 
 pub fn quarantine(cli: &Cli, cmd: QuarantineCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         QuarantineCmd::List => {
             let v = c.quarantine_list(cli.as_name.as_deref())?;
@@ -263,6 +369,9 @@ pub enum KeyringCmd {
         from_message: Option<String>,
         route: Option<String>,
     },
+    Remove {
+        name: String,
+    },
     Route {
         name: String,
         url: Option<String>,
@@ -275,6 +384,12 @@ pub enum RelayCmd {
     Set { url: String },
     Clear,
     Show,
+}
+
+pub enum ModeCmd {
+    Show,
+    Outbound { mode: String },
+    Inbound { mode: String },
 }
 
 pub enum QuarantineCmd {

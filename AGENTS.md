@@ -19,9 +19,11 @@ human which one, or check `cmail --as <name> whoami`).
 
 Sends to recipients who aren't allowlisted come back as `held`: a human must
 release them with `cmail approvals` / `cmail approve <id>`. Tell your human when
-this happens. Never run human-only commands: 0.3.x does not enforce the
-boundary (issue #2), but it is not yours. Trust, allowlist, relay, and held
-approvals are root-wide, shared by every identity on the root.
+this happens. Never run human-only commands: the human's presence-gated
+authority signature is the permission, and hand-edited policy files grant
+nothing. The boundary is only as strong as the OS presence check: macOS and
+Linux report advisory, and Windows is unverified at runtime. Trust, allowlist,
+relay, and held approvals are root-wide, shared by every identity on the root.
 
 ## Trust rules (important)
 

@@ -1,7 +1,8 @@
 # cmail — Agent-to-Agent Mail: Design
 
 Date: 2026-11-01
-Status: Approved by user (design review)
+Status: Approved by user (design review); modes, allowlist, and relay
+grants superseded by `docs/adr/0001-human-authority.md` (config keys never grant)
 Implementation language: Rust
 
 ## 1. Overview
@@ -147,8 +148,8 @@ When identity A sends to recipient B:
 3. A human resolves it: `cmail approvals` lists held mail (any identity, or
    `--as`), `cmail approve <id> [--remember]` delivers it (`--remember` also adds
    the recipient to the allowlist), `cmail reject <id>` deletes it. Audited.
-4. Escape hatch: `outbound = "open"` in config disables gating entirely — an
-   explicit, deliberate opt-out.
+4. Escape hatch: a human signs `cmail mode outbound open` to disable gating.
+   The `outbound = "open"` config key never opens the gate.
 
 ### 4.2 Inbound trust (computed at read)
 
@@ -186,13 +187,13 @@ never shown unfenced either.
   never re-shown to the agent as new mail." This is durable for every message
   class — release-to-inbox would be undone by the next scan for spoof/corrupt
   mail. To make quarantined mail *visible* to an agent, use the principled knobs
-  instead: `keyring add` (trust the sender) or `inbound = "permissive"` (loosen
-  strict mode). Released mail remains readable by id via `cmail read` (archive is
+  instead: `keyring add` (trust the sender) or a signed
+  `cmail mode inbound permissive` (loosen strict mode). Released mail remains readable by id via `cmail read` (archive is
   in the read path) and always wrapped unless verified.
 - **invalid** — `sig` fails against the envelope's own `from_key` (not even
   self-consistent). Quarantined at scan time, audit event `corrupt`. Never shown.
-- Strict mode: `inbound = "known-only"` routes unknown senders to quarantine too
-  (untrusted mail is not shown to the agent at all).
+- Strict mode: a signed `cmail mode inbound known-only` routes unknown senders to
+  quarantine too (untrusted mail is not shown to the agent at all).
 
 ### 4.3 Human-only powers
 
@@ -229,7 +230,11 @@ send = []                       # names pre-authorized for outbound
 max_attachment_bytes = 10485760
 ```
 
-Config is per-root. Generated on first use with defaults.
+Config is per-root. Generated on first use with defaults. Since
+`docs/adr/0001-human-authority.md`, `outbound` and `[allow]` never grant and
+`[relay]` is never read: they are adoption inputs. A signed record is
+authoritative for both modes; the legacy `inbound` key only applies when no
+signed record exists and the authority key is reachable.
 
 ## 5. CLI reference
 
