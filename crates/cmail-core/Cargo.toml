@@ -32,6 +32,13 @@ objc2-foundation = { version = "0.3", default-features = false, features = ["std
 objc2-local-authentication = { version = "0.3", default-features = false, features = ["std", "LAContext", "block2"] }
 block2 = "0.6"
 
+# Linux presence-gated authority backend. Pure Rust: no system library is
+# required to build or cross-check it.
+[target.'cfg(target_os = "linux")'.dependencies]
+secret-service = { version = "4", default-features = false, features = [
+    "rt-async-io-crypto-rust",
+] }
+
 [dev-dependencies]
 tempfile.workspace = true
 # Dev-only (legal Cargo cycle): in-process relay fixtures for the routed-send

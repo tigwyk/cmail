@@ -247,6 +247,9 @@ impl Authority for MacAuthority {
                 backend: "macos-keychain".into(),
                 assurance: Assurance::None,
                 last_grant: None,
+                explanation: Some(
+                    "no macOS authority key is initialized; run: cmail authority init".into(),
+                ),
             });
         }
         let key = self.read_public_key()?;
@@ -256,6 +259,10 @@ impl Authority for MacAuthority {
             backend: "macos-keychain".into(),
             assurance: Assurance::Moderate,
             last_grant: self.state()?.last_grant.clone(),
+            explanation: Some(
+                "LocalAuthentication checks Touch ID or passcode, but the Keychain seed is not cryptographically bound to that check; a same-user process with Keychain access can bypass cmail"
+                    .into(),
+            ),
         })
     }
 
