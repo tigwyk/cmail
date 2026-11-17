@@ -1,3 +1,4 @@
+pub mod adoption;
 pub mod audit;
 pub mod authority;
 pub mod canonical;

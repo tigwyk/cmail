@@ -158,6 +158,8 @@ pub enum AllowCommand {
 pub enum AuthorityCommand {
     /// Create the authority key (fails closed when no backend is available)
     Init,
+    /// Adopt legacy keyring, allowlist, relay, and held approvals
+    Adopt,
     /// Report authority fingerprint, backend, and assurance
     Status,
 }
@@ -292,6 +294,7 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         Commands::Config => commands::account::run(commands::account::AccountCommand::Config, cli),
         Commands::Authority { cmd } => match cmd {
             AuthorityCommand::Init => commands::authority::init(cli),
+            AuthorityCommand::Adopt => commands::authority::adopt(cli),
             AuthorityCommand::Status => commands::authority::status(cli),
         },
         Commands::Send {
