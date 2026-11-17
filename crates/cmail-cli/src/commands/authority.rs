@@ -11,11 +11,10 @@ use std::io::{self, Write};
 /// Resolve the authority port for this invocation. Debug builds can force the
 /// fail-closed backend so the CLI failure path is testable without touching a
 /// real credential store; release builds compile the override out.
-fn authority(cli: &Cli) -> &'static dyn Authority {
+pub(crate) fn authority(cli: &Cli) -> std::sync::Arc<dyn Authority> {
     #[cfg(debug_assertions)]
     if cli.test_unavailable_authority {
-        static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
-        return &UNAVAILABLE;
+        return std::sync::Arc::new(UnavailableAuthority);
     }
     #[cfg(not(debug_assertions))]
     let _ = cli;
@@ -102,12 +101,12 @@ fn confirm(question: &str) -> Result<bool> {
 pub fn adopt(cli: &Cli) -> Result<()> {
     let c = Cmail::open(&cli.root_path()?)?;
     let authority = authority(cli);
-    let plan = c.adoption_plan(authority)?;
+    let plan = c.adoption_plan(authority.as_ref())?;
     if !cli.json {
         print_plan(&plan);
     }
     let confirmed = plan.pending.is_empty() || confirm("sign these records?")?;
-    let outcome = c.sign_adoption(authority, plan, confirmed)?;
+    let outcome = c.sign_adoption(authority.as_ref(), plan, confirmed)?;
     if cli.json {
         output::print_json(&outcome);
     } else if outcome.plan.pending.is_empty() {
@@ -145,7 +144,7 @@ pub fn reset(cli: &Cli) -> Result<()> {
         }
         return Ok(());
     }
-    let status = c.reset_authority(authority(cli))?;
+    let status = c.reset_authority(authority(cli).as_ref())?;
     if cli.json {
         output::print_json(&status);
     } else {

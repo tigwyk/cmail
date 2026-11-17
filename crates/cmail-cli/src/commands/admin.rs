@@ -72,7 +72,10 @@ pub fn reject(cli: &Cli, id: &str) -> Result<()> {
 }
 
 pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         KeyringCmd::Add {
             name,
@@ -102,6 +105,14 @@ pub fn keyring(cli: &Cli, cmd: KeyringCmd) -> Result<()> {
                     Some(url) => println!("trusted {name} -> {url}"),
                     None => println!("trusted {name}"),
                 }
+            }
+        }
+        KeyringCmd::Remove { name } => {
+            c.keyring_remove(&name)?;
+            if cli.json {
+                output::print_json(&serde_json::json!({"status":"removed","name":name}));
+            } else {
+                println!("removed {name}");
             }
         }
         KeyringCmd::Route { name, url, clear } => {
@@ -182,7 +193,7 @@ pub fn relay(cli: &Cli, cmd: RelayCmd) -> Result<()> {
             }
         }
         RelayCmd::Show => {
-            let url = cmail_core::Policy::load(&c.root)?.relay_url();
+            let url = c.relay_url()?;
             if cli.json {
                 output::print_json(&serde_json::json!({"url": url}));
             } else {
@@ -262,6 +273,9 @@ pub enum KeyringCmd {
         key_file: Option<std::path::PathBuf>,
         from_message: Option<String>,
         route: Option<String>,
+    },
+    Remove {
+        name: String,
     },
     Route {
         name: String,

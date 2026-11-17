@@ -184,6 +184,11 @@ pub enum KeyringCommand {
         #[arg(long)]
         route: Option<String>,
     },
+    /// Remove a name's trusted key (human-only); the signed revocation wins
+    /// over every earlier grant
+    Remove {
+        name: String,
+    },
     /// Set or clear a name's relay route (human-only)
     Route {
         name: String,
@@ -249,6 +254,9 @@ fn map_keyring(cmd: &KeyringCommand) -> commands::admin::KeyringCmd {
             from_message: from_message.clone(),
             route: route.clone(),
         },
+        KeyringCommand::Remove { name } => {
+            commands::admin::KeyringCmd::Remove { name: name.clone() }
+        }
         KeyringCommand::Route { name, url, clear } => commands::admin::KeyringCmd::Route {
             name: name.clone(),
             url: url.clone(),

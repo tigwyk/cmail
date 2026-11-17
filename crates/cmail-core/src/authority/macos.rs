@@ -82,12 +82,15 @@ pub(super) struct MacAuthority {
 }
 
 /// The process-wide macOS backend.
-pub(super) fn authority() -> &'static dyn Authority {
-    static MAC: MacAuthority = MacAuthority {
-        ids: SYSTEM_IDS,
-        state: Mutex::new(MacState { last_grant: None }),
-    };
-    &MAC
+pub(super) fn authority() -> std::sync::Arc<dyn Authority> {
+    static MAC: std::sync::LazyLock<std::sync::Arc<dyn Authority>> =
+        std::sync::LazyLock::new(|| {
+            std::sync::Arc::new(MacAuthority {
+                ids: SYSTEM_IDS,
+                state: Mutex::new(MacState { last_grant: None }),
+            })
+        });
+    MAC.clone()
 }
 
 impl MacAuthority {

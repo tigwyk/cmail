@@ -1,7 +1,8 @@
+use crate::authority::{AuthorityAction, EffectivePolicy};
 use crate::error::{CoreError, Result};
 use crate::identity::{fingerprint_of, now_rfc3339};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::path::Path;
 
@@ -91,12 +92,136 @@ impl KeyRing {
             .map(|(k, v)| (k.clone(), v.clone()))
             .collect()
     }
+
+    /// Split a signed key subject (`name:public_key`) into its parts.
+    pub fn split_key_subject(subject: &str) -> Option<(&str, &str)> {
+        let (name, public_key) = subject.split_once(':')?;
+        (!name.is_empty() && !public_key.is_empty()).then_some((name, public_key))
+    }
+
+    /// Public keys currently granted to `name` by the latest signed decision
+    /// per subject. A later `KeyRemove` at the same subject supersedes the
+    /// grant, so revocations are simply absent. Used to revoke every live
+    /// subject on rotation or `keyring remove`.
+    pub fn granted_keys(policy: &EffectivePolicy, name: &str) -> Vec<String> {
+        let mut keys = BTreeSet::new();
+        for (subject, decision) in &policy.decisions {
+            if decision.action != AuthorityAction::KeyAdd {
+                continue;
+            }
+            if let Some((subject_name, public_key)) = Self::split_key_subject(subject) {
+                if subject_name == name {
+                    keys.insert(public_key.to_string());
+                }
+            }
+        }
+        keys.into_iter().collect()
+    }
+
+    /// The effective trust keyring: names granted by a latest signed
+    /// `KeyAdd`, and nothing else. Unsigned, wrong-key, and replayed records
+    /// never reach the fold. A name with two live keys is dropped (fail
+    /// closed) rather than silently trusting either.
+    pub fn from_decisions(policy: &EffectivePolicy) -> Self {
+        let mut grants: BTreeMap<String, Vec<(&str, &str)>> = BTreeMap::new();
+        for (subject, decision) in &policy.decisions {
+            if decision.action != AuthorityAction::KeyAdd {
+                continue;
+            }
+            if let Some((name, public_key)) = Self::split_key_subject(subject) {
+                grants
+                    .entry(name.to_string())
+                    .or_default()
+                    .push((public_key, decision.timestamp.as_str()));
+            }
+        }
+        let mut keyring = Self::default();
+        for (name, keys) in grants {
+            if keys.len() != 1 {
+                continue;
+            }
+            let (public_key, first_seen) = keys[0];
+            keyring.entries.insert(
+                name,
+                KeyEntry {
+                    public_key: public_key.to_string(),
+                    first_seen: first_seen.to_string(),
+                    route: None,
+                },
+            );
+        }
+        keyring
+    }
+
+    /// Copy relay routes from the legacy keyring file. Routes are pure
+    /// routing: they never grant trust, so this cannot resurrect an entry.
+    pub fn overlay_routes(&mut self, routes: &KeyRing) {
+        for (name, entry) in &mut self.entries {
+            if let Some(legacy) = routes.get(name) {
+                entry.route = legacy.route.clone();
+            }
+        }
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::PolicyDecision;
+    use std::collections::BTreeMap;
     use tempfile::TempDir;
+
+    fn decision(action: AuthorityAction, sequence: u64) -> PolicyDecision {
+        PolicyDecision {
+            action,
+            sequence,
+            timestamp: format!("2026-11-01T00:00:0{sequence}Z"),
+        }
+    }
+
+    #[test]
+    fn effective_keyring_takes_latest_grant_and_revocation_wins() {
+        let mut decisions = BTreeMap::new();
+        decisions.insert(
+            "alice:a2V5".to_string(),
+            decision(AuthorityAction::KeyAdd, 1),
+        );
+        let policy = EffectivePolicy { decisions };
+        let effective = KeyRing::from_decisions(&policy);
+        assert_eq!(effective.get("alice").unwrap().public_key, "a2V5");
+        assert_eq!(
+            KeyRing::granted_keys(&policy, "alice"),
+            vec!["a2V5".to_string()]
+        );
+
+        // A later KeyRemove at the same subject supersedes the grant.
+        let mut decisions = BTreeMap::new();
+        decisions.insert(
+            "alice:a2V5".to_string(),
+            decision(AuthorityAction::KeyRemove, 2),
+        );
+        let policy = EffectivePolicy { decisions };
+        assert!(KeyRing::from_decisions(&policy).get("alice").is_none());
+        assert!(KeyRing::granted_keys(&policy, "alice").is_empty());
+    }
+
+    #[test]
+    fn ambiguous_live_keys_drop_the_name_instead_of_dual_trust() {
+        let mut decisions = BTreeMap::new();
+        decisions.insert(
+            "alice:a2V5".to_string(),
+            decision(AuthorityAction::KeyAdd, 1),
+        );
+        decisions.insert(
+            "alice:b2V5".to_string(),
+            decision(AuthorityAction::KeyAdd, 2),
+        );
+        let effective = KeyRing::from_decisions(&EffectivePolicy { decisions });
+        assert!(
+            effective.get("alice").is_none(),
+            "two live keys must never both verify"
+        );
+    }
 
     #[test]
     fn add_get_persist_round_trip() {

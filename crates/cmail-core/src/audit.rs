@@ -17,6 +17,7 @@ pub enum AuditEvent {
     AllowAdd,
     AllowRemove,
     KeyAdd,
+    KeyRemove,
     SpoofSuspected,
     Corrupt,
     QuarantineRelease,
@@ -157,7 +158,7 @@ mod tests {
     }
 
     #[test]
-    fn all_sixteen_event_names_pinned() {
+    fn all_event_names_pinned() {
         for (evt, name) in [
             (AuditEvent::Init, "init"),
             (AuditEvent::Send, "send"),
@@ -168,6 +169,7 @@ mod tests {
             (AuditEvent::AllowAdd, "allow_add"),
             (AuditEvent::AllowRemove, "allow_remove"),
             (AuditEvent::KeyAdd, "key_add"),
+            (AuditEvent::KeyRemove, "key_remove"),
             (AuditEvent::SpoofSuspected, "spoof_suspected"),
             (AuditEvent::Corrupt, "corrupt"),
             (AuditEvent::QuarantineRelease, "quarantine_release"),

@@ -1,6 +1,6 @@
 use crate::adoption::{self, AdoptionOutcome, AdoptionPlan, LegacyApproval};
 use crate::audit::{append, AuditEvent, AuditRecord};
-use crate::authority::{Authority, AuthorityStatus};
+use crate::authority::{Authority, AuthorityAction, AuthorityStatus};
 use crate::config::{Config, InboundMode};
 use crate::crypto::{recipient_public_from_b64, x25519_secret, SealSession};
 use crate::envelope::{new_id, open_envelope, seal_and_sign, Envelope, NewSealedMessage};
@@ -20,6 +20,9 @@ pub struct Cmail {
     pub root: PathBuf,
     pub store: MailStore,
     pub config: Config,
+    /// The process authority: verifies signed policy on trust reads and gates
+    /// every human-only keyring decision. Resolved once per handle.
+    authority: std::sync::Arc<dyn Authority>,
 }
 
 /// Result of [`Cmail::init`]: a fresh identity or an explicitly reused one.
@@ -102,14 +105,32 @@ pub enum KeySource {
 }
 
 impl Cmail {
+    /// Open with the process authority backend (the only release path).
     pub fn open(root: &Path) -> Result<Self> {
+        Self::open_with_authority(root, crate::authority::system_authority())
+    }
+
+    /// Open with an explicit authority port. The CLI passes the backend it
+    /// selected (including the debug-only unavailable one) so command output
+    /// and trust reads agree; production callers use [`Cmail::open`].
+    pub fn open_with_authority(
+        root: &Path,
+        authority: std::sync::Arc<dyn Authority>,
+    ) -> Result<Self> {
         fs_ensure_root(root)?;
         let config = Config::load_or_init(root)?;
         Ok(Self {
             root: root.to_path_buf(),
             store: MailStore::new(root),
             config,
+            authority,
         })
+    }
+
+    /// The effective-policy seam, loaded fresh so human edits made since this
+    /// handle opened are observed (long-lived MCP process).
+    fn policy(&self) -> Result<Policy> {
+        Policy::load(&self.root, self.authority.clone())
     }
 
     /// Create an identity, or reuse an existing one only with `reuse`.
@@ -199,7 +220,7 @@ impl Cmail {
         // (the synced-root cross-machine case: only the remote machine holds
         // identities/<to>/; locally the keyring entry carries the encrypt-to
         // key, resolved by recipient_x25519 below).
-        let policy = Policy::load(&self.root)?;
+        let policy = self.policy()?;
         if !identity_exists(&self.root, to) && policy.keyring()?.get(to).is_none() {
             return Err(CoreError::UnknownRecipient(to.to_string()));
         }
@@ -267,7 +288,7 @@ impl Cmail {
         let public_key_b64 = if identity_exists(&self.root, to) {
             load_identity(&self.root, to)?.public_key_b64()
         } else {
-            Policy::load(&self.root)?
+            self.policy()?
                 .keyring()?
                 .get(to)
                 .map(|e| e.public_key.clone())
@@ -314,7 +335,7 @@ impl Cmail {
         // Gate on the effective policy, loaded fresh: allow_add/approve may have
         // updated the allowlist after this Cmail handle was opened (long-lived
         // MCP process).
-        if Policy::load(&self.root)?.may_send(to) {
+        if self.policy()?.may_send(to) {
             self.store.write_envelope(&self.store.inbox_dir(to), &env)?;
             append(
                 &self.root,
@@ -382,7 +403,7 @@ impl Cmail {
         )?;
         // Gate on the effective policy (long-lived MCP process), held BEFORE
         // network — identical gate semantics to send_gated.
-        if !Policy::load(&self.root)?.may_send(to) {
+        if !self.policy()?.may_send(to) {
             self.store
                 .write_envelope(&self.store.pending_dir(from), &env)?;
             append(
@@ -416,7 +437,8 @@ impl Cmail {
     /// parcel assembly: the CALLER owns the audit ordering (`send_relay` is
     /// appended by each caller after its own bookkeeping).
     fn deposit_remote(&self, env: &Envelope, route: &str) -> Result<()> {
-        let entry = Policy::load(&self.root)?
+        let entry = self
+            .policy()?
             .keyring()?
             .get(&env.to)
             .cloned()
@@ -542,7 +564,7 @@ impl Cmail {
 
     pub fn approve(&self, id: &str, remember: bool) -> Result<()> {
         let (owner, env) = self.store.find_pending(id)?;
-        let policy = Policy::load(&self.root)?;
+        let policy = self.policy()?;
         // Re-verify the recipient is still releasable: the same disjunction
         // send() accepts (local identity OR keyring-known). A local identity
         // may have been removed after the mail was held — but on a synced
@@ -664,7 +686,7 @@ impl Cmail {
     }
 
     pub fn allow_list(&self) -> Result<Vec<String>> {
-        let mut v = Policy::load(&self.root)?.allow_list().to_vec();
+        let mut v = self.policy()?.allow_list().to_vec();
         v.sort();
         Ok(v)
     }
@@ -686,7 +708,7 @@ impl Cmail {
     pub fn inbox(&self, as_name: Option<&str>) -> Result<Vec<InboxItem>> {
         let me = self.resolve_identity(as_name)?;
         self.store.ensure_mailbox(&me)?;
-        let policy = Policy::load(&self.root)?;
+        let policy = self.policy()?;
         // Policy is read fresh through the seam: a human may have flipped the
         // inbound mode since this handle was opened (long-lived MCP process),
         // mirroring send()'s gate.
@@ -798,7 +820,7 @@ impl Cmail {
         }
         let src = if in_inbox { &inbox } else { &archive };
         let env = self.load_envelope_from(std::slice::from_ref(src), id)?;
-        let tr = Policy::load(&self.root)?.trust(&env)?;
+        let tr = self.policy()?.trust(&env)?;
         // Spec 4.2: signature and trust come from the visible header (above);
         // content is recovered here — a sealed envelope is opened with the
         // reader's X25519 identity key, a plain envelope passes through. A
@@ -903,7 +925,7 @@ impl Cmail {
         let mut items = self.inbox(as_name)?;
         if all {
             let me = self.resolve_identity(as_name)?;
-            let policy = Policy::load(&self.root)?;
+            let policy = self.policy()?;
             let archive = self.store.archive_dir(&me);
             for id in self.store.list_ids(&archive) {
                 let raw = self.store.read_raw(&archive, &id)?;
@@ -967,7 +989,7 @@ impl Cmail {
         let identity = load_identity(&self.root, &me)?;
         // Load fresh through the seam: relay set/clear may have happened after
         // this handle was opened (long-lived MCP process), mirroring relay_set.
-        let raw_url = Policy::load(&self.root)?.relay_url().ok_or_else(|| {
+        let raw_url = self.policy()?.relay_url().ok_or_else(|| {
             CoreError::Config("no relay configured; run: cmail relay set <url>".into())
         })?;
         let base = normalize_base(&raw_url)?;
@@ -1104,7 +1126,7 @@ impl Cmail {
     pub fn quarantine_show(&self, owner: Option<&str>, id: &str) -> Result<ReadMessage> {
         let me = self.resolve_identity(owner)?;
         let env = Envelope::parse(&self.store.read_raw(&self.store.quarantine_dir(&me), id)?)?;
-        let tr = Policy::load(&self.root)?.trust(&env)?;
+        let tr = self.policy()?.trust(&env)?;
         let my = load_identity(&self.root, &me)?;
         let (kind, subject, body, attachments, in_reply_to) =
             match open_envelope(&env, &x25519_secret(&my.signing)) {
@@ -1171,7 +1193,7 @@ impl Cmail {
     }
 
     pub fn keyring_list(&self) -> Result<Vec<(String, crate::keyring::KeyEntry)>> {
-        Ok(Policy::load(&self.root)?.keyring()?.list())
+        Ok(self.policy()?.keyring()?.list())
     }
 
     pub fn keyring_add(&self, name: &str, source: KeySource) -> Result<()> {
@@ -1186,14 +1208,75 @@ impl Cmail {
                 env.from_key
             }
         };
-        let mut kr = KeyRing::load(&self.root)?;
-        kr.add(name, &key)?;
-        kr.save(&self.root)?;
+        // The signed log is the only thing that grants trust. Rotating a name
+        // revokes every live subject first, so the old key cannot stay trusted.
+        let policy = self.authority.load_effective_policy(&self.root)?;
+        let mut granted = KeyRing::granted_keys(&policy, name);
+        if granted.len() == 1 && granted[0] == key {
+            granted.clear();
+        }
+        for old_key in granted {
+            self.authority.sign_action(
+                &self.root,
+                AuthorityAction::KeyRemove,
+                &adoption::key_subject(name, &old_key),
+                &serde_json::json!({ "name": name, "public_key": old_key }),
+            )?;
+            append(
+                &self.root,
+                &AuditRecord::now(AuditEvent::KeyRemove, "human").counterpart(name),
+            )?;
+        }
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::KeyAdd,
+            &adoption::key_subject(name, &key),
+            &serde_json::json!({ "name": name, "public_key": key }),
+        )?;
+        // Non-trust cache: routes and display only. Trust ignores this file.
+        self.cache_key(name, &key)?;
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::KeyAdd, "human").counterpart(name),
         )?;
         Ok(())
+    }
+
+    /// Revoke every live signed grant for `name`. Revocation is a signed
+    /// record, so it wins over an earlier grant and survives a restart.
+    pub fn keyring_remove(&self, name: &str) -> Result<()> {
+        let policy = self.authority.load_effective_policy(&self.root)?;
+        let granted = KeyRing::granted_keys(&policy, name);
+        if granted.is_empty() {
+            return Err(CoreError::Config(format!(
+                "keyring has no entry for '{name}'"
+            )));
+        }
+        for public_key in granted {
+            self.authority.sign_action(
+                &self.root,
+                AuthorityAction::KeyRemove,
+                &adoption::key_subject(name, &public_key),
+                &serde_json::json!({ "name": name, "public_key": public_key }),
+            )?;
+        }
+        let mut kr = KeyRing::load(&self.root)?;
+        kr.remove(name);
+        kr.save(&self.root)?;
+        append(
+            &self.root,
+            &AuditRecord::now(AuditEvent::KeyRemove, "human").counterpart(name),
+        )?;
+        Ok(())
+    }
+
+    /// Keep the legacy keyring file as a non-trust cache of the signed key, so
+    /// routes keep working. Hand edits here never change trust.
+    fn cache_key(&self, name: &str, public_key: &str) -> Result<()> {
+        let mut kr = KeyRing::load(&self.root)?;
+        kr.remove(name);
+        kr.add(name, public_key)?;
+        kr.save(&self.root)
     }
 
     /// Set (`Some`) or clear (`None`) a keyring entry's relay route (spec
@@ -1211,6 +1294,11 @@ impl Cmail {
         }
         append(&self.root, &rec)?;
         Ok(())
+    }
+
+    /// The configured pickup relay url, if any (config-only read).
+    pub fn relay_url(&self) -> Result<Option<String>> {
+        Ok(self.policy()?.relay_url())
     }
 
     /// Set (`Some`) or clear (`None`) the pickup relay url (spec §3.3).
@@ -1283,10 +1371,31 @@ mod tests {
     /// `resolve_identity(None)` race (review hardening).
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    /// Service tests run against the in-memory authority: no presence prompt,
+    /// but the same persisted record log and fold as a platform backend.
+    fn open(root: &std::path::Path) -> Result<Cmail> {
+        open_with(root, test_authority())
+    }
+
+    fn open_with(
+        root: &std::path::Path,
+        authority: std::sync::Arc<dyn Authority>,
+    ) -> Result<Cmail> {
+        Cmail::open_with_authority(root, authority)
+    }
+
+    type TestAuthority = std::sync::Arc<crate::authority::InMemoryAuthority>;
+
+    fn test_authority() -> TestAuthority {
+        let authority = std::sync::Arc::new(crate::authority::InMemoryAuthority::new());
+        crate::authority::Authority::init(&*authority).unwrap();
+        authority
+    }
+
     #[test]
     fn init_refuses_silent_collision_and_reuse_is_explicit() {
         let root = TempDir::new().unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         assert_eq!(c.init("dup", false).unwrap(), InitOutcome::Created);
         let key_path = root.path().join("identities/dup/key.ed25519");
         let key_before = std::fs::read(&key_path).unwrap();
@@ -1333,7 +1442,7 @@ mod tests {
                     let path = path.clone();
                     let barrier = barrier.clone();
                     std::thread::spawn(move || {
-                        let c = Cmail::open(&path).unwrap();
+                        let c = open(&path).unwrap();
                         barrier.wait();
                         c.init(name, reuse)
                     })
@@ -1391,7 +1500,7 @@ mod tests {
 
     fn svc() -> (TempDir, Cmail) {
         let root = TempDir::new().unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         c.init("alice", false).unwrap();
         c.init("zoe", false).unwrap();
         (root, c)
@@ -1464,13 +1573,13 @@ mod tests {
             SendOutcome::Sent { .. }
         ));
         let root2 = TempDir::new().unwrap();
-        let c2 = Cmail::open(root2.path()).unwrap();
+        let c2 = open(root2.path()).unwrap();
         c2.init("a", false).unwrap();
         c2.init("b", false).unwrap();
         let mut cfg = c2.config.clone();
         cfg.outbound = OutboundMode::Open;
         cfg.save(&c2.root).unwrap();
-        let c2 = Cmail::open(root2.path()).unwrap();
+        let c2 = open(root2.path()).unwrap();
         assert!(matches!(
             c2.send(Some("a"), "b", "note", "s", "b", &[], None)
                 .unwrap(),
@@ -1498,7 +1607,7 @@ mod tests {
         let mut cfg = c.config.clone();
         cfg.default_identity = Some("zoe".into());
         cfg.save(root.path()).unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         assert_eq!(c.resolve_identity(None).unwrap(), "zoe");
         assert_eq!(c.resolve_identity(Some("alice")).unwrap(), "alice");
         std::env::set_var("CMAIL_IDENTITY", "alice");
@@ -1715,6 +1824,141 @@ mod tests {
         );
     }
 
+    // --- Signed keyring enforcement tests ---
+
+    fn envelope_from(name: &str, key: &ed25519_dalek::SigningKey) -> Envelope {
+        build_and_sign(
+            &"ab".repeat(16),
+            &NewEnvelope {
+                from: name.into(),
+                from_key: base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    key.verifying_key().as_bytes(),
+                ),
+                to: "zoe".into(),
+                kind: "note".into(),
+                subject: "s".into(),
+                body: "b".into(),
+                attachments: vec![],
+                in_reply_to: None,
+                created: "2026-11-01T12:00:00Z".into(),
+            },
+            key,
+        )
+        .unwrap()
+    }
+
+    fn level(c: &Cmail, env: &Envelope) -> TrustLevel {
+        Policy::load(&c.root, c.authority.clone())
+            .unwrap()
+            .trust(env)
+            .unwrap()
+            .level
+    }
+
+    #[test]
+    fn signed_remove_by_name_revokes_trust_and_survives_restart() {
+        let (root, c) = svc();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        let alice = load_identity(&c.root, "alice").unwrap().signing.clone();
+        let env = envelope_from("alice", &alice);
+        assert_eq!(level(&c, &env), TrustLevel::Verified);
+
+        c.keyring_remove("alice").unwrap();
+        assert_eq!(level(&c, &env), TrustLevel::Untrusted);
+        assert!(c.keyring_list().unwrap().is_empty());
+
+        // A new process with the same key sees the persisted revocation.
+        let restarted = open_with(root.path(), c.authority.clone()).unwrap();
+        assert_eq!(level(&restarted, &env), TrustLevel::Untrusted);
+        assert!(restarted.keyring_remove("alice").is_err());
+    }
+
+    #[test]
+    fn rotation_revokes_the_old_key_and_trusts_the_new_one() {
+        let (root, c) = svc();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        let old = load_identity(&c.root, "alice").unwrap().signing.clone();
+        let fresh = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+
+        let key_file = root.path().join("fresh-alice.b64");
+        std::fs::write(
+            &key_file,
+            base64::Engine::encode(
+                &base64::engine::general_purpose::STANDARD,
+                fresh.verifying_key().as_bytes(),
+            ),
+        )
+        .unwrap();
+        c.keyring_add("alice", KeySource::KeyFile(key_file))
+            .unwrap();
+
+        // The name is still known, so the old key is a spoof, never verified.
+        assert_eq!(
+            level(&c, &envelope_from("alice", &old)),
+            TrustLevel::SpoofSuspect
+        );
+        assert_eq!(
+            level(&c, &envelope_from("alice", &fresh)),
+            TrustLevel::Verified
+        );
+
+        let restarted = open_with(root.path(), c.authority.clone()).unwrap();
+        assert_eq!(
+            level(&restarted, &envelope_from("alice", &old)),
+            TrustLevel::SpoofSuspect
+        );
+        assert_eq!(
+            level(&restarted, &envelope_from("alice", &fresh)),
+            TrustLevel::Verified
+        );
+    }
+
+    #[test]
+    fn hand_edited_keyring_cache_never_grants_trust() {
+        let (root, c) = svc();
+        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        let alice = load_identity(&c.root, "alice").unwrap().signing.clone();
+        let mallory = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let mut cache = KeyRing::load(root.path()).unwrap();
+        cache.remove("alice");
+        cache
+            .add(
+                "alice",
+                &base64::Engine::encode(
+                    &base64::engine::general_purpose::STANDARD,
+                    mallory.verifying_key().as_bytes(),
+                ),
+            )
+            .unwrap();
+        cache.save(root.path()).unwrap();
+
+        assert_eq!(
+            level(&c, &envelope_from("alice", &alice)),
+            TrustLevel::Verified
+        );
+        assert_eq!(
+            level(&c, &envelope_from("alice", &mallory)),
+            TrustLevel::SpoofSuspect
+        );
+    }
+
+    #[test]
+    fn denied_presence_writes_no_record() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        authority.deny_presence();
+
+        let err = c
+            .keyring_add("alice", KeySource::LocalIdentity)
+            .unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(!root.path().join("authority.log").exists());
+        assert!(c.keyring_list().unwrap().is_empty());
+    }
+
     // --- Task 12 test: admin passthroughs ---
 
     #[test]
@@ -1830,7 +2074,7 @@ mod tests {
         let mut cfg = c.config.clone();
         cfg.inbound = crate::config::InboundMode::Permissive;
         cfg.save(root.path()).unwrap();
-        let c2 = Cmail::open(root.path()).unwrap();
+        let c2 = open(root.path()).unwrap();
         assert_eq!(c2.inbox(Some("zoe")).unwrap().len(), 0); // still in quarantine, not re-listed
         c2.quarantine_release(&id).unwrap();
         let msg = c2.read_message(Some("zoe"), &id).unwrap();
@@ -1920,10 +2164,9 @@ mod tests {
         assert_eq!(msg.body, "the state");
         assert_eq!(msg.kind, "handoff");
         assert_eq!(msg.attachments, Vec::<String>::new());
-        // second send arrives AFTER removing alice's trust -> untrusted, fenced post-decrypt
-        let mut kr = crate::keyring::KeyRing::load(_root.path()).unwrap();
-        kr.remove("alice");
-        kr.save(_root.path()).unwrap();
+        // second send arrives AFTER signed revocation of alice -> untrusted,
+        // fenced post-decrypt
+        c.keyring_remove("alice").unwrap();
         let SendOutcome::Sent { id: id2 } = c
             .send(Some("alice"), "zoe", "note", "s2", "secret2", &[], None)
             .unwrap()
@@ -2193,7 +2436,7 @@ mod tests {
         let server =
             cmail_relayd::RelayServer::start("127.0.0.1:0", rroot.path().to_path_buf(), 7).unwrap();
         let base = server.base_url();
-        let c = Cmail::open(root.path()).unwrap();
+        let c = open(root.path()).unwrap();
         c.init("alice", false).unwrap();
         (root, c, server, base)
     }
@@ -2392,10 +2635,10 @@ mod tests {
             cmail_relayd::RelayServer::start("127.0.0.1:0", relay_root.path().to_path_buf(), 7)
                 .unwrap();
         let base = server.base_url();
-        let sender = Cmail::open(sender_root.path()).unwrap();
+        let sender = open(sender_root.path()).unwrap();
         sender.init("alice", false).unwrap();
         let zoe = crate::identity::create_identity(recv_root.path(), "zoe").unwrap();
-        let recipient = Cmail::open(recv_root.path()).unwrap();
+        let recipient = open(recv_root.path()).unwrap();
         // out-of-band key exchange + route on the sender's side (through the
         // gate); the pickup relay configured on zoe's side
         sender
