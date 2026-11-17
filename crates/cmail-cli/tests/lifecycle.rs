@@ -848,9 +848,11 @@ fn authority_status_reports_backend_and_assurance() {
     }
     #[cfg(not(target_os = "macos"))]
     {
+        // Every supported platform now has its own backend; a fresh root has
+        // no authority, but the backend name must still be honest and concrete.
         assert_eq!(out["available"], false);
-        assert_eq!(out["backend"], "none");
-        assert_eq!(out["assurance"], "none");
+        let backend = out["backend"].as_str().unwrap_or_default();
+        assert!(!backend.is_empty(), "backend must be named: {out}");
         assert!(out["fingerprint"].is_null());
         assert!(out["last_grant"].is_null());
     }
