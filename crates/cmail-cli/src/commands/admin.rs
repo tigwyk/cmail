@@ -300,7 +300,10 @@ pub fn mode(cli: &Cli, cmd: ModeCmd) -> Result<()> {
 }
 
 pub fn quarantine(cli: &Cli, cmd: QuarantineCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         QuarantineCmd::List => {
             let v = c.quarantine_list(cli.as_name.as_deref())?;

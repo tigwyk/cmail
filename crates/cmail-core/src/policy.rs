@@ -18,14 +18,13 @@ use std::path::{Path, PathBuf};
 pub struct Policy {
     root: PathBuf,
     config: Config,
-    /// Verifies the signed record log that grants trust. Presence is never
+    /// Verifies the signed record log that grants policy. Presence is never
     /// requested on this path: only the public key is read.
     authority: std::sync::Arc<dyn Authority>,
     /// Derived on first use from the signed record log; an unavailable
     /// backend yields an empty policy so every gated read fails closed.
     effective: OnceCell<EffectivePolicy>,
-    /// Derived on first use: relay/config-only reads must not need authority
-    /// material (fetch, relay show, allow list never needed it before).
+    /// Derived from `effective` on first use.
     keyring: OnceCell<KeyRing>,
 }
 

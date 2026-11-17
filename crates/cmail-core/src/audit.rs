@@ -78,8 +78,8 @@ pub fn append(root: &Path, record: &AuditRecord) -> Result<()> {
     fs::create_dir_all(root)?;
     // Single atomic append (payload + newline in one write_all) + fsync:
     // concurrent appenders are cmail's normal mode (one process per agent on
-    // a shared root), and a torn line would make `tail` — and the fail-closed
-    // `was_released` gate — reject the whole log. See final whole-branch review.
+    // a shared root), and a torn line must not merge into the next record.
+    // The audit log is unsigned observability; no authority reads depend on it.
     fsutil::append_line(
         &root.join("audit.log"),
         &format!("{}\n", serde_json::to_string(record)?),
@@ -103,8 +103,9 @@ pub fn tail(root: &Path, n: usize) -> Result<Vec<AuditRecord>> {
     Ok(records)
 }
 
-/// Display-oriented tail: skips malformed lines instead of failing. The
-/// fail-closed `was_released` gate keeps using strict `tail`.
+/// Display- and adoption-oriented tail: skips malformed lines instead of
+/// failing. Audit events are unsigned observability; adoption may propose
+/// them for signing, but only a human-confirmed record grants authority.
 pub fn tail_lossy(root: &Path, n: usize) -> Result<Vec<AuditRecord>> {
     let path = root.join("audit.log");
     if !path.exists() {

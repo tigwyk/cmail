@@ -48,6 +48,11 @@ pub struct LegacySnapshot {
     pub outbound_mode: OutboundMode,
     pub inbound_mode: InboundMode,
     pub approvals: Vec<LegacyApproval>,
+    /// Message ids a pre-enforcement build recorded as released from
+    /// quarantine. The audit log is unsigned and non-authoritative; these ids
+    /// become signed decisions only when the human confirms adoption.
+    #[serde(default)]
+    pub quarantine_releases: Vec<String>,
 }
 
 impl LegacySnapshot {
@@ -58,6 +63,7 @@ impl LegacySnapshot {
             && self.approvals.is_empty()
             && self.outbound_mode == OutboundMode::Gated
             && self.inbound_mode == InboundMode::Permissive
+            && self.quarantine_releases.is_empty()
     }
 }
 
@@ -124,6 +130,7 @@ pub fn plan(
         outbound_mode: config.outbound,
         inbound_mode: config.inbound,
         approvals,
+        quarantine_releases: legacy_quarantine_releases(root)?,
     };
     let policy = authority.load_effective_policy(root)?;
     let (pending, already_adopted) = proposals(&legacy)
@@ -221,7 +228,34 @@ fn proposals(legacy: &LegacySnapshot) -> Vec<AdoptionEntry> {
             ),
         });
     }
+    for id in &legacy.quarantine_releases {
+        entries.push(AdoptionEntry {
+            action: AuthorityAction::QuarantineRelease,
+            subject: subject::quarantine(id),
+            payload: json!({ "message_id": id }),
+            summary: format!("release quarantine {id} (legacy audit event)"),
+        });
+    }
     entries
+}
+
+/// Message ids with a legacy `quarantine_release` audit event, in log order
+/// and deduplicated. Lossy: a malformed line is skipped rather than failing
+/// adoption, and a skipped release stays locked (fail closed).
+fn legacy_quarantine_releases(root: &Path) -> Result<Vec<String>> {
+    let mut seen = std::collections::HashSet::new();
+    let mut ids = Vec::new();
+    for record in crate::audit::tail_lossy(root, usize::MAX)? {
+        if record.event != crate::audit::AuditEvent::QuarantineRelease {
+            continue;
+        }
+        if let Some(id) = record.msg_id {
+            if seen.insert(id.clone()) {
+                ids.push(id);
+            }
+        }
+    }
+    Ok(ids)
 }
 
 #[cfg(test)]
@@ -454,6 +488,66 @@ mod tests {
         assert_eq!(
             policy.decisions[&subject::allow("zoe")].action,
             AuthorityAction::AllowAdd
+        );
+    }
+
+    #[test]
+    fn legacy_quarantine_releases_are_adopted_once() {
+        let (root, c) = legacy_service();
+        let id = "deadbeefdeadbeefdeadbeefdeadbeef";
+        // A pre-enforcement build wrote only unsigned audit events (twice).
+        for _ in 0..2 {
+            crate::audit::append(
+                root.path(),
+                &crate::audit::AuditRecord::now(
+                    crate::audit::AuditEvent::QuarantineRelease,
+                    "human",
+                )
+                .msg(id),
+            )
+            .unwrap();
+        }
+        let authority = authority();
+        let plan = c.adoption_plan(&authority).unwrap();
+        assert_eq!(plan.legacy.quarantine_releases, vec![id.to_string()]);
+        let releases: Vec<_> = plan
+            .pending
+            .iter()
+            .filter(|entry| entry.action == AuthorityAction::QuarantineRelease)
+            .collect();
+        assert_eq!(releases.len(), 1, "duplicate audit events collapse");
+        assert_eq!(releases[0].subject, subject::quarantine(id));
+
+        // Declining leaves the legacy release unsigned (still locked).
+        let declined = c.adopt_legacy(&authority, false).unwrap();
+        assert!(declined.signed.is_empty());
+        let policy = authority.load_effective_policy(root.path()).unwrap();
+        assert!(!policy.decisions.contains_key(&subject::quarantine(id)));
+
+        // Confirming signs the release in the same batch.
+        let adopted = c.adopt_legacy(&authority, true).unwrap();
+        assert!(adopted.signed.iter().any(|record| {
+            record.action == AuthorityAction::QuarantineRelease
+                && record.subject == subject::quarantine(id)
+        }));
+        let policy = authority.load_effective_policy(root.path()).unwrap();
+        assert_eq!(
+            policy.decisions[&subject::quarantine(id)].action,
+            AuthorityAction::QuarantineRelease
+        );
+
+        // Re-adoption is idempotent: no duplicate record for the same id.
+        let again = c.adopt_legacy(&authority, true).unwrap();
+        assert!(again.plan.pending.is_empty());
+        assert!(again.signed.is_empty());
+        assert_eq!(
+            again
+                .plan
+                .already_adopted
+                .iter()
+                .filter(|entry| entry.subject == subject::quarantine(id))
+                .count(),
+            1
         );
     }
 
