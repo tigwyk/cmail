@@ -1688,6 +1688,53 @@ mod tests {
     }
 
     #[test]
+    fn later_reject_revokes_prior_approval_for_same_id() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        let key = subject::approval(&id);
+        for action in [AuthorityAction::Approve, AuthorityAction::Reject] {
+            c.authority
+                .sign_action(&c.root, action, &key, &serde_json::json!({ "id": id }))
+                .unwrap();
+        }
+        assert!(!key.contains("approve:") && !key.contains("reject:"));
+        let policy = c.policy().unwrap();
+        assert_eq!(
+            policy
+                .effective()
+                .unwrap()
+                .decisions
+                .get(&key)
+                .unwrap()
+                .action,
+            AuthorityAction::Reject
+        );
+        let err = c.release_approved(&id, false).unwrap_err();
+        assert!(matches!(err, CoreError::AuthorityRequired(_)), "{err}");
+        assert!(c.store.find_pending(&id).is_ok());
+        assert!(!c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+    }
+
+    #[test]
+    fn later_approve_supersedes_prior_reject_for_same_id() {
+        let (_root, c) = svc();
+        let id = held(&c);
+        for action in [AuthorityAction::Reject, AuthorityAction::Approve] {
+            c.authority
+                .sign_action(
+                    &c.root,
+                    action,
+                    &subject::approval(&id),
+                    &serde_json::json!({ "id": id }),
+                )
+                .unwrap();
+        }
+        c.release_approved(&id, false).unwrap();
+        assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
+        assert!(c.store.find_pending(&id).is_err());
+    }
+
+    #[test]
     fn unsigned_permission_does_not_release() {
         let (_root, c) = svc();
         let id = held(&c);
