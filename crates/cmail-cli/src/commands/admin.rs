@@ -4,22 +4,31 @@ use anyhow::Result;
 use cmail_core::service::KeySource;
 
 pub fn allow(cli: &Cli, cmd: AllowCmd) -> Result<()> {
-    let c = cmail_core::Cmail::open(&cli.root_path()?)?;
+    // Signing commands share the authority seam so the debug/unavailable
+    // backend applies here exactly as it does to keyring edits.
+    let c = cmail_core::Cmail::open_with_authority(
+        &cli.root_path()?,
+        crate::commands::authority::authority(cli),
+    )?;
     match cmd {
         AllowCmd::Add { name } => {
             c.allow_add(&name)?;
             if cli.json {
-                output::print_json(&serde_json::json!({"status": "allowed", "name": name}));
+                output::print_json(
+                    &serde_json::json!({"status": "allowed", "name": name, "scope": "root-wide"}),
+                );
             } else {
-                println!("allowed {name}");
+                println!("allowed {name} (root-wide: every identity on this root)");
             }
         }
         AllowCmd::Remove { name } => {
             c.allow_remove(&name)?;
             if cli.json {
-                output::print_json(&serde_json::json!({"status": "removed", "name": name}));
+                output::print_json(
+                    &serde_json::json!({"status": "removed", "name": name, "scope": "root-wide"}),
+                );
             } else {
-                println!("removed {name}");
+                println!("removed {name} (root-wide: every identity on this root)");
             }
         }
         AllowCmd::List => {

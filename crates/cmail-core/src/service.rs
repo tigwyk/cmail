@@ -574,6 +574,13 @@ impl Cmail {
         if !identity_exists(&self.root, &env.to) && policy.keyring()?.get(&env.to).is_none() {
             return Err(CoreError::UnknownRecipient(env.to));
         }
+        // `--remember` signs a root-wide allow record BEFORE the release: if
+        // the human-presence signature is refused, nothing is released and
+        // the human can retry. A later relay failure leaves the approved
+        // name signed and the pending file in place.
+        if remember {
+            self.allow_add(&env.to)?;
+        }
         // Routed held mail (spec §3.2): the recipient has no local identity
         // but has keyring+route at approve time — the approval performs the
         // relay POST instead of the local move. A deposit failure propagates
@@ -598,9 +605,6 @@ impl Cmail {
                         .msg(id)
                         .counterpart(&env.to),
                 )?;
-                if remember {
-                    self.allow_add(&env.to)?;
-                }
                 return Ok(());
             }
         }
@@ -616,9 +620,6 @@ impl Cmail {
                 .msg(id)
                 .counterpart(&env.to),
         )?;
-        if remember {
-            self.allow_add(&env.to)?;
-        }
         Ok(())
     }
 
@@ -659,12 +660,16 @@ impl Cmail {
         Ok(())
     }
 
+    /// Sign an `allow:<name>` decision. Root-wide: every identity on this
+    /// root shares the allowlist. An unavailable or denied authority writes
+    /// no record and returns the typed refusal.
     pub fn allow_add(&self, name: &str) -> Result<()> {
-        let mut cfg = Config::load_or_init(&self.root)?;
-        if !cfg.allow.send.iter().any(|n| n == name) {
-            cfg.allow.send.push(name.to_string());
-            cfg.save(&self.root)?;
-        }
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::AllowAdd,
+            &crate::authority::subject::allow(name),
+            &serde_json::json!({ "name": name }),
+        )?;
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::AllowAdd, "human").counterpart(name),
@@ -672,12 +677,15 @@ impl Cmail {
         Ok(())
     }
 
+    /// Sign an `allow:<name>` revocation. Latest valid record wins, so the
+    /// name leaves the effective allowlist immediately.
     pub fn allow_remove(&self, name: &str) -> Result<()> {
-        // Load fresh: allow_add/approve may have updated the allowlist after
-        // this handle was opened (long-lived MCP process), mirroring allow_add.
-        let mut cfg = Config::load_or_init(&self.root)?;
-        cfg.allow.send.retain(|n| n != name);
-        cfg.save(&self.root)?;
+        self.authority.sign_action(
+            &self.root,
+            AuthorityAction::AllowRemove,
+            &crate::authority::subject::allow(name),
+            &serde_json::json!({ "name": name }),
+        )?;
         append(
             &self.root,
             &AuditRecord::now(AuditEvent::AllowRemove, "human").counterpart(name),
@@ -686,9 +694,7 @@ impl Cmail {
     }
 
     pub fn allow_list(&self) -> Result<Vec<String>> {
-        let mut v = self.policy()?.allow_list().to_vec();
-        v.sort();
-        Ok(v)
+        self.policy()?.allow_list()
     }
 
     /// Display-oriented audit tail: skips malformed lines so a damaged log
@@ -1547,8 +1553,10 @@ mod tests {
         c.approve(&id, true).unwrap();
         assert!(c.store.inbox_dir("zoe").join(format!("{id}.mail")).exists());
         assert!(c.approvals(None).unwrap().is_empty());
+        // --remember signs an allow record; the legacy config is untouched
+        assert_eq!(c.allow_list().unwrap(), vec!["zoe".to_string()]);
         let cfg = Config::load_or_init(&c.root).unwrap();
-        assert!(cfg.is_send_allowed("zoe"));
+        assert!(cfg.allow.send.is_empty());
         assert_eq!(to, "zoe");
         // now a second send goes straight through
         let out = c
@@ -1581,13 +1589,19 @@ mod tests {
             SendOutcome::Sent { .. }
         ));
         let root2 = TempDir::new().unwrap();
-        let c2 = open(root2.path()).unwrap();
+        let authority = test_authority();
+        let c2 = open_with(root2.path(), authority.clone()).unwrap();
         c2.init("a", false).unwrap();
         c2.init("b", false).unwrap();
-        let mut cfg = c2.config.clone();
-        cfg.outbound = OutboundMode::Open;
-        cfg.save(&c2.root).unwrap();
-        let c2 = open(root2.path()).unwrap();
+        // Only a signed mode record opens the gate; config is display-only.
+        authority
+            .sign_action(
+                root2.path(),
+                AuthorityAction::OutboundMode,
+                crate::authority::subject::OUTBOUND_MODE,
+                &serde_json::json!({ "mode": "open" }),
+            )
+            .unwrap();
         assert!(matches!(
             c2.send(Some("a"), "b", "note", "s", "b", &[], None)
                 .unwrap(),
@@ -1987,6 +2001,95 @@ mod tests {
         assert!(recs.iter().any(|r| r.event == AuditEvent::AllowRemove));
     }
 
+    #[test]
+    fn signed_allow_add_permits_and_remove_revokes() {
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+
+        // a signed add is what permits the send; the record is namespaced
+        c.allow_add("zoe").unwrap();
+        let log = std::fs::read_to_string(root.path().join("authority.log")).unwrap();
+        assert!(log.contains("allow:zoe"), "{log}");
+        let effective = authority.load_effective_policy(root.path()).unwrap();
+        assert_eq!(
+            effective.decisions[&crate::authority::subject::allow("zoe")].action,
+            AuthorityAction::AllowAdd
+        );
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Sent { .. }
+        ));
+
+        // a signed remove revokes it again
+        c.allow_remove("zoe").unwrap();
+        assert!(c.allow_list().unwrap().is_empty());
+        let effective = authority.load_effective_policy(root.path()).unwrap();
+        assert_eq!(
+            effective.decisions[&crate::authority::subject::allow("zoe")].action,
+            AuthorityAction::AllowRemove
+        );
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+    }
+
+    #[test]
+    fn hand_edited_config_allowlist_does_not_permit() {
+        let (root, c) = svc();
+        let mut cfg = Config::load_or_init(root.path()).unwrap();
+        cfg.allow.send = vec!["zoe".into()];
+        cfg.outbound = OutboundMode::Open;
+        cfg.save(root.path()).unwrap();
+
+        // neither the legacy allow entry nor the config mode reaches the gate
+        assert!(c.allow_list().unwrap().is_empty());
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+        assert!(!root.path().join("authority.log").exists());
+    }
+
+    #[test]
+    fn unavailable_authority_gates_sends_and_allow_edits() {
+        let root = TempDir::new().unwrap();
+        let authority: std::sync::Arc<dyn Authority> =
+            std::sync::Arc::new(crate::authority::UnavailableAuthority);
+        let c = open_with(root.path(), authority).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+
+        // gated send holds rather than erroring; the allowlist reads empty
+        assert!(matches!(
+            c.send(Some("alice"), "zoe", "note", "s", "b", &[], None)
+                .unwrap(),
+            SendOutcome::Held { .. }
+        ));
+        assert!(c.allow_list().unwrap().is_empty());
+
+        // allow edits need the authority and fail with typed guidance
+        for err in [
+            c.allow_add("zoe").unwrap_err(),
+            c.allow_remove("zoe").unwrap_err(),
+        ] {
+            assert!(matches!(err, CoreError::AuthorityUnavailable(_)), "{err}");
+        }
+        assert!(!root.path().join("authority.log").exists());
+    }
+
     // --- Task H5 tests: service consistency and failure cleanup ---
 
     #[test]
@@ -2065,7 +2168,11 @@ mod tests {
 
     #[test]
     fn strict_mode_quarantines_unknown_senders() {
-        let (root, c) = svc();
+        let root = TempDir::new().unwrap();
+        let authority = test_authority();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
         // deliver one untrusted message (alice -> zoe, allowlisted for the test)
         c.allow_add("zoe").unwrap();
         let id = match c
@@ -2088,7 +2195,7 @@ mod tests {
         let mut cfg = c.config.clone();
         cfg.inbound = crate::config::InboundMode::Permissive;
         cfg.save(root.path()).unwrap();
-        let c2 = open(root.path()).unwrap();
+        let c2 = open_with(root.path(), authority.clone()).unwrap();
         assert_eq!(c2.inbox(Some("zoe")).unwrap().len(), 0); // still in quarantine, not re-listed
         c2.quarantine_release(&id).unwrap();
         let msg = c2.read_message(Some("zoe"), &id).unwrap();

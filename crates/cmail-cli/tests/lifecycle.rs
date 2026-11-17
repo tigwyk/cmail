@@ -110,14 +110,9 @@ fn full_lifecycle_with_json_shapes() {
     );
     assert_eq!(empty.as_array().map(Vec::len), Some(0));
 
-    // approve (human); --remember allowlists zoe for alice's future sends
-    let approved = json_out(
-        cmail(&root)
-            .arg("--json")
-            .arg("approve")
-            .arg(&id)
-            .arg("--remember"),
-    );
+    // approve (human). No --remember: signing an allow record needs the
+    // human-present authority, so the CLI happy path stays prompt-free.
+    let approved = json_out(cmail(&root).arg("--json").arg("approve").arg(&id));
     assert_eq!(approved["status"], "approved");
 
     // sealed on the wire (spec 4.1): zoe's inbox file carries only the `enc`
@@ -190,7 +185,7 @@ fn full_lifecycle_with_json_shapes() {
     let message = denied["error"].as_str().unwrap();
     assert!(message.contains("authority unavailable"), "{message}");
     assert!(!root.path().join("authority.log").exists());
-    let sent2 = json_out(
+    let held2 = json_out(
         cmail(&root)
             .arg("--as")
             .arg("alice")
@@ -201,7 +196,9 @@ fn full_lifecycle_with_json_shapes() {
             .arg("--body")
             .arg("again"),
     );
-    assert_eq!(sent2["status"], "sent"); // remember flag allowlisted zoe for alice
+    // no signed allow record exists, so the config allowlist is inert
+    assert_eq!(held2["status"], "held");
+    approve_all_held(&root);
     let inbox2 = json_out(
         cmail(&root)
             .arg("--as")
@@ -224,9 +221,8 @@ fn full_lifecycle_with_json_shapes() {
     assert!(read2["body"].as_str().unwrap().contains(UNTRUSTED_OPEN));
     assert!(read2["body"].as_str().unwrap().contains("again"));
 
-    // reply threads: only zoe is allowlisted (alice is not), so zoe's reply is held.
-    // Deterministic: `approve --remember` added "zoe"; the denied keyring add
-    // never touches the allowlist; the gate checks the recipient (alice) -> held.
+    // reply threads: no signed allowlist entry covers alice, so zoe's reply
+    // is held (the gate checks the recipient, and config grants nothing).
     let rep = json_out(
         cmail(&root)
             .arg("--as")
@@ -240,18 +236,40 @@ fn full_lifecycle_with_json_shapes() {
     assert_eq!(rep["status"], "held");
     assert_eq!(rep["to"], "alice");
 
-    // allow add is no longer silent: it reports a status object under --json
-    // (placed after the reply check: allowlisting alice here must not change
-    // the reply-gate outcome asserted above)
-    let allowed = json_out(
+    // allow add signs a root-wide record, so without the human-present
+    // authority it fails closed with typed guidance and writes nothing. The
+    // hand-edited legacy config allowlist never reaches the gate.
+    let denied = cmail(&root)
+        .arg("--json")
+        .arg("--test-unavailable-authority")
+        .arg("allow")
+        .arg("add")
+        .arg("alice")
+        .assert()
+        .failure();
+    let denied: serde_json::Value = serde_json::from_slice(&denied.get_output().stdout).unwrap();
+    let message = denied["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+    assert!(!root.path().join("authority.log").exists());
+    let allowed = json_out(cmail(&root).arg("--json").arg("allow").arg("list"));
+    assert_eq!(allowed, serde_json::json!([]));
+    std::fs::write(
+        root.path().join("config.toml"),
+        "outbound = \"gated\"\ninbound = \"permissive\"\n[allow]\nsend = [\"alice\"]\n[relay]\nurl = \"\"\n[limits]\nmax_attachment_bytes = 10485760\n",
+    )
+    .unwrap();
+    let still_held = json_out(
         cmail(&root)
+            .arg("--as")
+            .arg("zoe")
             .arg("--json")
-            .arg("allow")
-            .arg("add")
-            .arg("alice"),
+            .arg("send")
+            .arg("--to")
+            .arg("alice")
+            .arg("--body")
+            .arg("hand-edited config must not permit"),
     );
-    assert_eq!(allowed["status"], "allowed");
-    assert_eq!(allowed["name"], "alice");
+    assert_eq!(still_held["status"], "held");
 
     // strict XOR: --body together with --body-file is an error, not a silent
     // --body win (exits 1 with {"error": ...} on stdout under --json)
@@ -284,7 +302,7 @@ fn full_lifecycle_with_json_shapes() {
         .iter()
         .map(|r| r["event"].as_str().unwrap())
         .collect();
-    for expected in ["init", "send", "held", "approve", "read"] {
+    for expected in ["init", "held", "approve", "read"] {
         assert!(
             events.contains(&expected),
             "missing {expected} in {events:?}"
@@ -810,6 +828,29 @@ fn keyring_add_fails_closed_without_backend() {
     assert!(message.contains("authority unavailable"), "{message}");
     assert!(!root.path().join("authority.log").exists());
     assert!(!root.path().join("keyring.json").exists());
+}
+
+#[test]
+fn allow_add_and_remove_fail_closed_without_backend() {
+    let root = TempDir::new().unwrap();
+    for action in ["add", "remove"] {
+        let output = cmail(&root)
+            .arg("--json")
+            .arg("--test-unavailable-authority")
+            .arg("allow")
+            .arg(action)
+            .arg("alice")
+            .assert()
+            .failure()
+            .get_output()
+            .clone();
+        let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let message = out["error"].as_str().unwrap();
+        assert!(message.contains("authority unavailable"), "{message}");
+        assert!(!root.path().join("authority.log").exists());
+    }
+    let listed = json_out(cmail(&root).arg("--json").arg("allow").arg("list"));
+    assert_eq!(listed, serde_json::json!([]));
 }
 
 #[test]

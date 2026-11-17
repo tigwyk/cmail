@@ -215,12 +215,16 @@ mod tests {
                 .unwrap(),
             SendOutcome::Held { .. }
         ));
-        // Unsigned legacy keyring, as a pre-enforcement install has it.
+        // Unsigned legacy keyring and config allowlist, as a pre-enforcement
+        // install has them. Written directly: allow_add now signs, and this
+        // fixture must model the unsigned state adoption migrates.
         let alice = crate::identity::load_identity(root.path(), "alice").unwrap();
         let mut legacy = crate::keyring::KeyRing::load(root.path()).unwrap();
         legacy.add("alice", &alice.public_key_b64()).unwrap();
         legacy.save(root.path()).unwrap();
-        c.allow_add("zoe").unwrap();
+        let mut cfg = Config::load_or_init(root.path()).unwrap();
+        cfg.allow.send.push("zoe".into());
+        cfg.save(root.path()).unwrap();
         c.relay_set(Some("https://relay.example.com")).unwrap();
         (root, c)
     }
