@@ -36,6 +36,7 @@ use windows::Win32::System::WinRT::{RoInitialize, RO_INIT_MULTITHREADED};
 /// Credential Manager target name for the authority seed.
 const CREDENTIAL_TARGET: &str = "cmail.authority.v1";
 const SEED_LEN: usize = 32;
+const ASSURANCE_EXPLANATION: &str = "Windows Hello proves human presence, but the DPAPI-protected credential blob is not cryptographically bound to that check: a same-user process that locates the blob can decrypt it after login.";
 
 /// Windows backend: Credential Manager key plus Windows Hello presence.
 pub struct WindowsAuthority {
@@ -70,6 +71,7 @@ impl Authority for WindowsAuthority {
                         CoreError::AuthorityUnavailable("authority status lock poisoned".into())
                     })?
                     .clone(),
+                explanation: Some(ASSURANCE_EXPLANATION.into()),
             },
             None => AuthorityStatus {
                 available: false,
@@ -77,6 +79,7 @@ impl Authority for WindowsAuthority {
                 backend: "windows-credential-manager".into(),
                 assurance: Assurance::None,
                 last_grant: None,
+                explanation: Some(ASSURANCE_EXPLANATION.into()),
             },
         })
     }
