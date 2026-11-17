@@ -199,13 +199,14 @@ mod tests {
         AuthorityStatus, InMemoryAuthority, UnavailableAuthority, RECORD_VERSION,
     };
     use crate::error::CoreError;
-    use crate::service::KeySource;
     use crate::service::{Cmail, InitOutcome, SendOutcome};
     use tempfile::TempDir;
 
     fn legacy_service() -> (TempDir, Cmail) {
         let root = TempDir::new().unwrap();
-        let c = Cmail::open(root.path()).unwrap();
+        let authority = std::sync::Arc::new(InMemoryAuthority::new());
+        authority.init().unwrap();
+        let c = Cmail::open_with_authority(root.path(), authority).unwrap();
         assert_eq!(c.init("alice", false).unwrap(), InitOutcome::Created);
         assert_eq!(c.init("zoe", false).unwrap(), InitOutcome::Created);
         // Hold one outbound message before allowlisting the recipient.
@@ -214,7 +215,11 @@ mod tests {
                 .unwrap(),
             SendOutcome::Held { .. }
         ));
-        c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
+        // Unsigned legacy keyring, as a pre-enforcement install has it.
+        let alice = crate::identity::load_identity(root.path(), "alice").unwrap();
+        let mut legacy = crate::keyring::KeyRing::load(root.path()).unwrap();
+        legacy.add("alice", &alice.public_key_b64()).unwrap();
+        legacy.save(root.path()).unwrap();
         c.allow_add("zoe").unwrap();
         c.relay_set(Some("https://relay.example.com")).unwrap();
         (root, c)

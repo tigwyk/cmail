@@ -175,15 +175,21 @@ fn full_lifecycle_with_json_shapes() {
         "fingerprint not hex: {fp}"
     );
 
-    // human trusts alice; a second send now arrives verified
-    let trusted = json_out(
-        cmail(&root)
-            .arg("--json")
-            .arg("keyring")
-            .arg("add")
-            .arg("alice"),
-    );
-    assert_eq!(trusted["status"], "trusted");
+    // Human-only keyring add cannot succeed unattended: the debug backend
+    // proves the CLI fails closed with typed authority guidance and writes no
+    // record. A second send therefore stays untrusted.
+    let denied = cmail(&root)
+        .arg("--json")
+        .arg("--test-unavailable-authority")
+        .arg("keyring")
+        .arg("add")
+        .arg("alice")
+        .assert()
+        .failure();
+    let denied: serde_json::Value = serde_json::from_slice(&denied.get_output().stdout).unwrap();
+    let message = denied["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+    assert!(!root.path().join("authority.log").exists());
     let sent2 = json_out(
         cmail(&root)
             .arg("--as")
@@ -204,7 +210,7 @@ fn full_lifecycle_with_json_shapes() {
             .arg("inbox"),
     );
     assert_eq!(inbox2.as_array().map(Vec::len), Some(1)); // first mail was archived on read
-    assert_eq!(inbox2[0]["trust"], "verified");
+    assert_eq!(inbox2[0]["trust"], "untrusted");
     let id2 = inbox2[0]["id"].as_str().unwrap().to_string();
     let read2 = json_out(
         cmail(&root)
@@ -214,11 +220,13 @@ fn full_lifecycle_with_json_shapes() {
             .arg("read")
             .arg(&id2),
     );
-    assert_eq!(read2["body"], "again"); // verified bodies are NOT wrapped
+    // untrusted bodies stay behind the fence
+    assert!(read2["body"].as_str().unwrap().contains(UNTRUSTED_OPEN));
+    assert!(read2["body"].as_str().unwrap().contains("again"));
 
     // reply threads: only zoe is allowlisted (alice is not), so zoe's reply is held.
-    // Deterministic: `approve --remember` added "zoe"; `keyring add` never touches
-    // the allowlist; the gate checks the recipient (alice) -> held.
+    // Deterministic: `approve --remember` added "zoe"; the denied keyring add
+    // never touches the allowlist; the gate checks the recipient (alice) -> held.
     let rep = json_out(
         cmail(&root)
             .arg("--as")
@@ -276,12 +284,14 @@ fn full_lifecycle_with_json_shapes() {
         .iter()
         .map(|r| r["event"].as_str().unwrap())
         .collect();
-    for expected in ["init", "send", "held", "approve", "read", "key_add"] {
+    for expected in ["init", "send", "held", "approve", "read"] {
         assert!(
             events.contains(&expected),
             "missing {expected} in {events:?}"
         );
     }
+    // the denied keyring add wrote no audit grant
+    assert!(!events.contains(&"key_add"), "{events:?}");
 }
 
 #[test]
@@ -299,13 +309,6 @@ fn corrupt_lands_in_quarantine_never_inbox() {
         .arg("init")
         .arg("--name")
         .arg("zoe")
-        .assert()
-        .success();
-    cmail(&root)
-        .arg("--json")
-        .arg("keyring")
-        .arg("add")
-        .arg("alice")
         .assert()
         .success();
 
@@ -346,12 +349,11 @@ fn corrupt_lands_in_quarantine_never_inbox() {
     assert_eq!(q.as_array().map(Vec::len), Some(1));
 }
 
-/// A TRUE spoof: mallory's identity signs a self-consistent envelope claiming
-/// `from: alice` (the signature is valid against mallory's key, so only the
-/// keyring comparison can catch it). Zoe's human already trusts the real
-/// alice, so the scan must quarantine the impostor — never show it in inbox.
+/// A hand-edited legacy keyring never grants trust: writing mallory's key for
+/// alice into `keyring.json` must not make a name-trusted entry. The impostor's
+/// envelope stays ordinary untrusted mail, never a verified sender.
 #[test]
-fn true_spoof_lands_in_quarantine_never_inbox() {
+fn hand_edited_keyring_never_grants_trust() {
     let root = TempDir::new().unwrap();
     cmail(&root)
         .arg("init")
@@ -371,12 +373,15 @@ fn true_spoof_lands_in_quarantine_never_inbox() {
         .arg("mallory")
         .assert()
         .success();
-    cmail(&root)
-        .arg("keyring")
-        .arg("add")
-        .arg("alice")
-        .assert()
-        .success(); // zoe's human trusts alice
+    // Unattended hand edit of the unsigned keyring cache.
+    {
+        use cmail_core::identity::load_identity;
+        use cmail_core::keyring::KeyRing;
+        let mallory = load_identity(root.path(), "mallory").unwrap();
+        let mut legacy = KeyRing::load(root.path()).unwrap();
+        legacy.add("alice", &mallory.public_key_b64()).unwrap();
+        legacy.save(root.path()).unwrap();
+    }
 
     // Mallory signs an envelope claiming from: alice — self-consistent
     // signature, only the keyring comparison can catch it. (base64 is not a
@@ -421,7 +426,10 @@ fn true_spoof_lands_in_quarantine_never_inbox() {
             .arg("--json")
             .arg("inbox"),
     );
-    assert_eq!(inbox.as_array().map(Vec::len), Some(0));
+    // The unsigned cache entry is ignored: the impostor is ordinary untrusted
+    // mail, never verified, and nothing is quarantined as a spoof.
+    assert_eq!(inbox.as_array().map(Vec::len), Some(1));
+    assert_eq!(inbox[0]["trust"], "untrusted");
     let q = json_out(
         cmail(&root)
             .arg("--as")
@@ -430,9 +438,7 @@ fn true_spoof_lands_in_quarantine_never_inbox() {
             .arg("quarantine")
             .arg("list"),
     );
-    assert_eq!(q.as_array().map(Vec::len), Some(1));
-    // the quarantined mail still CLAIMS to be from alice — that's the tell
-    assert_eq!(q[0]["from"], "alice");
+    assert_eq!(q.as_array().map(Vec::len), Some(0));
 }
 
 #[test]
@@ -592,9 +598,9 @@ fn fetch_without_relay_errors_cleanly() {
         .stdout(contains("cmail relay set"));
 }
 
-/// A corrupt keyring must not break relay/config-only commands: `relay show`
-/// and `allow list` never parsed it, and the policy seam keeps keyring loading
-/// lazy so a relay/config-only read still works.
+/// A corrupt legacy keyring cache must not break relay/config commands or
+/// signed trust reads: `relay show` and `allow list` never parsed it, and the
+/// keyring now comes from the signed log (the cache is routing only).
 #[test]
 fn relay_show_survives_corrupt_keyring() {
     let root = TempDir::new().unwrap();
@@ -613,20 +619,14 @@ fn relay_show_survives_corrupt_keyring() {
     let allowed = json_out(cmail(&root).arg("--json").arg("allow").arg("list"));
     assert_eq!(allowed, serde_json::json!([]));
 
-    // reads that need the keyring still fail closed
-    cmail(&root)
-        .arg("--json")
-        .arg("keyring")
-        .arg("list")
-        .assert()
-        .code(1)
-        .stdout(contains("\"error\""));
+    // no signed grants exist, so the effective keyring is empty — not an error
+    let listed = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
+    assert_eq!(listed, serde_json::json!([]));
 }
 
-/// Task R3: keyring routes and the pickup-relay config round-trip through the
-/// CLI — `keyring add --route` / `keyring route` set→list→clear, and
-/// `relay set`→`config` shows the url→`relay clear`, with `key_route` and
-/// `relay_set` landing in the audit log.
+/// Keyring routes and the pickup-relay config round-trip through the CLI.
+/// Routes are non-trust routing, so they live in the cache file; signed
+/// `keyring add` is tested through the fail-closed CLI path elsewhere.
 #[test]
 fn keyring_route_and_relay_config_lifecycle() {
     let root = TempDir::new().unwrap();
@@ -645,48 +645,41 @@ fn keyring_route_and_relay_config_lifecycle() {
         .assert()
         .success();
 
-    // keyring add --route: route accepted at add time and listed
-    let added = json_out(
-        cmail(&root)
-            .arg("--json")
-            .arg("keyring")
-            .arg("add")
-            .arg("alice")
-            .arg("--route")
-            .arg("https://relay.example.com"),
-    );
-    assert_eq!(added["status"], "trusted");
-    let list = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
-    let arr = list.as_array().unwrap();
-    assert_eq!(arr.len(), 1);
-    assert_eq!(arr[0]["name"], "alice");
-    assert_eq!(arr[0]["route"], "https://relay.example.com");
+    // Seed the non-trust routing cache directly (hand-written, like a synced
+    // root). It cannot grant trust.
+    {
+        use cmail_core::identity::load_identity;
+        use cmail_core::keyring::KeyRing;
+        let alice = load_identity(root.path(), "alice").unwrap();
+        let mut cache = KeyRing::load(root.path()).unwrap();
+        cache.add("alice", &alice.public_key_b64()).unwrap();
+        cache.save(root.path()).unwrap();
+    }
+    let cached_route = |root: &TempDir| {
+        use cmail_core::keyring::KeyRing;
+        KeyRing::load(root.path()).unwrap().get_route("alice")
+    };
 
-    // human list appends " -> {url}" when a route is present
-    cmail(&root)
-        .arg("keyring")
-        .arg("list")
-        .assert()
-        .success()
-        .stdout(contains("-> https://relay.example.com"));
-
-    // route set -> list -> clear
+    // route set -> cached -> clear; no signed grant, so the effective keyring
+    // list stays empty
     let set = json_out(
         cmail(&root)
             .arg("--json")
             .arg("keyring")
             .arg("route")
             .arg("alice")
-            .arg("https://relay2.example.com"),
+            .arg("https://relay.example.com"),
     );
     assert_eq!(set["status"], "set");
     assert_eq!(set["name"], "alice");
-    assert_eq!(set["route"], "https://relay2.example.com");
-    let list2 = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
+    assert_eq!(set["route"], "https://relay.example.com");
     assert_eq!(
-        list2.as_array().unwrap()[0]["route"],
-        "https://relay2.example.com"
+        cached_route(&root).as_deref(),
+        Some("https://relay.example.com")
     );
+    let list = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
+    assert_eq!(list, serde_json::json!([]));
+
     let cleared = json_out(
         cmail(&root)
             .arg("--json")
@@ -696,8 +689,7 @@ fn keyring_route_and_relay_config_lifecycle() {
             .arg("--clear"),
     );
     assert_eq!(cleared["status"], "cleared");
-    let list3 = json_out(cmail(&root).arg("--json").arg("keyring").arg("list"));
-    assert!(list3.as_array().unwrap()[0]["route"].is_null());
+    assert_eq!(cached_route(&root), None);
 
     // routing an unknown name is an error, not a silent no-op
     cmail(&root)
@@ -792,6 +784,51 @@ fn init_fails_on_collision_and_reuse_is_explicit() {
     );
     assert_eq!(reused["outcome"], "reused");
     assert_eq!(reused["fingerprint"], fingerprint.as_str());
+}
+
+#[test]
+fn keyring_add_fails_closed_without_backend() {
+    let root = TempDir::new().unwrap();
+    cmail(&root)
+        .arg("init")
+        .arg("--name")
+        .arg("alice")
+        .assert()
+        .success();
+    let output = cmail(&root)
+        .arg("--json")
+        .arg("--test-unavailable-authority")
+        .arg("keyring")
+        .arg("add")
+        .arg("alice")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = out["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+    assert!(!root.path().join("authority.log").exists());
+    assert!(!root.path().join("keyring.json").exists());
+}
+
+#[test]
+fn keyring_remove_fails_closed_without_backend() {
+    let root = TempDir::new().unwrap();
+    let output = cmail(&root)
+        .arg("--json")
+        .arg("--test-unavailable-authority")
+        .arg("keyring")
+        .arg("remove")
+        .arg("alice")
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let out: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    let message = out["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+    assert!(!root.path().join("authority.log").exists());
 }
 
 #[test]

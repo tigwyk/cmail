@@ -1,44 +1,63 @@
 //! Effective-policy seam: every protected policy read goes through [`Policy`].
 //!
-//! Today the effective policy is the legacy root-local `config.toml` plus
-//! `keyring.json`. When signed policy lands, only [`Policy::load`] changes;
-//! trust computation, the outbound gate, relay selection, approvals listing
-//! and quarantine release keep reading through this type.
+//! Trust for a sender name comes only from the signed authority-record log
+//! (a latest valid `key_add`); the legacy `keyring.json` supplies relay routes
+//! and display cache and grants nothing. Config-backed reads (outbound gate,
+//! relay selection) still use the root-local `config.toml`.
 
+use crate::authority::Authority;
 use crate::config::{Config, InboundMode, OutboundMode};
 use crate::envelope::Envelope;
-use crate::error::Result;
+use crate::error::{CoreError, Result};
 use crate::keyring::KeyRing;
 use crate::trust::{self, TrustResult};
 use std::cell::OnceCell;
 use std::path::{Path, PathBuf};
 
-#[derive(Debug)]
 pub struct Policy {
     root: PathBuf,
     config: Config,
-    /// Parsed on first use: relay/config-only reads must not fail on a corrupt
-    /// keyring (fetch, relay show, allow list never needed one before).
+    /// Verifies the signed record log that grants trust. Presence is never
+    /// requested on this path: only the public key is read.
+    authority: std::sync::Arc<dyn Authority>,
+    /// Derived on first use: relay/config-only reads must not need authority
+    /// material (fetch, relay show, allow list never needed it before).
     keyring: OnceCell<KeyRing>,
 }
 
 impl Policy {
     /// Load the effective policy for `root`, fresh from disk so a long-lived
     /// handle observes human edits made since it opened.
-    pub fn load(root: &Path) -> Result<Self> {
+    pub fn load(root: &Path, authority: std::sync::Arc<dyn Authority>) -> Result<Self> {
         Ok(Self {
             root: root.to_path_buf(),
             config: Config::load_or_init(root)?,
+            authority,
             keyring: OnceCell::new(),
         })
     }
 
-    /// The keyring that trust decisions and recipient lookups resolve against,
-    /// parsed on demand. A corrupt keyring fails every such read (fail closed).
+    /// The effective trust keyring, derived only from valid signed records.
+    /// The legacy `keyring.json` contributes relay routes and nothing else.
+    ///
+    /// An unavailable authority backend yields an empty keyring (no trust
+    /// anchor, so nothing verifies) instead of making mail unreadable; a
+    /// tampered or rolled-back log still fails closed with an error.
     pub fn keyring(&self) -> Result<&KeyRing> {
         if self.keyring.get().is_none() {
-            // Cache success only: a corrupt file cannot become valid mid-process.
-            let _ = self.keyring.set(KeyRing::load(&self.root)?);
+            let effective = match self.authority.load_effective_policy(&self.root) {
+                Ok(policy) => KeyRing::from_decisions(&policy),
+                Err(CoreError::AuthorityUnavailable(_)) => KeyRing::default(),
+                Err(error) => return Err(error),
+            };
+            let mut effective = effective;
+            // Routes are routing, never trust: a stale or hand-edited legacy
+            // file can redirect mail at most, never verify a key.
+            if let Ok(legacy) = KeyRing::load(&self.root) {
+                effective.overlay_routes(&legacy);
+            }
+            // Cache success only: a tampered log cannot become valid mid-process.
+            let _ = self.keyring.set(effective);
         }
         Ok(self.keyring.get().expect("keyring was just set"))
     }
@@ -80,6 +99,7 @@ impl Policy {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::authority::{Authority, AuthorityAction, InMemoryAuthority};
     use crate::config::{AllowSection, Config, InboundMode, OutboundMode, RelaySection};
     use crate::envelope::{build_and_sign, NewEnvelope};
     use crate::keyring::KeyRing;
@@ -89,8 +109,14 @@ mod tests {
     use rand::rngs::OsRng;
     use tempfile::TempDir;
 
-    /// A root laid out exactly as the legacy files are written today.
-    fn legacy_root() -> (TempDir, SigningKey) {
+    fn test_authority() -> std::sync::Arc<InMemoryAuthority> {
+        let authority = std::sync::Arc::new(InMemoryAuthority::new());
+        authority.init().unwrap();
+        authority
+    }
+
+    /// Config plus a signed `alice` grant and a legacy route cache entry.
+    fn legacy_root(authority: &InMemoryAuthority) -> (TempDir, SigningKey) {
         let root = TempDir::new().unwrap();
         let cfg = Config {
             outbound: OutboundMode::Gated,
@@ -105,12 +131,20 @@ mod tests {
         };
         cfg.save(root.path()).unwrap();
         let alice = SigningKey::generate(&mut OsRng);
+        let public_key = B64.encode(alice.verifying_key().as_bytes());
         let mut kr = KeyRing::load(root.path()).unwrap();
-        kr.add("alice", &B64.encode(alice.verifying_key().as_bytes()))
-            .unwrap();
+        kr.add("alice", &public_key).unwrap();
         kr.set_route("alice", Some("https://alice.example.com"))
             .unwrap();
         kr.save(root.path()).unwrap();
+        authority
+            .sign_action(
+                root.path(),
+                AuthorityAction::KeyAdd,
+                &crate::adoption::key_subject("alice", &public_key),
+                &serde_json::json!({ "name": "alice", "public_key": public_key }),
+            )
+            .unwrap();
         (root, alice)
     }
 
@@ -134,12 +168,14 @@ mod tests {
     }
 
     #[test]
-    fn seam_returns_todays_legacy_policy() {
-        let (root, alice) = legacy_root();
-        let policy = Policy::load(root.path()).unwrap();
+    fn seam_returns_todays_policy_from_signed_grants() {
+        let authority = test_authority();
+        let (root, alice) = legacy_root(&authority);
+        let policy = Policy::load(root.path(), authority.clone()).unwrap();
 
-        // the seam reports the same keyring, allowlist, relay and modes as the
-        // legacy files it reads
+        // the seam reports the same allowlist, relay and modes as the legacy
+        // config; the keyring comes from the signed log and carries the
+        // non-trust route overlay
         assert_eq!(policy.outbound(), OutboundMode::Gated);
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
         assert_eq!(policy.allow_list(), ["zoe".to_string()]);
@@ -160,7 +196,9 @@ mod tests {
         let mut open = Config::load_or_init(root.path()).unwrap();
         open.outbound = OutboundMode::Open;
         open.save(root.path()).unwrap();
-        assert!(Policy::load(root.path()).unwrap().may_send("mallory"));
+        assert!(Policy::load(root.path(), authority.clone())
+            .unwrap()
+            .may_send("mallory"));
 
         // trust through the seam is exactly the trust module on that keyring
         let env = signed_alice(&alice);
@@ -171,14 +209,56 @@ mod tests {
         assert_eq!(policy.trust(&env).unwrap().level, TrustLevel::Verified);
     }
 
-    /// A corrupt keyring must not break relay/config-only reads: `fetch`,
-    /// `relay show` and the allow list never parsed it before the seam.
+    /// Hand-editing the legacy keyring cache never grants trust: only the
+    /// signed log does.
     #[test]
-    fn corrupt_keyring_leaves_config_only_reads_working() {
-        let (root, _alice) = legacy_root();
+    fn tampered_legacy_keyring_does_not_change_trust() {
+        let authority = test_authority();
+        let (root, alice) = legacy_root(&authority);
+        let mallory = SigningKey::generate(&mut OsRng);
+        let mut cache = KeyRing::load(root.path()).unwrap();
+        cache.remove("alice");
+        cache
+            .add("alice", &B64.encode(mallory.verifying_key().as_bytes()))
+            .unwrap();
+        cache.save(root.path()).unwrap();
+
+        let policy = Policy::load(root.path(), authority.clone()).unwrap();
+        assert_eq!(
+            policy.trust(&signed_alice(&alice)).unwrap().level,
+            TrustLevel::Verified
+        );
+        let spoof = build_and_sign(
+            &"ab".repeat(16),
+            &NewEnvelope {
+                from: "alice".into(),
+                from_key: B64.encode(mallory.verifying_key().as_bytes()),
+                to: "zoe".into(),
+                kind: "note".into(),
+                subject: "s".into(),
+                body: "b".into(),
+                attachments: vec![],
+                in_reply_to: None,
+                created: "2026-11-01T12:00:00Z".into(),
+            },
+            &mallory,
+        )
+        .unwrap();
+        assert_eq!(
+            policy.trust(&spoof).unwrap().level,
+            TrustLevel::SpoofSuspect
+        );
+    }
+
+    /// A corrupt legacy cache must not break relay/config reads or trust: the
+    /// cache is routing only, and the signed log is intact.
+    #[test]
+    fn corrupt_keyring_leaves_config_and_trust_reads_working() {
+        let authority = test_authority();
+        let (root, alice) = legacy_root(&authority);
         std::fs::write(root.path().join("keyring.json"), "not json").unwrap();
 
-        let policy = Policy::load(root.path()).unwrap();
+        let policy = Policy::load(root.path(), authority.clone()).unwrap();
         assert_eq!(policy.inbound(), InboundMode::KnownOnly);
         assert_eq!(policy.allow_list(), ["zoe".to_string()]);
         assert_eq!(
@@ -188,8 +268,11 @@ mod tests {
         assert!(policy.may_send("zoe"));
         assert!(!policy.may_send("mallory"));
 
-        // reads that need the keyring still fail closed
-        assert!(policy.keyring().is_err());
-        assert!(policy.route("alice").is_err());
+        // signed trust is unaffected; only the route overlay is unavailable
+        assert_eq!(
+            policy.trust(&signed_alice(&alice)).unwrap().level,
+            TrustLevel::Verified
+        );
+        assert_eq!(policy.route("alice").unwrap(), None);
     }
 }

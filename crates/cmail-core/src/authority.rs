@@ -21,6 +21,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 use std::collections::BTreeMap;
 use std::path::Path;
+use std::sync::Arc;
 #[cfg(any(test, feature = "test-authority"))]
 use std::sync::{Mutex, MutexGuard};
 
@@ -249,7 +250,7 @@ pub struct LogHead {
 /// material, presence, and the pinned chain head; the root-scoped record log
 /// and its fold are shared by every backend in [`log`]. The CLI is a thin
 /// caller.
-pub trait Authority {
+pub trait Authority: Send + Sync {
     /// Report availability and assurance without changing state.
     fn status(&self) -> Result<AuthorityStatus>;
     /// Provision the authority key if absent. Idempotent.
@@ -522,27 +523,29 @@ impl Authority for UnavailableAuthority {
 /// The process-wide authority backend. Resolved here so the CLI cannot choose
 /// one from the environment; release builds have no injectable backend.
 #[cfg(target_os = "macos")]
-pub fn system_authority() -> &'static dyn Authority {
+pub fn system_authority() -> Arc<dyn Authority> {
     macos::authority()
 }
 
 #[cfg(target_os = "linux")]
-pub fn system_authority() -> &'static dyn Authority {
-    static LINUX: crate::authority_linux::LinuxAuthority =
-        crate::authority_linux::LinuxAuthority::new();
-    &LINUX
+pub fn system_authority() -> Arc<dyn Authority> {
+    static LINUX: std::sync::LazyLock<Arc<dyn Authority>> =
+        std::sync::LazyLock::new(|| Arc::new(crate::authority_linux::LinuxAuthority::new()));
+    LINUX.clone()
 }
 
 #[cfg(target_os = "windows")]
-pub fn system_authority() -> &'static dyn Authority {
-    static WINDOWS: windows::WindowsAuthority = windows::WindowsAuthority::new();
-    &WINDOWS
+pub fn system_authority() -> Arc<dyn Authority> {
+    static WINDOWS: std::sync::LazyLock<Arc<dyn Authority>> =
+        std::sync::LazyLock::new(|| Arc::new(windows::WindowsAuthority::new()));
+    WINDOWS.clone()
 }
 
 #[cfg(not(any(target_os = "macos", target_os = "linux", target_os = "windows")))]
-pub fn system_authority() -> &'static dyn Authority {
-    static UNAVAILABLE: UnavailableAuthority = UnavailableAuthority;
-    &UNAVAILABLE
+pub fn system_authority() -> Arc<dyn Authority> {
+    static UNAVAILABLE: std::sync::LazyLock<Arc<dyn Authority>> =
+        std::sync::LazyLock::new(|| Arc::new(UnavailableAuthority));
+    UNAVAILABLE.clone()
 }
 
 #[cfg(test)]
