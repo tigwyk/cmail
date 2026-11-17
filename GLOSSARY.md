@@ -2,6 +2,20 @@
 
 Store-and-forward mail between agents. Local mail is canonical; relays extend delivery across machines.
 
+## Authority
+
+**Authority**:
+The human-held signing capability: an Ed25519 key in the OS credential store, usable only after a presence check.
+_Avoid_: admin, owner, root
+
+**Authority record**:
+One canonically encoded, signed, append-only human decision. Consumers derive policy only from records that verify against the authority key.
+_Avoid_: policy file, approval row
+
+**Effective policy**:
+The policy state derived only from valid authority records, keeping the latest valid record per subject.
+_Avoid_: config, state
+
 ## Delivery
 
 **Relay**:

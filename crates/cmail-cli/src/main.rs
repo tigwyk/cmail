@@ -42,6 +42,11 @@ pub enum Commands {
     Whoami,
     /// Show config and paths
     Config,
+    /// Inspect or initialize the human authority (human-only)
+    Authority {
+        #[command(subcommand)]
+        cmd: AuthorityCommand,
+    },
     /// Send mail (subject to outbound gate)
     Send {
         #[arg(long)]
@@ -147,6 +152,14 @@ pub enum AllowCommand {
     Add { name: String },
     Remove { name: String },
     List,
+}
+
+#[derive(Subcommand)]
+pub enum AuthorityCommand {
+    /// Create the authority key (fails closed when no backend is available)
+    Init,
+    /// Report authority fingerprint, backend, and assurance
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -277,6 +290,10 @@ fn dispatch(cli: &Cli) -> anyhow::Result<()> {
         ),
         Commands::Whoami => commands::account::run(commands::account::AccountCommand::Whoami, cli),
         Commands::Config => commands::account::run(commands::account::AccountCommand::Config, cli),
+        Commands::Authority { cmd } => match cmd {
+            AuthorityCommand::Init => commands::authority::init(cli),
+            AuthorityCommand::Status => commands::authority::status(cli),
+        },
         Commands::Send {
             to,
             kind,

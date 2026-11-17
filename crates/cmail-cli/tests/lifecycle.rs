@@ -762,3 +762,31 @@ fn init_fails_on_collision_and_reuse_is_explicit() {
     assert_eq!(reused["outcome"], "reused");
     assert_eq!(reused["fingerprint"], fingerprint.as_str());
 }
+
+#[test]
+fn authority_status_reports_no_backend() {
+    let root = TempDir::new().unwrap();
+    let out = json_out(cmail(&root).arg("--json").arg("authority").arg("status"));
+    assert_eq!(out["available"], false);
+    assert_eq!(out["backend"], "none");
+    assert_eq!(out["assurance"], "none");
+    assert!(out["fingerprint"].is_null());
+    assert!(out["last_grant"].is_null());
+}
+
+#[test]
+fn authority_init_fails_closed_without_backend() {
+    let root = TempDir::new().unwrap();
+    let stdout = cmail(&root)
+        .arg("--json")
+        .arg("authority")
+        .arg("init")
+        .assert()
+        .failure()
+        .get_output()
+        .stdout
+        .clone();
+    let out: serde_json::Value = serde_json::from_slice(&stdout).unwrap();
+    let message = out["error"].as_str().unwrap();
+    assert!(message.contains("authority unavailable"), "{message}");
+}
