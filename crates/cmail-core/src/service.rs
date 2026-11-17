@@ -1923,6 +1923,37 @@ mod tests {
     }
 
     #[test]
+    fn adoption_makes_legacy_audit_release_readable() {
+        let authority = test_authority();
+        let root = TempDir::new().unwrap();
+        let c = open_with(root.path(), authority.clone()).unwrap();
+        c.init("alice", false).unwrap();
+        c.init("zoe", false).unwrap();
+        let id = deliver_direct(&c, "alice", "zoe", "legacy");
+        c.read_message(Some("zoe"), &id).unwrap(); // inbox -> archive
+                                                   // A 0.2 build recorded the release only as an unsigned audit event.
+        append(
+            &c.root,
+            &AuditRecord::now(AuditEvent::QuarantineRelease, "human").msg(&id),
+        )
+        .unwrap();
+        assert!(c.read_message(Some("zoe"), &id).is_err());
+
+        // Adoption signs the legacy event; the archived copy unlocks.
+        let adopted = c.adopt_legacy(authority.as_ref(), true).unwrap();
+        assert!(adopted
+            .signed
+            .iter()
+            .any(|record| record.subject == crate::authority::subject::quarantine(&id)));
+        let msg = c.read_message(Some("zoe"), &id).unwrap();
+        assert!(msg.body.contains("legacy"));
+
+        // Re-adoption adds no further records.
+        let again = c.adopt_legacy(authority.as_ref(), true).unwrap();
+        assert!(again.signed.is_empty());
+    }
+
+    #[test]
     fn reply_threads_and_uses_parent_sender() {
         let (_root, c) = svc();
         c.keyring_add("alice", KeySource::LocalIdentity).unwrap();
