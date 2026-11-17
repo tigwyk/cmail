@@ -592,6 +592,37 @@ fn fetch_without_relay_errors_cleanly() {
         .stdout(contains("cmail relay set"));
 }
 
+/// A corrupt keyring must not break relay/config-only commands: `relay show`
+/// and `allow list` never parsed it, and the policy seam keeps keyring loading
+/// lazy so a relay/config-only read still works.
+#[test]
+fn relay_show_survives_corrupt_keyring() {
+    let root = TempDir::new().unwrap();
+    cmail(&root)
+        .arg("--json")
+        .arg("relay")
+        .arg("set")
+        .arg("https://pickup.example.com")
+        .assert()
+        .success();
+    std::fs::write(root.path().join("keyring.json"), "not json").unwrap();
+
+    let shown = json_out(cmail(&root).arg("--json").arg("relay").arg("show"));
+    assert_eq!(shown["url"], "https://pickup.example.com");
+
+    let allowed = json_out(cmail(&root).arg("--json").arg("allow").arg("list"));
+    assert_eq!(allowed, serde_json::json!([]));
+
+    // reads that need the keyring still fail closed
+    cmail(&root)
+        .arg("--json")
+        .arg("keyring")
+        .arg("list")
+        .assert()
+        .code(1)
+        .stdout(contains("\"error\""));
+}
+
 /// Task R3: keyring routes and the pickup-relay config round-trip through the
 /// CLI — `keyring add --route` / `keyring route` set→list→clear, and
 /// `relay set`→`config` shows the url→`relay clear`, with `key_route` and
