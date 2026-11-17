@@ -187,11 +187,12 @@ fn fetch_without_relay_configured_is_guided_error() {
 fn inbox_read_reply_wait_covered_via_mcp() {
     let root = setup();
     // Deliver real untrusted mail to zoe using core (bypassing the gate
-    // directly): zoe must be allowlisted as a recipient so the send is Sent.
+    // directly): the send is held, then the pending file is moved into zoe's
+    // inbox exactly as a human approval would. No signed allow record is
+    // needed, so the test never touches the platform authority.
     // A plain local variable carries the id into the request lines below.
     let id = {
         let svc = cmail_core::Cmail::open(root.path()).unwrap();
-        svc.allow_add("zoe").unwrap();
         let sent = svc
             .send(
                 Some("alice"),
@@ -203,9 +204,17 @@ fn inbox_read_reply_wait_covered_via_mcp() {
                 None,
             )
             .unwrap();
-        let cmail_core::service::SendOutcome::Sent { id } = sent else {
-            panic!("expected Sent, got {sent:?}")
+        let cmail_core::service::SendOutcome::Held { id, .. } = sent else {
+            panic!("expected Held, got {sent:?}")
         };
+        svc.store.ensure_mailbox("zoe").unwrap();
+        svc.store
+            .move_message(
+                &svc.store.pending_dir("alice"),
+                &svc.store.inbox_dir("zoe"),
+                &id,
+            )
+            .unwrap();
         id
     };
     let lines: Vec<String> = vec![
