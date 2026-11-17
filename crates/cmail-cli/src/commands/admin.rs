@@ -182,7 +182,7 @@ pub fn relay(cli: &Cli, cmd: RelayCmd) -> Result<()> {
             }
         }
         RelayCmd::Show => {
-            let url = cmail_core::Config::load_or_init(&c.root)?.relay_url();
+            let url = cmail_core::Policy::load(&c.root)?.relay_url();
             if cli.json {
                 output::print_json(&serde_json::json!({"url": url}));
             } else {

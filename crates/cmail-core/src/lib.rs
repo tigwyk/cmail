@@ -8,6 +8,7 @@ pub mod error;
 pub mod fsutil;
 pub mod identity;
 pub mod keyring;
+pub mod policy;
 pub mod relay;
 pub mod service;
 pub mod store;
@@ -15,4 +16,5 @@ pub mod trust;
 
 pub use config::Config;
 pub use error::{CoreError, Result};
+pub use policy::Policy;
 pub use service::{Cmail, InitOutcome};
